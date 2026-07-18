@@ -59,15 +59,26 @@ pub struct PreparedInvocation {
     pub remote_eligibility: RemoteEligibility,
     pub output_files: Vec<PreparedOutput>,
     pub path_mappings: Vec<(String, String)>,
+    pub arguments: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub inputs: Vec<PreparedInput>,
+    pub toolchain_sha256: String,
+    pub platform_os: &'static str,
+    pub platform_arch: &'static str,
     compiler: String,
     toolchain: ToolchainIdentity,
     platform: PlatformIdentity,
     working_directory: String,
     crate_name: Option<String>,
-    arguments: Vec<String>,
-    environment: BTreeMap<String, String>,
-    inputs: Vec<ActionInput>,
     output_directory: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PreparedInput {
+    pub logical_path: String,
+    pub actual_path: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -152,7 +163,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         inputs: inputs
             .iter()
             .map(|input| ActionInput {
-                path: input.path.clone(),
+                path: input.logical_path.clone(),
                 sha256: input.sha256.clone(),
                 size_bytes: input.size_bytes,
             })
@@ -162,6 +173,9 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
     let key = action_key(&deterministic_action)?;
     Ok(PreparedInvocation {
         action_key: key,
+        toolchain_sha256: toolchain.sha256.clone(),
+        platform_os: platform.os,
+        platform_arch: platform.arch,
         compiler: display(&invocation.compiler),
         toolchain,
         platform,
@@ -208,7 +222,15 @@ pub fn record_invocation(
         crate_name: prepared.crate_name.clone(),
         arguments: prepared.arguments.clone(),
         environment: prepared.environment.clone(),
-        inputs: prepared.inputs.clone(),
+        inputs: prepared
+            .inputs
+            .iter()
+            .map(|input| ActionInput {
+                path: input.logical_path.clone(),
+                sha256: input.sha256.clone(),
+                size_bytes: input.size_bytes,
+            })
+            .collect(),
         output_directory: prepared.output_directory.clone(),
         output_files: prepared
             .output_files
@@ -304,7 +326,7 @@ impl CaptureRoots {
 fn discover_inputs(
     invocation: &RustcInvocation,
     roots: &CaptureRoots,
-) -> Result<(Vec<ActionInput>, Vec<String>)> {
+) -> Result<(Vec<PreparedInput>, Vec<String>)> {
     let mut candidates = BTreeSet::new();
     for (index, arg) in invocation.args.iter().enumerate() {
         let path = PathBuf::from(arg);
@@ -344,11 +366,11 @@ fn discover_inputs(
     let mut reasons = Vec::new();
     for path in candidates {
         match roots.normalize(&path, &invocation.cwd) {
-            Ok(logical_path) => inputs.push(digest_file(&path, logical_path)?),
+            Ok(logical_path) => inputs.push(digest_file(&path, logical_path, &invocation.cwd)?),
             Err(error) => reasons.push(error.to_string()),
         }
     }
-    inputs.sort_by(|left, right| left.path.cmp(&right.path));
+    inputs.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
     Ok((inputs, reasons))
 }
 
@@ -362,11 +384,12 @@ fn is_ignored(path: &Path) -> bool {
         .any(|component| matches!(component.as_os_str().to_str(), Some(".git" | "target")))
 }
 
-fn digest_file(path: &Path, logical_path: String) -> Result<ActionInput> {
+fn digest_file(path: &Path, logical_path: String, cwd: &Path) -> Result<PreparedInput> {
     let bytes = fs::read(path).with_context(|| format!("reading input {}", path.display()))?;
     let size_bytes = u64::try_from(bytes.len()).context("input file is too large")?;
-    Ok(ActionInput {
-        path: logical_path,
+    Ok(PreparedInput {
+        logical_path,
+        actual_path: absolute(path, cwd),
         sha256: format!("{:x}", Sha256::digest(&bytes)),
         size_bytes,
     })
@@ -396,11 +419,22 @@ fn toolchain_identity(compiler: &Path) -> Result<ToolchainIdentity> {
 }
 
 fn absolute(path: &Path, cwd: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
     }
+    normalized
 }
 
 fn logical_path(root: &str, relative: &Path) -> String {

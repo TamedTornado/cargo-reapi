@@ -12,7 +12,7 @@ Remote eligibility is fail-closed and auditable. Metadata-only compiler actions 
 
 The local shared-cache backend now implements the complete action lifecycle: content-addressed output blobs, per-action cross-process locks, atomic publication, digest verification, dep-info path rewriting, and output materialization into independent worktrees. Concurrent identical actions execute once; waiters restore the published result. Corrupt blobs are rejected and rebuilt locally. Failed actions and remotely ineligible link actions are never published.
 
-The reclient adapter for remote CAS upload and action execution is the next milestone. Reusing the production `rewrapper`/`reproxy` implementation keeps this project focused on Cargo and Rust action discovery. `--backend reapi` fails closed until that adapter is implemented; it never silently falls back to an unverified remote result.
+The reclient transport adapter stages eligible actions into explicit input roots, invokes the production `rewrapper` client with declared inputs and outputs, and materializes successful outputs back into Cargo's target directory. Its platform template must bind `{os}`, `{arch}`, and `{toolchain_sha256}` so an action cannot silently execute against a mismatched worker toolchain. Real remote execution still requires an operator-provided reclient installation, a running `reproxy`, and a platform-matched REAPI service. The repository test suite exercises the complete adapter against a behaviorally faithful fake `rewrapper`; validation against a live service is the next infrastructure milestone.
 
 The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
 
@@ -22,9 +22,15 @@ The public name is currently collision-free: a crates.io exact-name search retur
 cargo install --path .
 cargo reapi --backend capture -- test
 cargo reapi --backend cache --cache-dir /shared/cargo-reapi-cache -- check
+cargo reapi --backend reapi \
+  --rewrapper /opt/reclient/rewrapper \
+  --rewrapper-cfg /etc/cargo-reapi/rewrapper.cfg \
+  --reclient-staging-dir /shared/cargo-reapi-stage \
+  --reclient-platform 'OSFamily={os},Arch={arch},toolchain_sha256={toolchain_sha256}' \
+  -- check
 ```
 
-The default log is `target/cargo-reapi/actions.jsonl`. Cache mode deliberately requires an explicit cache directory so separate worktrees share only the operator-selected store. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
+The default log is `target/cargo-reapi/actions.jsonl`. Cache mode deliberately requires an explicit cache directory so separate worktrees share only the operator-selected store. REAPI mode expects `reproxy` to be started and stopped through reclient's `bootstrap` lifecycle outside each individual Cargo action. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
 
 ## Design constraints
 

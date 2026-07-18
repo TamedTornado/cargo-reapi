@@ -6,6 +6,9 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 fn write_fixture(root: &std::path::Path, binary: bool) {
     fs::create_dir(root.join("src")).expect("source directory");
     fs::write(
@@ -298,4 +301,95 @@ fn dependency_package_outside_workspace_is_narrowly_mapped_and_eligible() {
                 .as_str()
                 .is_some_and(|path| path.starts_with("package/"))))
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn reapi_backend_stages_explicit_inputs_and_materializes_fake_rewrapper_outputs() {
+    let fixture = tempdir().expect("fixture directory");
+    let tools = tempdir().expect("fake reclient tools");
+    let staging = tempdir().expect("reclient staging root");
+    write_fixture(fixture.path(), false);
+    let rewrapper = tools.path().join("rewrapper");
+    let cfg = tools.path().join("rewrapper.cfg");
+    let rewrapper_log = tools.path().join("rewrapper.log");
+    fs::write(&cfg, "server_address=unix:///tmp/fake-reproxy.sock\n")
+        .expect("fake rewrapper config");
+    fs::write(
+        &rewrapper,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" >> \"$FAKE_REWRAPPER_LOG\"\nexec_root=\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --exec_root=*) exec_root=${1#--exec_root=} ;;\n    --) shift; break ;;\n  esac\n  shift\ndone\ncd \"$exec_root\"\nexec \"$@\"\n",
+    )
+    .expect("fake rewrapper");
+    fs::set_permissions(&rewrapper, fs::Permissions::from_mode(0o755))
+        .expect("executable fake rewrapper");
+
+    let action_log = fixture.path().join("target/cargo-reapi/actions.jsonl");
+    let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(fixture.path())
+        .args(["--backend", "reapi", "--action-log"])
+        .arg(&action_log)
+        .arg("--rewrapper")
+        .arg(&rewrapper)
+        .arg("--rewrapper-cfg")
+        .arg(&cfg)
+        .arg("--reclient-staging-dir")
+        .arg(staging.path())
+        .args([
+            "--reclient-platform",
+            "OSFamily={os},Arch={arch},toolchain_sha256={toolchain_sha256}",
+        ])
+        .args(["--", "check"])
+        .env("FAKE_REWRAPPER_LOG", &rewrapper_log)
+        .status()
+        .expect("run fake REAPI Cargo action");
+    assert!(status.success());
+
+    let actions = read_actions(&action_log);
+    let action = fixture_action(&actions);
+    assert_eq!(action["execution"], "reapi");
+    let log = fs::read_to_string(rewrapper_log).expect("fake rewrapper log");
+    assert!(log.contains("--inputs="), "{log}");
+    assert!(log.contains("Cargo.toml"), "{log}");
+    assert!(log.contains("src/lib.rs"), "{log}");
+    assert!(log.contains("--output_files=target/"));
+    assert!(log.contains("--platform=OSFamily=macos,Arch=aarch64,toolchain_sha256="));
+    assert!(!log.contains("{toolchain_sha256}"));
+}
+
+#[cfg(unix)]
+#[test]
+fn reapi_backend_never_sends_link_actions_to_rewrapper() {
+    let fixture = tempdir().expect("fixture directory");
+    let tools = tempdir().expect("fake reclient tools");
+    let staging = tempdir().expect("reclient staging root");
+    write_fixture(fixture.path(), true);
+    let rewrapper = tools.path().join("rewrapper");
+    let cfg = tools.path().join("rewrapper.cfg");
+    fs::write(&cfg, "server_address=unix:///tmp/fake-reproxy.sock\n")
+        .expect("fake rewrapper config");
+    fs::write(&rewrapper, "#!/bin/sh\nexit 99\n").expect("rejecting fake rewrapper");
+    fs::set_permissions(&rewrapper, fs::Permissions::from_mode(0o755))
+        .expect("executable fake rewrapper");
+
+    let action_log = fixture.path().join("target/cargo-reapi/actions.jsonl");
+    let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(fixture.path())
+        .args(["--backend", "reapi", "--action-log"])
+        .arg(&action_log)
+        .arg("--rewrapper")
+        .arg(&rewrapper)
+        .arg("--rewrapper-cfg")
+        .arg(&cfg)
+        .arg("--reclient-staging-dir")
+        .arg(staging.path())
+        .args([
+            "--reclient-platform",
+            "OSFamily={os},Arch={arch},toolchain_sha256={toolchain_sha256}",
+        ])
+        .args(["--", "build"])
+        .status()
+        .expect("run link-ineligible REAPI Cargo action");
+    assert!(status.success());
+    let actions = read_actions(&action_log);
+    assert_eq!(fixture_action(&actions)["execution"], "local-ineligible");
 }

@@ -2,6 +2,7 @@ mod action;
 mod cache;
 mod capture;
 mod invocation;
+mod reclient;
 
 use std::env;
 use std::ffi::OsString;
@@ -14,6 +15,7 @@ use clap::{Parser, ValueEnum};
 use crate::cache::{CacheOptions, execute_cached};
 use crate::capture::{CaptureOptions, capture_invocation};
 use crate::invocation::RustcInvocation;
+use crate::reclient::{ReclientOptions, execute_reapi, validate_platform_template};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Backend {
@@ -38,6 +40,22 @@ struct Cli {
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 
+    /// Path to reclient's rewrapper binary.
+    #[arg(long)]
+    rewrapper: Option<PathBuf>,
+
+    /// Rewrapper/reproxy configuration file.
+    #[arg(long)]
+    rewrapper_cfg: Option<PathBuf>,
+
+    /// Action staging root used to construct explicit reclient input trees.
+    #[arg(long)]
+    reclient_staging_dir: Option<PathBuf>,
+
+    /// Reclient platform properties, including the platform-matched toolchain contract.
+    #[arg(long)]
+    reclient_platform: Option<String>,
+
     /// Arguments passed verbatim to Cargo.
     #[arg(last = true, required = true, num_args = 1..)]
     cargo_args: Vec<OsString>,
@@ -60,11 +78,21 @@ fn run() -> Result<i32> {
     }
 
     let cli = Cli::parse_from(strip_cargo_subcommand_name(args));
-    if matches!(cli.backend, Backend::Reapi) {
-        bail!("the reclient adapter is not implemented yet; use --backend capture")
-    }
     if matches!(cli.backend, Backend::Cache) && cli.cache_dir.is_none() {
         bail!("--backend cache requires an explicit shared --cache-dir")
+    }
+    if matches!(cli.backend, Backend::Reapi)
+        && (cli.rewrapper.is_none()
+            || cli.rewrapper_cfg.is_none()
+            || cli.reclient_staging_dir.is_none()
+            || cli.reclient_platform.is_none())
+    {
+        bail!(
+            "--backend reapi requires --rewrapper, --rewrapper-cfg, --reclient-staging-dir, and --reclient-platform"
+        )
+    }
+    if let Some(platform) = &cli.reclient_platform {
+        validate_platform_template(platform)?;
     }
 
     let executable = env::current_exe().context("locating cargo-reapi executable")?;
@@ -84,7 +112,7 @@ fn run() -> Result<i32> {
                 Backend::Local => "local",
                 Backend::Capture => "capture",
                 Backend::Cache => "cache",
-                Backend::Reapi => unreachable!(),
+                Backend::Reapi => "reapi",
             },
         )
         .env("CARGO_REAPI_ACTION_LOG", action_log)
@@ -92,6 +120,28 @@ fn run() -> Result<i32> {
         .env("CARGO_REAPI_TARGET_ROOT", target_root);
     if let Some(cache_dir) = cli.cache_dir {
         cargo.env("CARGO_REAPI_CACHE_DIR", cache_dir);
+    }
+    for (name, value) in [
+        (
+            "CARGO_REAPI_REWRAPPER",
+            cli.rewrapper.map(PathBuf::into_os_string),
+        ),
+        (
+            "CARGO_REAPI_REWRAPPER_CFG",
+            cli.rewrapper_cfg.map(PathBuf::into_os_string),
+        ),
+        (
+            "CARGO_REAPI_RECLIENT_STAGING_DIR",
+            cli.reclient_staging_dir.map(PathBuf::into_os_string),
+        ),
+        (
+            "CARGO_REAPI_RECLIENT_PLATFORM",
+            cli.reclient_platform.map(OsString::from),
+        ),
+    ] {
+        if let Some(value) = value {
+            cargo.env(name, value);
+        }
     }
     let status = cargo.status().context("starting Cargo")?;
     Ok(status.code().unwrap_or(1))
@@ -112,7 +162,11 @@ fn run_wrapper(args: Vec<OsString>) -> Result<i32> {
                     .context("CARGO_REAPI_CACHE_DIR is required in cache mode")?,
             ),
         ),
-        "reapi" => bail!("REAPI wrapper execution is not implemented yet"),
+        "reapi" => execute_reapi(
+            &invocation,
+            &CaptureOptions::from_env()?,
+            &ReclientOptions::from_env()?,
+        ),
         value => bail!("unknown CARGO_REAPI_BACKEND value: {value}"),
     }
 }
