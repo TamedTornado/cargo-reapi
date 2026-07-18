@@ -14,6 +14,8 @@ The local shared-cache backend now implements the complete action lifecycle: con
 
 The reclient transport adapter stages eligible actions into explicit input roots, invokes the production `rewrapper` client with declared inputs and outputs, and materializes successful outputs back into Cargo's target directory. Its platform template must bind `{os}`, `{arch}`, and `{toolchain_sha256}` so an action cannot silently execute against a mismatched worker toolchain. Real remote execution still requires an operator-provided reclient installation, a running `reproxy`, and a platform-matched REAPI service. The repository test suite exercises the complete adapter against a behaviorally faithful fake `rewrapper`; validation against a live service is the next infrastructure milestone.
 
+The first bounded [five-worktree Moria acceptance](docs/moria-acceptance-2026-07-18.md) passed in 7m07s, with 63 shared-cache hits per fresh worktree. It also exposed the remaining hard boundary: nondeterministic local proc-macro links invalidate 22 downstream actions, so the 60-second fresh-worktree warm target is not yet met.
+
 The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
 
 ## Usage
