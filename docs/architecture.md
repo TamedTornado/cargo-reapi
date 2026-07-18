@@ -28,6 +28,28 @@ Build scripts are initially executed by Cargo on the coordinator. Their compilat
 5. Build-script sandboxing: trace and declare filesystem/environment effects before allowing remote execution.
 6. Bro integration: per-project policy, telemetry, bounded admission, fallback behavior, and five-worktree acceptance.
 
+## Schedule guardrails
+
+Backend proofs and milestones have clocks as well as correctness gates. A proof that spends its time reconstructing Cargo ecosystem behavior has already produced the maintainability answer; it does not earn an open-ended extension.
+
+- Bazel `rules_rust`: at most one agent-day or four elapsed hours for a representative Moria target, whichever comes first.
+- Buck2/Reindeer: at most half an agent-day or two elapsed hours after dependency import, whichever comes first.
+- Existing Cargo-native wrappers: at most one agent-day to demonstrate native macOS, platform-matched artifacts and the full Cargo gate.
+- `cargo-reapi` milestones: each milestone is split or stopped after five agent-days without a reviewable, tested artifact.
+
+The operator is pre-authorized to skip to the Cargo-authoritative implementation when a proof stalls on second-graph maintenance, build-script fixups, native platform gaps, or other ecosystem friction rather than measured execution performance. The completed Bazel and Buck2 evaluations exercised that authority.
+
+## Linker correctness
+
+Linked outputs are the critical compatibility surface and are not treated as an incidental `rustc` output. Link actions must key every object, native library, response file, linker/toolchain binary, relevant environment value, generated build-script output, and platform SDK input. Compatibility fixtures must cover embedded absolute paths, debug information, build-script-generated linker arguments, proc macros, native dependencies, and stale-output rejection before remote linker results can be accepted.
+
+Performance reports expose two measurements:
+
+1. the authoritative full warm Cargo gate, including final links and runnable test artifacts;
+2. a diagnostic warm measurement excluding final links, used to separate compiler-action reuse from linker work.
+
+The diagnostic measurement cannot satisfy the production acceptance gate. It keeps a linker limitation visible and measurable instead of making all backend progress appear to be zero.
+
 ## Acceptance
 
-The production gate is the same Cargo command set used without the wrapper: format, check, clippy, and test. A backend is acceptable only when exit status and produced artifacts match, stale results cannot be accepted, peak coordinator memory stays within its configured cap, and five independent worktrees can progress under bounded admission.
+The production gate is the same Cargo command set used without the wrapper: format, check, clippy, and test. A backend is acceptable only when exit status and produced artifacts match, stale results cannot be accepted, peak coordinator memory stays within its configured cap, and five independent worktrees can progress under bounded admission. A 60-second identical warm-gate target and a 15-minute five-worktree warm target remain performance goals; failure to cache final links must be reported explicitly and cannot be hidden by the compiler-only diagnostic.

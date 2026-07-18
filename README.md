@@ -10,6 +10,8 @@ The capture milestone works: Cargo runs normally, every compiler action still ex
 
 The reclient adapter for CAS upload, action execution, and output materialization is the next milestone. Reusing the production `rewrapper`/`reproxy` implementation keeps this project focused on Cargo and Rust action discovery. `--backend reapi` fails closed until that adapter is implemented; it never silently falls back to an unverified remote result.
 
+The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
+
 ## Usage
 
 ```sh
@@ -29,3 +31,7 @@ The default log is `target/cargo-reapi/actions.jsonl`. To prove there is no sema
 - Quality-gate concurrency is still bounded outside this tool. Remote execution changes where work runs; it does not grant unbounded scheduling.
 
 See [docs/architecture.md](docs/architecture.md) for the implementation boundary and milestones.
+
+## Project policy
+
+This is infrastructure built first for the Moria/Bro workload and shared in public as-is. Issues with reproducible action captures are welcome, but publication does not promise compatibility with every Cargo project, hosted workers, or support response times. Correctness and fail-closed behavior take priority over backend coverage.
