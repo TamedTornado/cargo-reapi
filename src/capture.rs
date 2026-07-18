@@ -4,6 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -12,6 +13,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::action::{
+    ActionInput, DeterministicAction, PlatformIdentity, RemoteEligibility, ToolchainIdentity,
+    action_key,
+};
 use crate::invocation::RustcInvocation;
 
 pub struct CaptureOptions {
@@ -33,48 +38,181 @@ struct ActionCapture {
     schema_version: u32,
     captured_at_unix_ms: u128,
     compiler: String,
+    action_key: String,
+    toolchain: ToolchainIdentity,
+    platform: PlatformIdentity,
+    remote_eligibility: RemoteEligibility,
     working_directory: String,
     crate_name: Option<String>,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
-    inputs: Vec<InputDigest>,
+    inputs: Vec<ActionInput>,
     output_directory: Option<String>,
     output_files: Vec<String>,
     exit_code: i32,
 }
 
 #[derive(Debug, Serialize)]
-struct InputDigest {
-    path: String,
-    sha256: String,
-    size_bytes: u64,
+struct CaptureRoots {
+    workspace: PathBuf,
+    target: PathBuf,
+    toolchain: PathBuf,
 }
 
 pub fn capture_invocation(invocation: &RustcInvocation, options: &CaptureOptions) -> Result<i32> {
-    let inputs = discover_inputs(invocation)?;
+    let roots = CaptureRoots::from_env(invocation)?;
+    let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots)?;
     let output_files = invocation.output_files()?;
+    let outputs = output_files
+        .iter()
+        .map(|path| roots.normalize(path, &invocation.cwd))
+        .collect::<Result<Vec<_>, _>>();
+    let outputs = match outputs {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            eligibility_reasons.push(error.to_string());
+            Vec::new()
+        }
+    };
+    if outputs.is_empty() {
+        eligibility_reasons.push("action has no declared outputs".to_owned());
+    }
+    if invocation.is_link_action() {
+        eligibility_reasons.push(
+            "link action input discovery is incomplete; native libraries, linker binaries, response files, and platform SDK inputs must be declared"
+                .to_owned(),
+        );
+    }
+    let working_directory = match roots.normalize(&invocation.cwd, &invocation.cwd) {
+        Ok(path) => path,
+        Err(error) => {
+            eligibility_reasons.push(error.to_string());
+            display(&invocation.cwd)
+        }
+    };
+    let toolchain = toolchain_identity(&invocation.compiler)?;
+    let platform = PlatformIdentity {
+        os: env::consts::OS,
+        arch: env::consts::ARCH,
+    };
+    let arguments: Vec<String> = invocation
+        .args
+        .iter()
+        .map(|value| roots.normalize_text(&lossy(value)))
+        .collect();
+    let environment: BTreeMap<String, String> = captured_environment()
+        .into_iter()
+        .map(|(name, value)| (name, roots.normalize_text(&value)))
+        .collect();
+    let deterministic_action = DeterministicAction {
+        compiler: ToolchainIdentity {
+            sha256: toolchain.sha256.clone(),
+            size_bytes: toolchain.size_bytes,
+            version: toolchain.version.clone(),
+        },
+        platform: PlatformIdentity {
+            os: platform.os,
+            arch: platform.arch,
+        },
+        working_directory: working_directory.clone(),
+        arguments: arguments.clone(),
+        environment: environment.clone(),
+        inputs: inputs
+            .iter()
+            .map(|input| ActionInput {
+                path: input.path.clone(),
+                sha256: input.sha256.clone(),
+                size_bytes: input.size_bytes,
+            })
+            .collect(),
+        outputs: outputs.clone(),
+    };
+    let key = action_key(&deterministic_action)?;
     let exit_code = invocation.execute()?;
     let capture = ActionCapture {
-        schema_version: 1,
+        schema_version: 2,
         captured_at_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock is before Unix epoch")?
             .as_millis(),
         compiler: display(&invocation.compiler),
-        working_directory: display(&invocation.cwd),
+        action_key: key,
+        toolchain,
+        platform,
+        remote_eligibility: RemoteEligibility::from_reasons(eligibility_reasons),
+        working_directory,
         crate_name: invocation.crate_name().map(lossy),
-        arguments: invocation.args.iter().map(|value| lossy(value)).collect(),
-        environment: captured_environment(),
+        arguments,
+        environment,
         inputs,
-        output_directory: invocation.out_dir().as_deref().map(display),
-        output_files: output_files.iter().map(|path| display(path)).collect(),
+        output_directory: invocation
+            .out_dir()
+            .as_deref()
+            .map(|path| roots.normalize_text(&display(path))),
+        output_files: outputs,
         exit_code,
     };
     append_capture(&options.action_log, &capture)?;
     Ok(exit_code)
 }
 
-fn discover_inputs(invocation: &RustcInvocation) -> Result<Vec<InputDigest>> {
+impl CaptureRoots {
+    fn from_env(invocation: &RustcInvocation) -> Result<Self> {
+        let workspace = env::var_os("CARGO_REAPI_WORKSPACE_ROOT")
+            .map(PathBuf::from)
+            .context("CARGO_REAPI_WORKSPACE_ROOT is required in capture mode")?;
+        let target = env::var_os("CARGO_REAPI_TARGET_ROOT")
+            .map(PathBuf::from)
+            .context("CARGO_REAPI_TARGET_ROOT is required in capture mode")?;
+        let toolchain = invocation
+            .compiler
+            .parent()
+            .and_then(Path::parent)
+            .context("compiler path has no toolchain root")?
+            .to_path_buf();
+        Ok(Self {
+            workspace: absolute(&workspace, &invocation.cwd),
+            target: absolute(&target, &invocation.cwd),
+            toolchain: absolute(&toolchain, &invocation.cwd),
+        })
+    }
+
+    fn normalize(&self, path: &Path, cwd: &Path) -> Result<String> {
+        let absolute = absolute(path, cwd);
+        for (root, label) in [
+            (&self.target, "target"),
+            (&self.workspace, "workspace"),
+            (&self.toolchain, "toolchain"),
+        ] {
+            if let Ok(relative) = absolute.strip_prefix(root) {
+                return Ok(logical_path(label, relative));
+            }
+        }
+        anyhow::bail!(
+            "path is outside declared workspace, target, and toolchain roots: {}",
+            absolute.display()
+        )
+    }
+
+    fn normalize_text(&self, value: &str) -> String {
+        let mut normalized = value.to_owned();
+        for (root, label) in [
+            (&self.target, "target"),
+            (&self.workspace, "workspace"),
+            (&self.toolchain, "toolchain"),
+        ] {
+            if let Some(root) = root.to_str() {
+                normalized = normalized.replace(root, label);
+            }
+        }
+        normalized
+    }
+}
+
+fn discover_inputs(
+    invocation: &RustcInvocation,
+    roots: &CaptureRoots,
+) -> Result<(Vec<ActionInput>, Vec<String>)> {
     let mut candidates = BTreeSet::new();
     for (index, arg) in invocation.args.iter().enumerate() {
         let path = PathBuf::from(arg);
@@ -107,7 +245,16 @@ fn discover_inputs(invocation: &RustcInvocation) -> Result<Vec<InputDigest>> {
         }
     }
 
-    candidates.iter().map(|path| digest_file(path)).collect()
+    let mut inputs = Vec::new();
+    let mut reasons = Vec::new();
+    for path in candidates {
+        match roots.normalize(&path, &invocation.cwd) {
+            Ok(logical_path) => inputs.push(digest_file(&path, logical_path)?),
+            Err(error) => reasons.push(error.to_string()),
+        }
+    }
+    inputs.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((inputs, reasons))
 }
 
 fn extern_path(value: &OsString) -> Option<PathBuf> {
@@ -120,14 +267,53 @@ fn is_ignored(path: &Path) -> bool {
         .any(|component| matches!(component.as_os_str().to_str(), Some(".git" | "target")))
 }
 
-fn digest_file(path: &Path) -> Result<InputDigest> {
+fn digest_file(path: &Path, logical_path: String) -> Result<ActionInput> {
     let bytes = fs::read(path).with_context(|| format!("reading input {}", path.display()))?;
     let size_bytes = u64::try_from(bytes.len()).context("input file is too large")?;
-    Ok(InputDigest {
-        path: display(path),
+    Ok(ActionInput {
+        path: logical_path,
         sha256: format!("{:x}", Sha256::digest(&bytes)),
         size_bytes,
     })
+}
+
+fn toolchain_identity(compiler: &Path) -> Result<ToolchainIdentity> {
+    let bytes = fs::read(compiler)
+        .with_context(|| format!("reading compiler executable {}", compiler.display()))?;
+    let version = Command::new(compiler)
+        .arg("-vV")
+        .output()
+        .with_context(|| format!("reading compiler identity from {}", compiler.display()))?;
+    if !version.status.success() {
+        anyhow::bail!(
+            "compiler identity command failed: {}",
+            String::from_utf8_lossy(&version.stderr).trim()
+        );
+    }
+    Ok(ToolchainIdentity {
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        size_bytes: u64::try_from(bytes.len()).context("compiler executable is too large")?,
+        version: String::from_utf8(version.stdout)
+            .context("compiler identity is not UTF-8")?
+            .trim()
+            .to_owned(),
+    })
+}
+
+fn absolute(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn logical_path(root: &str, relative: &Path) -> String {
+    if relative.as_os_str().is_empty() {
+        root.to_owned()
+    } else {
+        format!("{root}/{}", relative.to_string_lossy())
+    }
 }
 
 fn captured_environment() -> BTreeMap<String, String> {

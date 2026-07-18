@@ -21,8 +21,8 @@ Build scripts are initially executed by Cargo on the coordinator. Their compilat
 
 ## Milestones
 
-1. Capture and replay audit: record real Cargo actions and prove local wrapper transparency.
-2. Deterministic action model: normalize paths, predict outputs, identify toolchains, and reject incomplete inputs.
+1. **Complete:** Capture and replay audit: record real Cargo actions and prove local wrapper transparency.
+2. **Complete:** Deterministic action model: normalize paths, predict outputs, identify toolchains, and reject incomplete inputs. Real-Cargo tests prove identical worktrees share an action key and links fail closed.
 3. Reclient adapter: stage path-normalized action roots, generate explicit input/output lists, and use local execution with remote caching.
 4. REAPI execution: run eligible `rustc` actions through reclient on platform-matched workers and materialize outputs.
 5. Build-script sandboxing: trace and declare filesystem/environment effects before allowing remote execution.

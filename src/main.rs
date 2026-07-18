@@ -1,3 +1,4 @@
+mod action;
 mod capture;
 mod invocation;
 
@@ -57,6 +58,9 @@ fn run() -> Result<i32> {
     }
 
     let executable = env::current_exe().context("locating cargo-reapi executable")?;
+    let workspace_root = env::current_dir().context("locating Cargo workspace root")?;
+    let target_root = env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace_root.join("target"), PathBuf::from);
     let action_log = cli
         .action_log
         .unwrap_or_else(|| PathBuf::from("target/cargo-reapi/actions.jsonl"));
@@ -72,6 +76,8 @@ fn run() -> Result<i32> {
             },
         )
         .env("CARGO_REAPI_ACTION_LOG", action_log)
+        .env("CARGO_REAPI_WORKSPACE_ROOT", workspace_root)
+        .env("CARGO_REAPI_TARGET_ROOT", target_root)
         .status()
         .context("starting Cargo")?;
     Ok(status.code().unwrap_or(1))

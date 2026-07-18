@@ -6,7 +6,9 @@ The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a 
 
 ## Current status
 
-The capture milestone works: Cargo runs normally, every compiler action still executes locally, and a JSON Lines action log records the compiler command, Cargo environment, package inputs, explicit `--extern` artifacts, output directory, and content digests.
+The capture and deterministic-action milestones work: Cargo runs normally, every compiler action still executes locally, and a JSON Lines action log records the compiler command, Cargo environment, package inputs, explicit `--extern` artifacts, output directory, and content digests. Actions also carry a cross-worktree-stable key derived from normalized paths, input content, compiler identity, platform, arguments, environment, and outputs.
+
+Remote eligibility is fail-closed and auditable. Metadata-only compiler actions with fully mapped inputs and outputs can be marked eligible. Link actions are explicitly ineligible until native libraries, linker binaries, response files, generated linker arguments, and platform SDK inputs are completely represented. Identical real Cargo fixtures in different worktrees must produce the same action key in the integration suite.
 
 The reclient adapter for CAS upload, action execution, and output materialization is the next milestone. Reusing the production `rewrapper`/`reproxy` implementation keeps this project focused on Cargo and Rust action discovery. `--backend reapi` fails closed until that adapter is implemented; it never silently falls back to an unverified remote result.
 

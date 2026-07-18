@@ -38,6 +38,12 @@ impl RustcInvocation {
         value_after(&self.args, "--crate-name")
     }
 
+    pub fn is_link_action(&self) -> bool {
+        emit_values(&self.args)
+            .iter()
+            .any(|(kind, _)| kind == "link")
+    }
+
     pub fn out_dir(&self) -> Option<PathBuf> {
         value_after(&self.args, "--out-dir").map(PathBuf::from)
     }
@@ -175,5 +181,24 @@ mod tests {
                 ("link".to_owned(), None),
             ]
         );
+    }
+
+    #[test]
+    fn classifies_link_actions_from_emit_contract() {
+        let invocation = RustcInvocation {
+            compiler: PathBuf::from("rustc"),
+            args: ["--emit=dep-info,metadata,link"]
+                .map(OsString::from)
+                .to_vec(),
+            cwd: PathBuf::from("/workspace"),
+        };
+        assert!(invocation.is_link_action());
+
+        let metadata_only = RustcInvocation {
+            compiler: PathBuf::from("rustc"),
+            args: ["--emit=dep-info,metadata"].map(OsString::from).to_vec(),
+            cwd: PathBuf::from("/workspace"),
+        };
+        assert!(!metadata_only.is_link_action());
     }
 }
