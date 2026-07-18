@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DeterministicAction {
     pub compiler: ToolchainIdentity,
     pub platform: PlatformIdentity,
@@ -15,27 +15,27 @@ pub struct DeterministicAction {
     pub outputs: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolchainIdentity {
     pub sha256: String,
     pub size_bytes: u64,
     pub version: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PlatformIdentity {
     pub os: &'static str,
     pub arch: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ActionInput {
     pub path: String,
     pub sha256: String,
     pub size_bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RemoteEligibility {
     pub eligible: bool,
     pub reasons: Vec<String>,

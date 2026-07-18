@@ -1,4 +1,5 @@
 mod action;
+mod cache;
 mod capture;
 mod invocation;
 
@@ -10,6 +11,7 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
+use crate::cache::{CacheOptions, execute_cached};
 use crate::capture::{CaptureOptions, capture_invocation};
 use crate::invocation::RustcInvocation;
 
@@ -17,6 +19,7 @@ use crate::invocation::RustcInvocation;
 enum Backend {
     Local,
     Capture,
+    Cache,
     Reapi,
 }
 
@@ -30,6 +33,10 @@ struct Cli {
     /// JSON Lines action log. Defaults to target/cargo-reapi/actions.jsonl.
     #[arg(long)]
     action_log: Option<PathBuf>,
+
+    /// Shared filesystem CAS used by the cache backend.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 
     /// Arguments passed verbatim to Cargo.
     #[arg(last = true, required = true, num_args = 1..)]
@@ -56,6 +63,9 @@ fn run() -> Result<i32> {
     if matches!(cli.backend, Backend::Reapi) {
         bail!("the reclient adapter is not implemented yet; use --backend capture")
     }
+    if matches!(cli.backend, Backend::Cache) && cli.cache_dir.is_none() {
+        bail!("--backend cache requires an explicit shared --cache-dir")
+    }
 
     let executable = env::current_exe().context("locating cargo-reapi executable")?;
     let workspace_root = env::current_dir().context("locating Cargo workspace root")?;
@@ -64,7 +74,8 @@ fn run() -> Result<i32> {
     let action_log = cli
         .action_log
         .unwrap_or_else(|| PathBuf::from("target/cargo-reapi/actions.jsonl"));
-    let status = Command::new("cargo")
+    let mut cargo = Command::new("cargo");
+    cargo
         .args(&cli.cargo_args)
         .env("RUSTC_WRAPPER", executable)
         .env(
@@ -72,14 +83,17 @@ fn run() -> Result<i32> {
             match cli.backend {
                 Backend::Local => "local",
                 Backend::Capture => "capture",
+                Backend::Cache => "cache",
                 Backend::Reapi => unreachable!(),
             },
         )
         .env("CARGO_REAPI_ACTION_LOG", action_log)
         .env("CARGO_REAPI_WORKSPACE_ROOT", workspace_root)
-        .env("CARGO_REAPI_TARGET_ROOT", target_root)
-        .status()
-        .context("starting Cargo")?;
+        .env("CARGO_REAPI_TARGET_ROOT", target_root);
+    if let Some(cache_dir) = cli.cache_dir {
+        cargo.env("CARGO_REAPI_CACHE_DIR", cache_dir);
+    }
+    let status = cargo.status().context("starting Cargo")?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -89,6 +103,15 @@ fn run_wrapper(args: Vec<OsString>) -> Result<i32> {
     match backend.as_str() {
         "local" => invocation.execute(),
         "capture" => capture_invocation(&invocation, &CaptureOptions::from_env()?),
+        "cache" => execute_cached(
+            &invocation,
+            &CaptureOptions::from_env()?,
+            &CacheOptions::new(
+                env::var_os("CARGO_REAPI_CACHE_DIR")
+                    .map(PathBuf::from)
+                    .context("CARGO_REAPI_CACHE_DIR is required in cache mode")?,
+            ),
+        ),
         "reapi" => bail!("REAPI wrapper execution is not implemented yet"),
         value => bail!("unknown CARGO_REAPI_BACKEND value: {value}"),
     }

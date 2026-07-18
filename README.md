@@ -10,7 +10,9 @@ The capture and deterministic-action milestones work: Cargo runs normally, every
 
 Remote eligibility is fail-closed and auditable. Metadata-only compiler actions with fully mapped inputs and outputs can be marked eligible. Link actions are explicitly ineligible until native libraries, linker binaries, response files, generated linker arguments, and platform SDK inputs are completely represented. Identical real Cargo fixtures in different worktrees must produce the same action key in the integration suite.
 
-The reclient adapter for CAS upload, action execution, and output materialization is the next milestone. Reusing the production `rewrapper`/`reproxy` implementation keeps this project focused on Cargo and Rust action discovery. `--backend reapi` fails closed until that adapter is implemented; it never silently falls back to an unverified remote result.
+The local shared-cache backend now implements the complete action lifecycle: content-addressed output blobs, per-action cross-process locks, atomic publication, digest verification, dep-info path rewriting, and output materialization into independent worktrees. Concurrent identical actions execute once; waiters restore the published result. Corrupt blobs are rejected and rebuilt locally. Failed actions and remotely ineligible link actions are never published.
+
+The reclient adapter for remote CAS upload and action execution is the next milestone. Reusing the production `rewrapper`/`reproxy` implementation keeps this project focused on Cargo and Rust action discovery. `--backend reapi` fails closed until that adapter is implemented; it never silently falls back to an unverified remote result.
 
 The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
 
@@ -19,9 +21,10 @@ The public name is currently collision-free: a crates.io exact-name search retur
 ```sh
 cargo install --path .
 cargo reapi --backend capture -- test
+cargo reapi --backend cache --cache-dir /shared/cargo-reapi-cache -- check
 ```
 
-The default log is `target/cargo-reapi/actions.jsonl`. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
+The default log is `target/cargo-reapi/actions.jsonl`. Cache mode deliberately requires an explicit cache directory so separate worktrees share only the operator-selected store. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
 
 ## Design constraints
 

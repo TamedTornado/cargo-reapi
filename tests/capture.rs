@@ -1,4 +1,6 @@
+use std::fmt::Write as _;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
@@ -23,16 +25,26 @@ fn write_fixture(root: &std::path::Path, binary: bool) {
     .expect("fixture source");
 }
 
-fn capture(root: &std::path::Path, cargo_command: &str) -> Vec<Value> {
+fn run(
+    root: &std::path::Path,
+    cargo_command: &str,
+    backend: &str,
+    cache_dir: Option<&std::path::Path>,
+) -> Vec<Value> {
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
-    let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
+    command
         .current_dir(root)
-        .args(["--backend", "capture", "--action-log"])
-        .arg(&action_log)
+        .args(["--backend", backend, "--action-log"])
+        .arg(&action_log);
+    if let Some(cache_dir) = cache_dir {
+        command.arg("--cache-dir").arg(cache_dir);
+    }
+    let status = command
         .args(["--", cargo_command])
         .env("CARGO_REGISTRY_TOKEN", "do-not-record")
         .status()
-        .expect("run cargo-reapi capture");
+        .expect("run cargo-reapi");
     assert!(status.success());
     fs::read_to_string(action_log)
         .expect("action log")
@@ -41,11 +53,36 @@ fn capture(root: &std::path::Path, cargo_command: &str) -> Vec<Value> {
         .collect()
 }
 
+fn capture(root: &std::path::Path, cargo_command: &str) -> Vec<Value> {
+    run(root, cargo_command, "capture", None)
+}
+
 fn fixture_action(actions: &[Value]) -> &Value {
     actions
         .iter()
         .find(|action| action["crate_name"] == "capture_fixture")
         .expect("fixture compiler action")
+}
+
+fn cache_command(root: &Path, cache_dir: &Path) -> (Command, PathBuf) {
+    let action_log = root.join("target/cargo-reapi/actions.jsonl");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
+    command
+        .current_dir(root)
+        .args(["--backend", "cache", "--action-log"])
+        .arg(&action_log)
+        .arg("--cache-dir")
+        .arg(cache_dir)
+        .args(["--", "check"]);
+    (command, action_log)
+}
+
+fn read_actions(action_log: &Path) -> Vec<Value> {
+    fs::read_to_string(action_log)
+        .expect("action log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON action"))
+        .collect()
 }
 
 #[test]
@@ -65,7 +102,7 @@ fn cargo_driver_captures_real_rustc_actions_without_credentials() {
     assert!(
         action["working_directory"]
             .as_str()
-            .is_some_and(|path| path == "workspace")
+            .is_some_and(|path| path == "package")
     );
     assert!(actions.iter().all(|action| {
         action["environment"]
@@ -107,5 +144,158 @@ fn linked_binary_fails_remote_eligibility_closed() {
                     |reason| reason.contains("link action input discovery is incomplete")
                 ))
             )
+    );
+}
+
+#[test]
+fn shared_cache_restores_identical_action_outputs_across_worktrees() {
+    let cache = tempdir().expect("shared cache directory");
+    let first = tempdir().expect("first fixture directory");
+    let second = tempdir().expect("second fixture directory");
+    write_fixture(first.path(), false);
+    write_fixture(second.path(), false);
+
+    let first_actions = run(first.path(), "check", "cache", Some(cache.path()));
+    let second_actions = run(second.path(), "check", "cache", Some(cache.path()));
+    let first_action = fixture_action(&first_actions);
+    let second_action = fixture_action(&second_actions);
+
+    assert_eq!(first_action["action_key"], second_action["action_key"]);
+    assert_eq!(first_action["execution"], "local-cache-miss");
+    assert_eq!(second_action["execution"], "cache-hit");
+
+    let dep_info = fs::read_dir(second.path().join("target/debug/deps"))
+        .expect("second dependency output directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension().is_some_and(|extension| extension == "d")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("capture_fixture-"))
+        })
+        .expect("restored dep-info output");
+    let dep_info = fs::read_to_string(dep_info).expect("read restored dep-info");
+    assert!(!dep_info.contains(&first.path().to_string_lossy().to_string()));
+    assert!(dep_info.contains(&second.path().to_string_lossy().to_string()));
+}
+
+#[test]
+fn concurrent_identical_actions_execute_once_and_coalesce_on_the_lock() {
+    let cache = tempdir().expect("shared cache directory");
+    let first = tempdir().expect("first fixture directory");
+    let second = tempdir().expect("second fixture directory");
+    for fixture in [first.path(), second.path()] {
+        write_fixture(fixture, false);
+        let mut source = String::new();
+        for index in 0..8_000 {
+            writeln!(source, "pub fn value_{index}() -> usize {{ {index} }}")
+                .expect("write generated fixture source");
+        }
+        fs::write(fixture.join("src/lib.rs"), source).expect("large fixture source");
+    }
+
+    let (mut first_command, first_log) = cache_command(first.path(), cache.path());
+    let (mut second_command, second_log) = cache_command(second.path(), cache.path());
+    let mut first_child = first_command
+        .spawn()
+        .expect("start first cached Cargo action");
+    let mut second_child = second_command
+        .spawn()
+        .expect("start second cached Cargo action");
+    assert!(first_child.wait().expect("wait for first action").success());
+    assert!(
+        second_child
+            .wait()
+            .expect("wait for second action")
+            .success()
+    );
+
+    let first_actions = read_actions(&first_log);
+    let second_actions = read_actions(&second_log);
+    let executions = [
+        fixture_action(&first_actions)["execution"]
+            .as_str()
+            .expect("first execution"),
+        fixture_action(&second_actions)["execution"]
+            .as_str()
+            .expect("second execution"),
+    ];
+    assert!(executions.contains(&"local-cache-miss"));
+    assert!(executions.contains(&"cache-hit"));
+}
+
+#[test]
+fn corrupt_cached_blob_is_rejected_and_rebuilt_locally() {
+    let cache = tempdir().expect("shared cache directory");
+    let first = tempdir().expect("first fixture directory");
+    let second = tempdir().expect("second fixture directory");
+    let third = tempdir().expect("third fixture directory");
+    for fixture in [first.path(), second.path(), third.path()] {
+        write_fixture(fixture, false);
+    }
+
+    let first_actions = run(first.path(), "check", "cache", Some(cache.path()));
+    assert_eq!(
+        fixture_action(&first_actions)["execution"],
+        "local-cache-miss"
+    );
+    let blob = fs::read_dir(cache.path().join("blobs"))
+        .expect("cache blobs")
+        .next()
+        .expect("at least one cache blob")
+        .expect("cache blob entry")
+        .path();
+    fs::write(blob, b"corrupt").expect("corrupt cached blob");
+
+    let second_actions = run(second.path(), "check", "cache", Some(cache.path()));
+    assert_eq!(
+        fixture_action(&second_actions)["execution"],
+        "local-cache-miss"
+    );
+    let third_actions = run(third.path(), "check", "cache", Some(cache.path()));
+    assert_eq!(fixture_action(&third_actions)["execution"], "cache-hit");
+}
+
+#[test]
+fn dependency_package_outside_workspace_is_narrowly_mapped_and_eligible() {
+    let fixture = tempdir().expect("fixture directory");
+    let app = fixture.path().join("app");
+    let dependency = fixture.path().join("external-dependency");
+    fs::create_dir_all(app.join("src")).expect("application source directory");
+    fs::create_dir_all(dependency.join("src")).expect("dependency source directory");
+    fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nexternal-dependency={path='../external-dependency'}\n",
+    )
+    .expect("application manifest");
+    fs::write(
+        app.join("src/lib.rs"),
+        "pub use external_dependency::answer;\n",
+    )
+    .expect("application source");
+    fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname='external-dependency'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .expect("dependency manifest");
+    fs::write(
+        dependency.join("src/lib.rs"),
+        "pub fn answer() -> u8 { 42 }\n",
+    )
+    .expect("dependency source");
+
+    let actions = capture(&app, "check");
+    let action = actions
+        .iter()
+        .find(|action| action["crate_name"] == "external_dependency")
+        .expect("external dependency action");
+    assert_eq!(action["remote_eligibility"]["eligible"], true);
+    assert!(
+        action["inputs"]
+            .as_array()
+            .is_some_and(|inputs| inputs.iter().all(|input| input["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("package/"))))
     );
 }

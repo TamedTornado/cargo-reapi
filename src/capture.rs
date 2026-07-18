@@ -49,25 +49,57 @@ struct ActionCapture {
     inputs: Vec<ActionInput>,
     output_directory: Option<String>,
     output_files: Vec<String>,
+    execution: String,
     exit_code: i32,
+}
+
+#[derive(Debug)]
+pub struct PreparedInvocation {
+    pub action_key: String,
+    pub remote_eligibility: RemoteEligibility,
+    pub output_files: Vec<PreparedOutput>,
+    pub path_mappings: Vec<(String, String)>,
+    compiler: String,
+    toolchain: ToolchainIdentity,
+    platform: PlatformIdentity,
+    working_directory: String,
+    crate_name: Option<String>,
+    arguments: Vec<String>,
+    environment: BTreeMap<String, String>,
+    inputs: Vec<ActionInput>,
+    output_directory: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PreparedOutput {
+    pub logical_path: String,
+    pub actual_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
 struct CaptureRoots {
     workspace: PathBuf,
+    package: Option<PathBuf>,
     target: PathBuf,
     toolchain: PathBuf,
 }
 
 pub fn capture_invocation(invocation: &RustcInvocation, options: &CaptureOptions) -> Result<i32> {
+    let prepared = prepare_invocation(invocation)?;
+    let exit_code = invocation.execute()?;
+    record_invocation(options, &prepared, "local-capture", exit_code)?;
+    Ok(exit_code)
+}
+
+pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvocation> {
     let roots = CaptureRoots::from_env(invocation)?;
     let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots)?;
     let output_files = invocation.output_files()?;
-    let outputs = output_files
+    let normalized_outputs = output_files
         .iter()
         .map(|path| roots.normalize(path, &invocation.cwd))
         .collect::<Result<Vec<_>, _>>();
-    let outputs = match outputs {
+    let outputs = match normalized_outputs {
         Ok(outputs) => outputs,
         Err(error) => {
             eligibility_reasons.push(error.to_string());
@@ -128,15 +160,9 @@ pub fn capture_invocation(invocation: &RustcInvocation, options: &CaptureOptions
         outputs: outputs.clone(),
     };
     let key = action_key(&deterministic_action)?;
-    let exit_code = invocation.execute()?;
-    let capture = ActionCapture {
-        schema_version: 2,
-        captured_at_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before Unix epoch")?
-            .as_millis(),
-        compiler: display(&invocation.compiler),
+    Ok(PreparedInvocation {
         action_key: key,
+        compiler: display(&invocation.compiler),
         toolchain,
         platform,
         remote_eligibility: RemoteEligibility::from_reasons(eligibility_reasons),
@@ -149,11 +175,51 @@ pub fn capture_invocation(invocation: &RustcInvocation, options: &CaptureOptions
             .out_dir()
             .as_deref()
             .map(|path| roots.normalize_text(&display(path))),
-        output_files: outputs,
+        output_files: outputs
+            .into_iter()
+            .zip(output_files)
+            .map(|(logical_path, actual_path)| PreparedOutput {
+                logical_path,
+                actual_path: absolute(&actual_path, &invocation.cwd),
+            })
+            .collect(),
+        path_mappings: roots.path_mappings(),
+    })
+}
+
+pub fn record_invocation(
+    options: &CaptureOptions,
+    prepared: &PreparedInvocation,
+    execution: &str,
+    exit_code: i32,
+) -> Result<()> {
+    let capture = ActionCapture {
+        schema_version: 2,
+        captured_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_millis(),
+        compiler: prepared.compiler.clone(),
+        action_key: prepared.action_key.clone(),
+        toolchain: prepared.toolchain.clone(),
+        platform: prepared.platform.clone(),
+        remote_eligibility: prepared.remote_eligibility.clone(),
+        working_directory: prepared.working_directory.clone(),
+        crate_name: prepared.crate_name.clone(),
+        arguments: prepared.arguments.clone(),
+        environment: prepared.environment.clone(),
+        inputs: prepared.inputs.clone(),
+        output_directory: prepared.output_directory.clone(),
+        output_files: prepared
+            .output_files
+            .iter()
+            .map(|output| output.logical_path.clone())
+            .collect(),
+        execution: execution.to_owned(),
         exit_code,
     };
     append_capture(&options.action_log, &capture)?;
-    Ok(exit_code)
+    Ok(())
 }
 
 impl CaptureRoots {
@@ -172,6 +238,9 @@ impl CaptureRoots {
             .to_path_buf();
         Ok(Self {
             workspace: absolute(&workspace, &invocation.cwd),
+            package: env::var_os("CARGO_MANIFEST_DIR")
+                .map(PathBuf::from)
+                .map(|path| absolute(&path, &invocation.cwd)),
             target: absolute(&target, &invocation.cwd),
             toolchain: absolute(&toolchain, &invocation.cwd),
         })
@@ -179,33 +248,56 @@ impl CaptureRoots {
 
     fn normalize(&self, path: &Path, cwd: &Path) -> Result<String> {
         let absolute = absolute(path, cwd);
-        for (root, label) in [
-            (&self.target, "target"),
-            (&self.workspace, "workspace"),
-            (&self.toolchain, "toolchain"),
-        ] {
-            if let Ok(relative) = absolute.strip_prefix(root) {
-                return Ok(logical_path(label, relative));
-            }
+        if let Ok(relative) = absolute.strip_prefix(&self.target) {
+            return Ok(logical_path("target", relative));
+        }
+        if let Some(package) = &self.package
+            && let Ok(relative) = absolute.strip_prefix(package)
+        {
+            return Ok(logical_path("package", relative));
+        }
+        if let Ok(relative) = absolute.strip_prefix(&self.workspace) {
+            return Ok(logical_path("workspace", relative));
+        }
+        if let Ok(relative) = absolute.strip_prefix(&self.toolchain) {
+            return Ok(logical_path("toolchain", relative));
         }
         anyhow::bail!(
-            "path is outside declared workspace, target, and toolchain roots: {}",
+            "path is outside declared package, workspace, target, and toolchain roots: {}",
             absolute.display()
         )
     }
 
     fn normalize_text(&self, value: &str) -> String {
         let mut normalized = value.to_owned();
-        for (root, label) in [
-            (&self.target, "target"),
-            (&self.workspace, "workspace"),
-            (&self.toolchain, "toolchain"),
-        ] {
+        let mut mappings = vec![(&self.target, "target")];
+        if let Some(package) = &self.package {
+            mappings.push((package, "package"));
+        }
+        mappings.push((&self.workspace, "workspace"));
+        mappings.push((&self.toolchain, "toolchain"));
+        for (root, label) in mappings {
             if let Some(root) = root.to_str() {
                 normalized = normalized.replace(root, label);
             }
         }
         normalized
+    }
+
+    fn path_mappings(&self) -> Vec<(String, String)> {
+        let mut roots = vec![(&self.target, "target")];
+        if let Some(package) = &self.package {
+            roots.push((package, "package"));
+        }
+        roots.push((&self.workspace, "workspace"));
+        roots.push((&self.toolchain, "toolchain"));
+        roots
+            .into_iter()
+            .filter_map(|(root, label)| {
+                root.to_str()
+                    .map(|root| (label.to_owned(), root.to_owned()))
+            })
+            .collect()
     }
 }
 
@@ -232,8 +324,11 @@ fn discover_inputs(
         }
     }
 
-    if let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) {
-        for entry in WalkDir::new(manifest_dir)
+    for input_root in ["CARGO_MANIFEST_DIR", "OUT_DIR"]
+        .into_iter()
+        .filter_map(|name| env::var_os(name).map(PathBuf::from))
+    {
+        for entry in WalkDir::new(input_root)
             .follow_links(false)
             .into_iter()
             .filter_entry(|entry| !is_ignored(entry.path()))
