@@ -32,6 +32,14 @@ cargo reapi --backend reapi \
 
 The default log is `target/cargo-reapi/actions.jsonl`. Cache mode deliberately requires an explicit cache directory so separate worktrees share only the operator-selected store. REAPI mode expects `reproxy` to be started and stopped through reclient's `bootstrap` lifecycle outside each individual Cargo action. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
 
+For Linux container consumers, build the repository's image rather than bind-mounting a host binary across an OS boundary:
+
+```sh
+docker build -t cargo-reapi:local .
+```
+
+The image is also suitable as an init artifact source: its executable is at `/usr/local/bin/cargo-reapi`. Bro's optional local overlay uses that boundary, so cargo-reapi remains independently built and is not copied into Bro's source tree.
+
 ## Design constraints
 
 - Cargo owns dependency resolution, features, build scripts, proc macros, profiles, and command ordering.
