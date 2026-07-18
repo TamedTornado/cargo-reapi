@@ -1,0 +1,96 @@
+mod capture;
+mod invocation;
+
+use std::env;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::{Command, ExitCode};
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, ValueEnum};
+
+use crate::capture::{CaptureOptions, capture_invocation};
+use crate::invocation::RustcInvocation;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Backend {
+    Local,
+    Capture,
+    Reapi,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "cargo reapi", bin_name = "cargo reapi")]
+struct Cli {
+    /// Execution backend. Capture executes locally and records hermetic action inputs.
+    #[arg(long, value_enum, default_value_t = Backend::Capture)]
+    backend: Backend,
+
+    /// JSON Lines action log. Defaults to target/cargo-reapi/actions.jsonl.
+    #[arg(long)]
+    action_log: Option<PathBuf>,
+
+    /// Arguments passed verbatim to Cargo.
+    #[arg(last = true, required = true, num_args = 1..)]
+    cargo_args: Vec<OsString>,
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+        Err(error) => {
+            eprintln!("cargo-reapi: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<i32> {
+    let args: Vec<OsString> = env::args_os().collect();
+    if RustcInvocation::looks_like_wrapper(&args) {
+        return run_wrapper(args);
+    }
+
+    let cli = Cli::parse_from(strip_cargo_subcommand_name(args));
+    if matches!(cli.backend, Backend::Reapi) {
+        bail!("the reclient adapter is not implemented yet; use --backend capture")
+    }
+
+    let executable = env::current_exe().context("locating cargo-reapi executable")?;
+    let action_log = cli
+        .action_log
+        .unwrap_or_else(|| PathBuf::from("target/cargo-reapi/actions.jsonl"));
+    let status = Command::new("cargo")
+        .args(&cli.cargo_args)
+        .env("RUSTC_WRAPPER", executable)
+        .env(
+            "CARGO_REAPI_BACKEND",
+            match cli.backend {
+                Backend::Local => "local",
+                Backend::Capture => "capture",
+                Backend::Reapi => unreachable!(),
+            },
+        )
+        .env("CARGO_REAPI_ACTION_LOG", action_log)
+        .status()
+        .context("starting Cargo")?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn run_wrapper(args: Vec<OsString>) -> Result<i32> {
+    let invocation = RustcInvocation::parse(args)?;
+    let backend = env::var("CARGO_REAPI_BACKEND").unwrap_or_else(|_| "capture".to_owned());
+    match backend.as_str() {
+        "local" => invocation.execute(),
+        "capture" => capture_invocation(&invocation, &CaptureOptions::from_env()?),
+        "reapi" => bail!("REAPI wrapper execution is not implemented yet"),
+        value => bail!("unknown CARGO_REAPI_BACKEND value: {value}"),
+    }
+}
+
+fn strip_cargo_subcommand_name(mut args: Vec<OsString>) -> Vec<OsString> {
+    if args.get(1).is_some_and(|value| value == "reapi") {
+        args.remove(1);
+    }
+    args
+}
