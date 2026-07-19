@@ -18,8 +18,8 @@ driver=$(cd "$(dirname "$0")/.." && pwd)/target/release/cargo-reapi
 auditor=$(cd "$(dirname "$0")/.." && pwd)/target/release/cargo-reapi-auditor
 contract=$(cd "$(dirname "$0")/.." && pwd)/acceptance/contract.toml
 observer=$(cd "$(dirname "$0")/.." && pwd)/acceptance/rustc-observer/rustc
-real_rustc=$(command -v rustc)
-observed_rustc=$(rustup which rustc)
+real_rustc=$(rustup which rustc)
+observed_rustc=$real_rustc
 observed_clang=$(/usr/bin/xcrun --find clang)
 
 if ! sudo -n true 2>/dev/null; then
@@ -48,8 +48,10 @@ stop_os_observer() {
 
 "$driver" contract verify --path "$contract"
 "$driver" prove environment --storage-profile "$storage_profile" --report "$report_root/environment.json"
-git -C "$moria_root" diff --quiet
-git -C "$moria_root" diff --cached --quiet
+if [ -n "$(git -C "$moria_root" status --porcelain)" ]; then
+  echo "acceptance requires a completely clean Moria repository, including no untracked files" >&2
+  exit 2
+fi
 
 mkdir -p "$shared_cache" "$report_root"
 run_root=$(mktemp -d "$report_root/moria-proof.XXXXXX")
