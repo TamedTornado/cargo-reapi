@@ -14,6 +14,10 @@ case "$storage_profile" in
   ssd|rotational) ;;
   *) echo "storage profile must be ssd or rotational" >&2; exit 2 ;;
 esac
+moria_root=$(cd "$moria_root" && pwd)
+mkdir -p "$shared_cache" "$report_root"
+shared_cache=$(cd "$shared_cache" && pwd)
+report_root=$(cd "$report_root" && pwd)
 driver=$(cd "$(dirname "$0")/.." && pwd)/target/release/cargo-reapi
 auditor=$(cd "$(dirname "$0")/.." && pwd)/target/release/cargo-reapi-auditor
 contract=$(cd "$(dirname "$0")/.." && pwd)/acceptance/contract.toml
@@ -61,7 +65,6 @@ if [ -n "$(git -C "$moria_root" status --porcelain)" ]; then
   exit 2
 fi
 
-mkdir -p "$shared_cache" "$report_root"
 run_root=$(mktemp -d "$report_root/moria-proof.XXXXXX")
 rustc_trace=$run_root/rustc-trace
 mkdir -p "$rustc_trace"
