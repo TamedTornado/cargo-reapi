@@ -18,6 +18,10 @@ use crate::action::{
     action_key,
 };
 use crate::invocation::RustcInvocation;
+use crate::relocation::{
+    cache_slot, execution_slot, normalize_artifact_slots, record_path_mappings,
+    restored_logical_digest,
+};
 
 pub struct CaptureOptions {
     action_log: PathBuf,
@@ -42,6 +46,7 @@ struct ActionCapture {
     toolchain: ToolchainIdentity,
     platform: PlatformIdentity,
     remote_eligibility: RemoteEligibility,
+    cache_eligibility: RemoteEligibility,
     working_directory: String,
     crate_name: Option<String>,
     arguments: Vec<String>,
@@ -57,6 +62,7 @@ struct ActionCapture {
 pub struct PreparedInvocation {
     pub action_key: String,
     pub remote_eligibility: RemoteEligibility,
+    pub cache_eligibility: RemoteEligibility,
     pub output_files: Vec<PreparedOutput>,
     pub path_mappings: Vec<(String, String)>,
     pub arguments: Vec<String>,
@@ -104,6 +110,7 @@ pub fn capture_invocation(invocation: &RustcInvocation, options: &CaptureOptions
 
 pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvocation> {
     let roots = CaptureRoots::from_env(invocation)?;
+    record_path_mappings(&roots.path_mappings())?;
     let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots)?;
     let output_files = invocation.output_files()?;
     let normalized_outputs = output_files
@@ -119,12 +126,6 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
     };
     if outputs.is_empty() {
         eligibility_reasons.push("action has no declared outputs".to_owned());
-    }
-    if invocation.is_link_action() {
-        eligibility_reasons.push(
-            "link action input discovery is incomplete; native libraries, linker binaries, response files, and platform SDK inputs must be declared"
-                .to_owned(),
-        );
     }
     let working_directory = match roots.normalize(&invocation.cwd, &invocation.cwd) {
         Ok(path) => path,
@@ -171,6 +172,13 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         outputs: outputs.clone(),
     };
     let key = action_key(&deterministic_action)?;
+    let cache_eligibility = RemoteEligibility::from_reasons(eligibility_reasons.clone());
+    if invocation.requires_native_linker() {
+        eligibility_reasons.push(
+            "link action input discovery is incomplete; native libraries, linker binaries, response files, and platform SDK inputs must be declared"
+                .to_owned(),
+        );
+    }
     Ok(PreparedInvocation {
         action_key: key,
         toolchain_sha256: toolchain.sha256.clone(),
@@ -180,6 +188,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         toolchain,
         platform,
         remote_eligibility: RemoteEligibility::from_reasons(eligibility_reasons),
+        cache_eligibility,
         working_directory,
         crate_name: invocation.crate_name().map(lossy),
         arguments,
@@ -218,6 +227,7 @@ pub fn record_invocation(
         toolchain: prepared.toolchain.clone(),
         platform: prepared.platform.clone(),
         remote_eligibility: prepared.remote_eligibility.clone(),
+        cache_eligibility: prepared.cache_eligibility.clone(),
         working_directory: prepared.working_directory.clone(),
         crate_name: prepared.crate_name.clone(),
         arguments: prepared.arguments.clone(),
@@ -298,6 +308,13 @@ impl CaptureRoots {
         }
         mappings.push((&self.workspace, "workspace"));
         mappings.push((&self.toolchain, "toolchain"));
+        for (root, label) in &mappings {
+            if let Some(root) = root.to_str()
+                && let (Ok(execution), Ok(cached)) = (execution_slot(root), cache_slot(label))
+            {
+                normalized = normalized.replace(&execution, &cached);
+            }
+        }
         for (root, label) in mappings {
             if let Some(root) = root.to_str() {
                 normalized = normalized.replace(root, label);
@@ -366,7 +383,12 @@ fn discover_inputs(
     let mut reasons = Vec::new();
     for path in candidates {
         match roots.normalize(&path, &invocation.cwd) {
-            Ok(logical_path) => inputs.push(digest_file(&path, logical_path, &invocation.cwd)?),
+            Ok(logical_path) => inputs.push(digest_file(
+                &path,
+                logical_path,
+                &invocation.cwd,
+                &roots.path_mappings(),
+            )?),
             Err(error) => reasons.push(error.to_string()),
         }
     }
@@ -384,8 +406,22 @@ fn is_ignored(path: &Path) -> bool {
         .any(|component| matches!(component.as_os_str().to_str(), Some(".git" | "target")))
 }
 
-fn digest_file(path: &Path, logical_path: String, cwd: &Path) -> Result<PreparedInput> {
+fn digest_file(
+    path: &Path,
+    logical_path: String,
+    cwd: &Path,
+    mappings: &[(String, String)],
+) -> Result<PreparedInput> {
+    if let Some((sha256, size_bytes)) = restored_logical_digest(&absolute(path, cwd))? {
+        return Ok(PreparedInput {
+            logical_path,
+            actual_path: absolute(path, cwd),
+            sha256,
+            size_bytes,
+        });
+    }
     let bytes = fs::read(path).with_context(|| format!("reading input {}", path.display()))?;
+    let bytes = normalize_artifact_slots(bytes, mappings)?;
     let size_bytes = u64::try_from(bytes.len()).context("input file is too large")?;
     Ok(PreparedInput {
         logical_path,

@@ -90,6 +90,43 @@ mod tests {
     }
 
     #[test]
+    fn action_keys_invalidate_every_declared_correctness_dimension() {
+        let baseline = action(&["--crate-name", "demo"]);
+        let baseline_key = action_key(&baseline).expect("baseline key");
+
+        let mut mutations = Vec::new();
+        let mut toolchain = baseline.clone();
+        toolchain.compiler.sha256 = "different-toolchain".to_owned();
+        mutations.push(toolchain);
+        let mut platform = baseline.clone();
+        platform.platform.arch = "different-arch";
+        mutations.push(platform);
+        let mut environment = baseline.clone();
+        environment
+            .environment
+            .insert("CARGO_FEATURE_TEST".to_owned(), "1".to_owned());
+        mutations.push(environment);
+        let mut input = baseline.clone();
+        input.inputs.push(ActionInput {
+            path: "package/src/lib.rs".to_owned(),
+            sha256: "different-source".to_owned(),
+            size_bytes: 9,
+        });
+        mutations.push(input);
+        let mut output = baseline.clone();
+        output.outputs.push("target/demo.d".to_owned());
+        mutations.push(output);
+
+        for mutation in mutations {
+            assert_ne!(
+                action_key(&mutation).expect("mutated key"),
+                baseline_key,
+                "declared correctness dimension did not invalidate the key"
+            );
+        }
+    }
+
+    #[test]
     fn eligibility_reasons_are_stable_and_deduplicated() {
         let eligibility =
             RemoteEligibility::from_reasons(vec!["z".to_owned(), "a".to_owned(), "z".to_owned()]);

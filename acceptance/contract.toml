@@ -1,0 +1,60 @@
+schema_version = 1
+name = "moria-bevy-durable-artifact-reuse"
+platform_os = "macos"
+platform_arch = "aarch64"
+minimum_logical_cpus = 8
+minimum_memory_gib = 20
+minimum_bro_concurrency = 5
+admission_stress_multiplier = 2
+scheduler_property_population = 128
+single_warm_deadline_seconds = 60
+population_warm_deadline_seconds = 120
+maximum_build_rss_gib = 15
+maximum_swap_growth_mib = 512
+stall_seconds = 300
+cache_time_to_live_seconds = 0
+allow_threshold_overrides = false
+allow_gate_admission_limit = false
+require_clean_repositories = true
+require_empty_consumer_targets = true
+require_producer_exit_before_persistent_restore = true
+require_zero_warm_physical_actions = true
+require_mixed_key_physical_overlap = true
+require_bevy_fixture = true
+require_real_moria = true
+
+canonical_moria_gate = [
+  "cargo fmt --all -- --check",
+  "cargo check --all-targets",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test",
+]
+
+allowed_local_ineligible_reasons = [
+  "action has no declared outputs",
+]
+
+required_clause_prefixes = [
+  "ENV",
+  "PERSIST",
+  "COAL",
+  "PAR",
+  "SCALE",
+  "COR",
+  "INV",
+  "RES",
+  "INT",
+]
+
+clauses = [
+  "ENV-1: The proof host has at least 8 logical CPUs and 20 GiB physical memory and reports the exact toolchain and platform identity.",
+  "PERSIST-1: After a complete producer gate exits, its worktree and target are unavailable before any consumer starts; a clean consumer restores every cacheable artifact with no TTL assumption.",
+  "PERSIST-2: A single clean consumer completes the entire canonical Moria gate within 60 seconds with zero cacheable physical compiler or linker actions.",
+  "COAL-1: Simultaneous identical cold actions execute physically once; every waiter reports a coalesced restore and receives identical outputs.",
+  "PAR-1: Five independent clean Moria worktrees start the entire canonical gate simultaneously, before any member completes; no whole-gate admission limit or serial wave is permitted.",
+  "SCALE-1: Ten independent clean Moria worktrees (2N) are admitted simultaneously and complete the entire canonical gate within 120 seconds.",
+  "COR-1: Restored linked binaries preserve runtime behavior, embedded worktree paths resolve to the consumer, Moria tests pass, and macOS signatures are valid.",
+  "INV-1: Action keys change for source, generated, toolchain, linker, SDK, environment, and native-input changes, and remain identical across different-length worktree paths.",
+  "RES-1: Physical actions lease CPU and memory from one cross-process ledger; distinct keys overlap, peak build RSS stays at or below 15 GiB, swap grows by at most 512 MiB, and a 300-second no-progress interval is an infrastructure failure.",
+  "INT-1: Bro launches at least five Moria jobs concurrently through the standalone cargo-reapi interface; Bro does not own cargo-reapi source, deployment, or a hidden two-job/gate cap.",
+]

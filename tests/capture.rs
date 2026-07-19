@@ -10,14 +10,14 @@ use tempfile::tempdir;
 use std::os::unix::fs::PermissionsExt;
 
 fn write_fixture(root: &std::path::Path, binary: bool) {
-    fs::create_dir(root.join("src")).expect("source directory");
+    fs::create_dir_all(root.join("src")).expect("source directory");
     fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"capture-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )
     .expect("fixture manifest");
     let source = if binary {
-        "fn main() { println!(\"{}\", 42); }\n"
+        "fn main() { println!(\"{}\", env!(\"CARGO_MANIFEST_DIR\")); }\n"
     } else {
         "pub fn answer() -> u8 { 42 }\n"
     };
@@ -26,6 +26,36 @@ fn write_fixture(root: &std::path::Path, binary: bool) {
         source,
     )
     .expect("fixture source");
+}
+
+fn write_proc_macro_fixture(root: &Path) {
+    fs::create_dir_all(root.join("macro/src")).expect("macro source directory");
+    fs::create_dir_all(root.join("app/src")).expect("app source directory");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['macro','app']\nresolver='3'\n",
+    )
+    .expect("workspace manifest");
+    fs::write(
+        root.join("macro/Cargo.toml"),
+        "[package]\nname='identity-macro'\nversion='0.0.0'\nedition='2024'\n[lib]\nproc-macro=true\n",
+    )
+    .expect("macro manifest");
+    fs::write(
+        root.join("macro/src/lib.rs"),
+        "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro_attribute]\npub fn identity(_: TokenStream, item: TokenStream) -> TokenStream { item }\n",
+    )
+    .expect("macro source");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        "[package]\nname='macro-app'\nversion='0.0.0'\nedition='2024'\n[dependencies]\nidentity-macro={path='../macro'}\n",
+    )
+    .expect("app manifest");
+    fs::write(
+        root.join("app/src/main.rs"),
+        "use identity_macro::identity;\n#[identity]\nfn answer() -> u8 { 42 }\nfn main() { println!(\"{}:{}\", env!(\"CARGO_MANIFEST_DIR\"), answer()); }\n",
+    )
+    .expect("app source");
 }
 
 fn run(
@@ -38,6 +68,7 @@ fn run(
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
+        .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .args(["--backend", backend, "--action-log"])
         .arg(&action_log);
     if let Some(cache_dir) = cache_dir {
@@ -72,6 +103,7 @@ fn cache_command(root: &Path, cache_dir: &Path) -> (Command, PathBuf) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
+        .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .args(["--backend", "cache", "--action-log"])
         .arg(&action_log)
         .arg("--cache-dir")
@@ -86,6 +118,87 @@ fn read_actions(action_log: &Path) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid JSON action"))
         .collect()
+}
+
+fn run_snapshot_gate(root: &Path, cache_dir: &Path, action_log: &Path, cargo_args: &[&str]) {
+    let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(root)
+        .args(["--backend", "cache", "--action-log"])
+        .arg(action_log)
+        .arg("--cache-dir")
+        .arg(cache_dir)
+        .arg("--")
+        .args(cargo_args)
+        .status()
+        .expect("run whole-gate snapshot build");
+    assert!(status.success());
+}
+
+#[test]
+fn whole_gate_snapshot_restores_cargo_state_after_producer_deletion() {
+    let roots = tempdir().expect("snapshot worktrees");
+    let cache = tempdir().expect("snapshot cache");
+    let producer = roots.path().join("p");
+    let consumer = roots
+        .path()
+        .join("consumer-with-a-deliberately-different-path-length");
+    write_fixture(&producer, true);
+    write_fixture(&consumer, true);
+    let producer_log = roots.path().join("producer-actions.jsonl");
+    let consumer_log = roots.path().join("consumer-actions.jsonl");
+
+    run_snapshot_gate(
+        &producer,
+        cache.path(),
+        &producer_log,
+        &["build", "--all-targets"],
+    );
+    run_snapshot_gate(
+        &producer,
+        cache.path(),
+        &producer_log,
+        &["check", "--all-targets"],
+    );
+    assert!(producer_log.is_file(), "cold seed must perform actions");
+    let consumer_source = consumer.join("src/main.rs");
+    let unchanged_source = fs::read(&consumer_source).expect("read consumer source");
+    fs::write(&consumer_source, unchanged_source)
+        .expect("make consumer source newer than snapshot");
+    fs::remove_dir_all(&producer).expect("retire snapshot producer");
+    run_snapshot_gate(
+        &consumer,
+        cache.path(),
+        &consumer_log,
+        &["build", "--all-targets"],
+    );
+    run_snapshot_gate(
+        &consumer,
+        cache.path(),
+        &consumer_log,
+        &["check", "--all-targets"],
+    );
+    let consumer_actions = read_actions(&consumer_log);
+    assert_eq!(consumer_actions.len(), 2);
+    assert!(
+        consumer_actions
+            .iter()
+            .all(|action| action["execution"] == "gate-snapshot-hit")
+    );
+
+    let output = Command::new(consumer.join("target/debug/capture-fixture"))
+        .output()
+        .expect("run snapshot-restored executable");
+    assert!(
+        output.status.success(),
+        "snapshot executable failed: status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::canonicalize(String::from_utf8(output.stdout).unwrap().trim())
+            .expect("embedded manifest path"),
+        fs::canonicalize(&consumer).expect("consumer path")
+    );
 }
 
 #[test]
@@ -116,13 +229,16 @@ fn cargo_driver_captures_real_rustc_actions_without_credentials() {
 
 #[test]
 fn identical_projects_in_different_worktrees_have_the_same_action_key() {
-    let first = tempdir().expect("first fixture directory");
-    let second = tempdir().expect("second fixture directory");
-    write_fixture(first.path(), false);
-    write_fixture(second.path(), false);
+    let root = tempdir().expect("fixture parent directory");
+    let first = root.path().join("a");
+    let second = root.path().join("worktree-with-a-deliberately-longer-name");
+    fs::create_dir(&first).expect("first fixture directory");
+    fs::create_dir(&second).expect("second fixture directory");
+    write_fixture(&first, false);
+    write_fixture(&second, false);
 
-    let first_actions = capture(first.path(), "check");
-    let second_actions = capture(second.path(), "check");
+    let first_actions = capture(&first, "check");
+    let second_actions = capture(&second, "check");
     let first_action = fixture_action(&first_actions);
     let second_action = fixture_action(&second_actions);
 
@@ -147,6 +263,72 @@ fn linked_binary_fails_remote_eligibility_closed() {
                     |reason| reason.contains("link action input discovery is incomplete")
                 ))
             )
+    );
+}
+
+#[test]
+fn linked_binary_is_durably_cached_and_runs_in_a_later_worktree() {
+    let cache = tempdir().expect("shared cache directory");
+    let first = tempdir().expect("first fixture directory");
+    let second = tempdir().expect("second fixture directory");
+    write_fixture(first.path(), true);
+    write_fixture(second.path(), true);
+
+    let first_actions = run(first.path(), "build", "cache", Some(cache.path()));
+    let first_action = fixture_action(&first_actions).clone();
+    drop(first);
+    let second_actions = run(second.path(), "build", "cache", Some(cache.path()));
+    let second_action = fixture_action(&second_actions);
+
+    assert_eq!(first_action["execution"], "local-cache-miss");
+    assert_eq!(second_action["execution"], "cache-hit");
+    assert_eq!(first_action["action_key"], second_action["action_key"]);
+    assert_eq!(second_action["cache_eligibility"]["eligible"], true);
+
+    let output = Command::new(second.path().join("target/debug/capture-fixture"))
+        .output()
+        .expect("execute restored binary");
+    assert!(output.status.success());
+    let embedded_manifest = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        fs::canonicalize(embedded_manifest.trim()).expect("embedded consumer manifest path"),
+        fs::canonicalize(second.path()).expect("consumer manifest path")
+    );
+}
+
+#[test]
+fn restored_proc_macro_signature_does_not_invalidate_its_consumer() {
+    let cache = tempdir().expect("shared cache directory");
+    let first = tempdir().expect("first fixture directory");
+    let second = tempdir().expect("second fixture directory");
+    write_proc_macro_fixture(first.path());
+    write_proc_macro_fixture(second.path());
+
+    let first_actions = run(first.path(), "build", "cache", Some(cache.path()));
+    assert!(
+        first_actions
+            .iter()
+            .any(|action| action["crate_name"] == "identity_macro")
+    );
+    drop(first);
+    let second_actions = run(second.path(), "build", "cache", Some(cache.path()));
+    assert!(second_actions.iter().all(|action| {
+        matches!(
+            action["execution"].as_str(),
+            Some("cache-hit" | "local-ineligible")
+        )
+    }));
+
+    let output = Command::new(second.path().join("target/debug/macro-app"))
+        .output()
+        .expect("execute restored proc-macro consumer");
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).expect("consumer output");
+    let (manifest, answer) = output.trim().rsplit_once(':').expect("output fields");
+    assert_eq!(answer, "42");
+    assert_eq!(
+        fs::canonicalize(manifest).expect("embedded manifest"),
+        fs::canonicalize(second.path().join("app")).expect("consumer app path")
     );
 }
 
@@ -225,7 +407,7 @@ fn concurrent_identical_actions_execute_once_and_coalesce_on_the_lock() {
             .expect("second execution"),
     ];
     assert!(executions.contains(&"local-cache-miss"));
-    assert!(executions.contains(&"cache-hit"));
+    assert!(executions.contains(&"coalesced-hit"));
 }
 
 #[test]

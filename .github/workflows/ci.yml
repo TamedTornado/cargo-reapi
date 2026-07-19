@@ -1,9 +1,14 @@
 name: CI
 
 on:
-  pull_request:
+  workflow_dispatch:
   push:
     branches: [main]
+
+# Hosted CI is opportunistic portability validation only. It does not publish,
+# deploy, merge, or constitute cargo-reapi/Moria acceptance. The real Bevy and
+# Moria integration proofs require the local executable contract and are not run
+# on GitHub-hosted machines.
 
 jobs:
   test:
@@ -18,4 +23,4 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+      - run: cargo test --bin cargo-reapi

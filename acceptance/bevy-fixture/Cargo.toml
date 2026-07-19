@@ -1,0 +1,10 @@
+[package]
+name = "cargo-reapi-bevy-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bevy = { version = "=0.19.0", default-features = false, features = ["bevy_state", "3d"] }
+
+[workspace]

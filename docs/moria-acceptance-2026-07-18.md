@@ -1,10 +1,15 @@
 # Moria local acceptance — 2026-07-18
 
+> Historical failed proof, retained as evidence. This run serialized five logical
+> gates through a two-process admission cap and still executed cacheable actions.
+> It does **not** satisfy the current embedded contract in
+> `acceptance/contract.toml`, particularly PAR-1, PERSIST-2, or SCALE-1.
+
 ## Scope
 
 This run exercised the local shared-CAS backend against Moria's real Bevy dependency graph. It did not use GitHub CI, a PR workflow, or a remote REAPI service.
 
-Five detached worktrees at Moria commit `6542cb5` used independent `CARGO_TARGET_DIR` roots, one shared cargo-reapi cache, and `cargo check -p moria-world --lib -j 1`. Physical admission was bounded to two simultaneous Cargo processes. The cache was pre-populated by one cold worktree before the five-worktree measurement.
+Five detached worktrees at Moria commit `6542cb5` used independent `CARGO_TARGET_DIR` roots, one shared cargo-reapi cache, and `cargo check -p moria-world --lib -j 1`. Physical admission was incorrectly bounded to two simultaneous Cargo processes. The cache was pre-populated by one cold worktree before the five-worktree measurement.
 
 The same standalone source was also built as a Linux image and consumed by Bro's 2-CPU/4-GiB build-worker. A cold Linux `moria-world` check completed successfully through the mounted cargo-reapi executable and named cache volume.
 

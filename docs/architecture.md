@@ -23,10 +23,10 @@ Build scripts are initially executed by Cargo on the coordinator. Their compilat
 
 1. **Complete:** Capture and replay audit: record real Cargo actions and prove local wrapper transparency.
 2. **Complete:** Deterministic action model: normalize paths, predict outputs, identify toolchains, and reject incomplete inputs. Real-Cargo tests prove identical worktrees share an action key and links fail closed.
-3. **Complete:** The local CAS substrate provides path-normalized action keys, content-addressed blobs, single-flight locking, atomic publication, verified restore, and dep-info relocation across independent Cargo worktrees. The reclient adapter stages explicit action roots, binds platform/toolchain identity, invokes `rewrapper`, and materializes declared outputs; integration tests exercise the transport with a fake rewrapper.
+3. **Complete:** The local CAS substrate provides path-normalized action keys, content-addressed blobs, single-flight locking, atomic publication, verified restore, fixed-width artifact relocation, macOS re-signing, whole-gate target snapshots, and a cross-process physical-action resource ledger. Linked artifacts include discovered native, linker, SDK, and response-file inputs. Producer-deletion tests cover runnable binaries and embedded manifest paths. Pinned Bevy and the locked one/five/ten-member Moria acceptance pass.
 4. **Infrastructure validation pending:** Run eligible `rustc` actions through reclient against a live REAPI service with platform-matched workers, then compare artifacts and failure behavior with local Cargo.
 5. Build-script sandboxing: trace and declare filesystem/environment effects before allowing remote execution.
-6. Bro integration: per-project policy, telemetry, bounded admission, fallback behavior, and five-worktree acceptance.
+6. **In validation:** Bro invokes the standalone driver for cacheable canonical gates and may launch five or ten logical gates simultaneously; resource control belongs around physical cache misses, not around whole Cargo gates. cargo-reapi remains a separate project and deployment artifact.
 
 ## Schedule guardrails
 
@@ -52,4 +52,4 @@ The diagnostic measurement cannot satisfy the production acceptance gate. It kee
 
 ## Acceptance
 
-The production gate is the same Cargo command set used without the wrapper: format, check, clippy, and test. A backend is acceptable only when exit status and produced artifacts match, stale results cannot be accepted, peak coordinator memory stays within its configured cap, and five independent worktrees can progress under bounded admission. A 60-second identical warm-gate target and a 15-minute five-worktree warm target remain performance goals; failure to cache final links must be reported explicitly and cannot be hidden by the compiler-only diagnostic.
+The production gate is the same Cargo command set used without the wrapper: format, check, clippy, and test. The immutable executable contract is `acceptance/contract.toml`; `cargo reapi contract verify` rejects drift and `cargo reapi prove` writes machine-readable evidence. Five and 2N worktrees must start simultaneously. Whole-gate admission limits, serialized waves, threshold overrides, compiler-only substitutions, and producer-resident targets are not valid proofs. Resource leases constrain only physical cache misses.

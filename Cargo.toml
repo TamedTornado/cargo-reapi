@@ -9,11 +9,12 @@ rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 fs2 = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+toml = "0.9"
 walkdir = "2.5"
 
 [dev-dependencies]
