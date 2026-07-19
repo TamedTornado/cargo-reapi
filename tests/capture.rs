@@ -1270,6 +1270,13 @@ fn whole_gate_snapshot_restores_cargo_state_after_producer_deletion() {
             .iter()
             .all(|action| action["execution"] == "gate-snapshot-hit")
     );
+    assert!(
+        fs::read_dir(&consumer_trace)
+            .expect("consumer rustc trace")
+            .next()
+            .is_none(),
+        "a restored whole-gate hit must not execute rustc, including Cargo metadata probes"
+    );
 
     let output = Command::new(consumer.join("target/debug/capture-fixture"))
         .output()

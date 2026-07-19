@@ -395,7 +395,7 @@ fn gate_key(
 
     hash_tree(&mut hasher, workspace, "workspace", target, action_log)?;
     hash_cargo_configuration(&mut hasher, workspace)?;
-    hash_external_path_dependencies(&mut hasher, workspace, target, action_log)?;
+    hash_external_path_dependencies(&mut hasher, cache, workspace, target, action_log)?;
     let mut declared_inputs = declared_inputs.to_vec();
     declared_inputs.sort();
     declared_inputs.dedup();
@@ -603,14 +603,12 @@ fn hash_tool_identity(hasher: &mut Sha256, name: &str) -> Result<()> {
 
 fn hash_external_path_dependencies(
     hasher: &mut Sha256,
+    cache: &Path,
     workspace: &Path,
     target: &Path,
     action_log: &Path,
 ) -> Result<()> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1"])
-        .current_dir(workspace)
-        .output()
+    let output = crate::query::cargo_metadata_output(workspace, cache, &[])
         .context("running cargo metadata for gate key")?;
     if !output.status.success() {
         bail!(

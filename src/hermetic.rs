@@ -335,7 +335,7 @@ fn build_policy(
     control_temporary: &Path,
     explicit_inputs: &[PathBuf],
 ) -> Result<SrtPolicy> {
-    let mut readable = package_roots(workspace)?;
+    let mut readable = package_roots(workspace, cache)?;
     readable.extend([
         workspace.to_path_buf(),
         target.to_path_buf(),
@@ -613,12 +613,8 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn package_roots(workspace: &Path) -> Result<BTreeSet<PathBuf>> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--offline"])
-        .env("CARGO_NET_OFFLINE", "true")
-        .current_dir(workspace)
-        .output()
+fn package_roots(workspace: &Path, cache: &Path) -> Result<BTreeSet<PathBuf>> {
+    let output = crate::query::cargo_metadata_output(workspace, cache, &["--offline"])
         .context("running cargo metadata for the strict snapshot policy")?;
     if !output.status.success() {
         bail!(

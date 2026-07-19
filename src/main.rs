@@ -6,6 +6,7 @@ mod gate;
 mod hermetic;
 mod invocation;
 mod proof;
+mod query;
 mod reclient;
 mod relocation;
 mod resource;
@@ -202,6 +203,9 @@ fn main() -> ExitCode {
 
 fn run() -> Result<i32> {
     let args: Vec<OsString> = env::args_os().collect();
+    if env::var_os("CARGO_REAPI_RUSTC_QUERY_SHIM").is_some() {
+        return query::run_shim(args);
+    }
     if env::var_os("CARGO_REAPI_LINKER_CAPTURE").is_some() {
         return run_linker_capture(args);
     }
