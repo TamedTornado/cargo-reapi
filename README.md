@@ -2,9 +2,9 @@
 
 The binding project acceptance requirements are recorded in
 [`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). The
-current status is **not yet satisfied**: individual timing reports and test
-passes are partial evidence until the aggregate proof required by that document
-exists and passes.
+current aggregate status is **not yet satisfied**. The externally observed
+Moria SSD receipt now passes, but it remains one part of the aggregate proof
+required by that document.
 
 `cargo-reapi` is an experimental Cargo-native path to remote execution. Cargo remains the build planner and source of truth; the tool observes the exact `rustc` commands Cargo schedules through `RUSTC_WRAPPER`, captures their inputs, and will translate those actions to the Remote Execution API (REAPI).
 
@@ -30,6 +30,8 @@ The local shared-cache backend implements content-addressed output blobs, per-ac
 The reclient transport adapter stages eligible actions into explicit input roots, invokes the production `rewrapper` client with declared inputs and outputs, and materializes successful outputs back into Cargo's target directory. Its platform template must bind `{os}`, `{arch}`, and `{toolchain_sha256}` so an action cannot silently execute against a mismatched worker toolchain. Real remote execution still requires an operator-provided reclient installation, a running `reproxy`, and a platform-matched REAPI service. The repository test suite exercises the complete adapter against a behaviorally faithful fake `rewrapper`; validation against a live service is the next infrastructure milestone.
 
 The first bounded [five-worktree Moria experiment](docs/moria-acceptance-2026-07-18.md) is retained as failed evidence: it used serialized two-process waves and executed cacheable work. The later [self-reported Moria experiment](docs/moria-acceptance-2026-07-19.md) met its timing thresholds, but predates external compiler observation and is therefore also historical, unaudited evidence rather than an acceptance result. The thresholds and anti-escape clauses are embedded from `acceptance/contract.toml`; only a complete externally observed `cargo reapi prove` report can claim success.
+
+The current [real-world benchmark record](benchmarks/results/2026-07-19-local.md#moria-ssd-acceptance-receipt) contains the first externally observed Moria SSD pass: 9.441s for one worktree, 14.918s for five simultaneous worktrees, and 26.639s for ten simultaneous worktrees, with zero OS-observed compiler/linker executions in every warm population. This satisfies the Moria population receipt; it does not by itself satisfy the aggregate publication gate.
 
 The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
 
