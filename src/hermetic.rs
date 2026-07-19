@@ -264,8 +264,34 @@ pub fn policy_identity_bytes(
         &control_temporary,
         explicit_inputs,
     )?;
-    let bytes = canonical_policy_bytes(&policy)?;
-    let text = String::from_utf8(bytes)?
+    normalize_policy_identity_bytes(
+        canonical_policy_bytes(&policy)?,
+        &control_temporary,
+        env::var_os("CARGO_REAPI_RUSTC_TRACE")
+            .map(PathBuf::from)
+            .as_deref(),
+        &workspace,
+        &target,
+        &cache,
+        &action_log,
+    )
+}
+
+fn normalize_policy_identity_bytes(
+    bytes: Vec<u8>,
+    control_temporary: &Path,
+    rustc_trace: Option<&Path>,
+    workspace: &Path,
+    target: &Path,
+    cache: &Path,
+    action_log: &Path,
+) -> Result<Vec<u8>> {
+    let mut text = String::from_utf8(bytes)?;
+    if let Some(trace) = rustc_trace {
+        let trace = canonical_or_absolute(trace)?;
+        text = text.replace(&trace.to_string_lossy().to_string(), "<rustc-trace>");
+    }
+    let text = text
         .replace(
             &control_temporary.to_string_lossy().to_string(),
             "<srt-control>",
@@ -274,7 +300,28 @@ pub fn policy_identity_bytes(
         .replace(&target.to_string_lossy().to_string(), "<target>")
         .replace(&cache.to_string_lossy().to_string(), "<cache>")
         .replace(&action_log.to_string_lossy().to_string(), "<action-log>");
-    Ok(text.into_bytes())
+    let mut policy: serde_json::Value = serde_json::from_str(&text)?;
+    sort_string_arrays(&mut policy);
+    Ok(serde_json::to_vec_pretty(&policy)?)
+}
+
+fn sort_string_arrays(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values.iter_mut() {
+                sort_string_arrays(value);
+            }
+            if values.iter().all(serde_json::Value::is_string) {
+                values.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for value in fields.values_mut() {
+                sort_string_arrays(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -704,7 +751,11 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SrtFilesystemPolicy, SrtNetworkPolicy, SrtPolicy, canonical_policy_bytes};
+    use super::{
+        SrtFilesystemPolicy, SrtNetworkPolicy, SrtPolicy, canonical_policy_bytes,
+        normalize_policy_identity_bytes,
+    };
+    use std::path::Path;
 
     #[test]
     fn strict_policy_is_fail_closed() {
@@ -735,5 +786,31 @@ mod tests {
         assert_eq!(value["enableWeakerNestedSandbox"], false);
         assert_eq!(value["enableWeakerNetworkIsolation"], false);
         assert_eq!(value["allowAppleEvents"], false);
+    }
+
+    #[test]
+    fn policy_identity_ignores_external_observer_output_location() {
+        let first = normalize_policy_identity_bytes(
+            br#"{"allowWrite":["/tmp/trace-one","/tmp/workspace/target"]}"#.to_vec(),
+            Path::new("/tmp/control"),
+            Some(Path::new("/tmp/trace-one")),
+            Path::new("/tmp/workspace"),
+            Path::new("/tmp/workspace/target"),
+            Path::new("/tmp/cache"),
+            Path::new("/tmp/actions"),
+        )
+        .unwrap();
+        let second = normalize_policy_identity_bytes(
+            br#"{"allowWrite":["/tmp/workspace-longer/target","/tmp/trace-two"]}"#.to_vec(),
+            Path::new("/tmp/control"),
+            Some(Path::new("/tmp/trace-two")),
+            Path::new("/tmp/workspace-longer"),
+            Path::new("/tmp/workspace-longer/target"),
+            Path::new("/tmp/cache"),
+            Path::new("/tmp/actions"),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert!(String::from_utf8(first).unwrap().contains("<rustc-trace>"));
     }
 }

@@ -59,6 +59,36 @@ fn write_proc_macro_fixture(root: &Path) {
     .expect("app source");
 }
 
+fn write_library_app_fixture(root: &Path) {
+    fs::create_dir_all(root.join("leaf/src")).expect("leaf source directory");
+    fs::create_dir_all(root.join("app/src")).expect("app source directory");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['leaf','app']\nresolver='3'\n",
+    )
+    .expect("workspace manifest");
+    fs::write(
+        root.join("leaf/Cargo.toml"),
+        "[package]\nname='relocated-leaf'\nversion='0.0.0'\nedition='2024'\n",
+    )
+    .expect("leaf manifest");
+    fs::write(
+        root.join("leaf/src/lib.rs"),
+        "pub fn answer() -> u8 { 42 }\n",
+    )
+    .expect("leaf source");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        "[package]\nname='relocated-app'\nversion='0.0.0'\nedition='2024'\n[dependencies]\nrelocated-leaf={path='../leaf'}\n",
+    )
+    .expect("app manifest");
+    fs::write(
+        root.join("app/src/main.rs"),
+        "fn main() { println!(\"{}:{}\", env!(\"CARGO_MANIFEST_DIR\"), relocated_leaf::answer()); }\n",
+    )
+    .expect("app source");
+}
+
 fn run(
     root: &std::path::Path,
     cargo_command: &str,
@@ -170,6 +200,7 @@ fn run_snapshot_gate_with_inputs(
         command.env(name, value);
     }
     if let Some(trace) = trace {
+        fs::create_dir_all(trace).expect("rustc observer trace directory");
         let sysroot = Command::new("rustc")
             .args(["--print", "sysroot"])
             .output()
@@ -1179,18 +1210,30 @@ fn whole_gate_snapshot_restores_cargo_state_after_producer_deletion() {
     write_fixture(&consumer, true);
     let producer_log = roots.path().join("producer-actions.jsonl");
     let consumer_log = roots.path().join("consumer-actions.jsonl");
+    let producer_trace = roots.path().join("producer-rustc-trace");
+    let consumer_trace = roots.path().join("consumer-rustc-trace");
 
-    run_snapshot_gate(
-        &producer,
-        cache.path(),
-        &producer_log,
-        &["build", "--all-targets"],
+    assert!(
+        run_snapshot_gate_with_environment(
+            &producer,
+            cache.path(),
+            &producer_log,
+            &["build", "--all-targets"],
+            &[],
+            Some(&producer_trace),
+        )
+        .success()
     );
-    run_snapshot_gate(
-        &producer,
-        cache.path(),
-        &producer_log,
-        &["check", "--all-targets"],
+    assert!(
+        run_snapshot_gate_with_environment(
+            &producer,
+            cache.path(),
+            &producer_log,
+            &["check", "--all-targets"],
+            &[],
+            Some(&producer_trace),
+        )
+        .success()
     );
     assert!(producer_log.is_file(), "cold seed must perform actions");
     let consumer_source = consumer.join("src/main.rs");
@@ -1198,17 +1241,27 @@ fn whole_gate_snapshot_restores_cargo_state_after_producer_deletion() {
     fs::write(&consumer_source, unchanged_source)
         .expect("make consumer source newer than snapshot");
     fs::remove_dir_all(&producer).expect("retire snapshot producer");
-    run_snapshot_gate(
-        &consumer,
-        cache.path(),
-        &consumer_log,
-        &["build", "--all-targets"],
+    assert!(
+        run_snapshot_gate_with_environment(
+            &consumer,
+            cache.path(),
+            &consumer_log,
+            &["build", "--all-targets"],
+            &[],
+            Some(&consumer_trace),
+        )
+        .success()
     );
-    run_snapshot_gate(
-        &consumer,
-        cache.path(),
-        &consumer_log,
-        &["check", "--all-targets"],
+    assert!(
+        run_snapshot_gate_with_environment(
+            &consumer,
+            cache.path(),
+            &consumer_log,
+            &["check", "--all-targets"],
+            &[],
+            Some(&consumer_trace),
+        )
+        .success()
     );
     let consumer_actions = read_actions(&consumer_log);
     assert_eq!(consumer_actions.len(), 2);
@@ -1380,6 +1433,50 @@ fn restored_proc_macro_signature_does_not_invalidate_its_consumer() {
     let output = Command::new(second.path().join("target/debug/macro-app"))
         .output()
         .expect("execute restored proc-macro consumer");
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).expect("consumer output");
+    let (manifest, answer) = output.trim().rsplit_once(':').expect("output fields");
+    assert_eq!(answer, "42");
+    assert_eq!(
+        fs::canonicalize(manifest).expect("embedded manifest"),
+        fs::canonicalize(second.path().join("app")).expect("consumer app path")
+    );
+}
+
+#[test]
+fn restored_rlib_keeps_the_downstream_link_action_key() {
+    let cache = tempdir().expect("shared cache directory");
+    let first = tempdir().expect("first fixture directory");
+    let second = tempdir().expect("second fixture directory");
+    write_library_app_fixture(first.path());
+    write_library_app_fixture(second.path());
+
+    let first_actions = run(first.path(), "build", "cache", Some(cache.path()));
+    let first_app = first_actions
+        .iter()
+        .find(|action| action["crate_name"] == "relocated_app")
+        .expect("first app link action");
+    assert_eq!(first_app["execution"], "local-cache-miss");
+    let first_key = first_app["action_key"].clone();
+    drop(first);
+
+    let second_actions = run(second.path(), "build", "cache", Some(cache.path()));
+    let second_app = second_actions
+        .iter()
+        .find(|action| action["crate_name"] == "relocated_app")
+        .expect("second app link action");
+    assert_eq!(second_app["action_key"], first_key);
+    assert_eq!(second_app["execution"], "cache-hit");
+    assert!(second_actions.iter().all(|action| {
+        matches!(
+            action["execution"].as_str(),
+            Some("cache-hit" | "local-ineligible")
+        )
+    }));
+
+    let output = Command::new(second.path().join("target/debug/relocated-app"))
+        .output()
+        .expect("execute restored rlib consumer");
     assert!(output.status.success());
     let output = String::from_utf8(output.stdout).expect("consumer output");
     let (manifest, answer) = output.trim().rsplit_once(':').expect("output fields");

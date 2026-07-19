@@ -801,11 +801,13 @@ fn publish(options: &CacheOptions, prepared: &PreparedInvocation) -> Result<bool
         let path_rewritten = bytes != original;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         publish_blob(options, &sha256, &bytes)?;
-        record_logical_digest(
-            &output.actual_path,
-            &sha256,
-            u64::try_from(bytes.len()).context("cached output is too large")?,
-        )?;
+        if path_rewritten {
+            record_logical_digest(
+                &output.actual_path,
+                &sha256,
+                u64::try_from(bytes.len()).context("cached output is too large")?,
+            )?;
+        }
         outputs.push(CachedOutput {
             logical_path: output.logical_path.clone(),
             sha256,
@@ -894,7 +896,10 @@ fn materialize_blob(
     }
     fs::rename(&temporary, output)
         .with_context(|| format!("installing cached output {}", output.display()))?;
-    record_logical_digest(output, &cached.sha256, cached.size_bytes)
+    if cached.path_rewritten {
+        record_logical_digest(output, &cached.sha256, cached.size_bytes)?;
+    }
+    Ok(())
 }
 
 fn rewrite_paths_for_cache(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Vec<u8> {

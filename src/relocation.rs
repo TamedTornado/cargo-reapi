@@ -106,7 +106,19 @@ pub fn record_logical_digest(
     logical_sha256: &str,
     logical_size_bytes: u64,
 ) -> Result<()> {
-    let Some(receipt_path) = receipt_path(actual_path) else {
+    let Some(target) = std::env::var_os("CARGO_REAPI_TARGET_ROOT").map(PathBuf::from) else {
+        return Ok(());
+    };
+    record_logical_digest_for_target(&target, actual_path, logical_sha256, logical_size_bytes)
+}
+
+fn record_logical_digest_for_target(
+    target: &Path,
+    actual_path: &Path,
+    logical_sha256: &str,
+    logical_size_bytes: u64,
+) -> Result<()> {
+    let Some(receipt_path) = receipt_path(target, actual_path) else {
         return Ok(());
     };
     let metadata = fs::metadata(actual_path)
@@ -168,7 +180,17 @@ pub fn record_path_mappings(mappings: &[(String, String)]) -> Result<()> {
 }
 
 pub fn restored_logical_digest(actual_path: &Path) -> Result<Option<(String, u64)>> {
-    let Some(receipt_path) = receipt_path(actual_path) else {
+    let Some(target) = std::env::var_os("CARGO_REAPI_TARGET_ROOT").map(PathBuf::from) else {
+        return Ok(None);
+    };
+    restored_logical_digest_for_target(&target, actual_path)
+}
+
+fn restored_logical_digest_for_target(
+    target: &Path,
+    actual_path: &Path,
+) -> Result<Option<(String, u64)>> {
+    let Some(receipt_path) = receipt_path(target, actual_path) else {
         return Ok(None);
     };
     let Ok(encoded) = fs::read(&receipt_path) else {
@@ -186,8 +208,6 @@ pub fn restored_logical_digest(actual_path: &Path) -> Result<Option<(String, u64
     if receipt.schema_version != 1
         || receipt.actual_path != actual_path
         || receipt.actual_size_bytes != metadata.len()
-        || receipt.modified_unix_ns != modified_unix_ns(&metadata)?
-        || !receipt_identity_matches(&receipt, &metadata)
     {
         return Ok(None);
     }
@@ -199,8 +219,7 @@ pub fn restored_logical_digest(actual_path: &Path) -> Result<Option<(String, u64
     Ok(Some((receipt.logical_sha256, receipt.logical_size_bytes)))
 }
 
-fn receipt_path(actual_path: &Path) -> Option<PathBuf> {
-    let target = std::env::var_os("CARGO_REAPI_TARGET_ROOT").map(PathBuf::from)?;
+fn receipt_path(target: &Path, actual_path: &Path) -> Option<PathBuf> {
     if !actual_path.starts_with(&target) {
         return None;
     }
@@ -236,29 +255,8 @@ fn unix_inode(metadata: &fs::Metadata) -> u64 {
     metadata.ino()
 }
 
-fn receipt_identity_matches(receipt: &LogicalDigestReceipt, metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        receipt.device == unix_device(metadata) && receipt.inode == unix_inode(metadata)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (receipt, metadata);
-        true
-    }
-}
-
 fn requires_logical_digest_receipt(metadata: &fs::Metadata) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = metadata;
-        false
-    }
+    metadata.is_file()
 }
 
 #[cfg(test)]
@@ -291,5 +289,33 @@ mod tests {
         let restored = materialize_artifact_slots(cached, &consumer).unwrap();
         let restored = String::from_utf8(restored).unwrap();
         assert!(restored.contains(&execution_slot(&consumer[0].1).unwrap()));
+    }
+
+    #[test]
+    fn logical_receipt_for_non_executable_survives_touch_but_rejects_mutation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let artifact = target.join("debug/deps/libfixture.rlib");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"relocated artifact").unwrap();
+        record_logical_digest_for_target(&target, &artifact, "logical-digest", 17).unwrap();
+
+        let touched = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        OpenOptions::new()
+            .write(true)
+            .open(&artifact)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(touched))
+            .unwrap();
+        assert_eq!(
+            restored_logical_digest_for_target(&target, &artifact).unwrap(),
+            Some(("logical-digest".to_owned(), 17))
+        );
+
+        fs::write(&artifact, b"poisoned artifact!").unwrap();
+        assert_eq!(
+            restored_logical_digest_for_target(&target, &artifact).unwrap(),
+            None
+        );
     }
 }
