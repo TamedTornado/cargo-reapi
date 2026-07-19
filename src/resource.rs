@@ -13,10 +13,10 @@ pub struct ResourceLease {
 
 impl ResourceLease {
     pub fn acquire(native_link: bool) -> Result<Self> {
-        Self::acquire_at(
-            &std::env::temp_dir().join("cargo-reapi-resource-ledger-v1"),
-            native_link,
-        )
+        let lease_root = std::env::var_os("CARGO_REAPI_RESOURCE_LEDGER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("cargo-reapi-resource-ledger-v1"));
+        Self::acquire_at(&lease_root, native_link)
     }
 
     fn acquire_at(lease_root: &Path, native_link: bool) -> Result<Self> {
@@ -61,11 +61,9 @@ impl ResourceLease {
         }
     }
 
-    pub fn acquire_snapshot_signing() -> Result<Self> {
+    pub fn acquire_snapshot_signing_at(lease_root: &Path) -> Result<Self> {
         let contract = AcceptanceContract::embedded()?;
-        let root = std::env::temp_dir()
-            .join("cargo-reapi-resource-ledger-v1")
-            .join("snapshot-signing");
+        let root = lease_root.join("snapshot-signing");
         fs::create_dir_all(&root)?;
         let deadline = Instant::now() + Duration::from_secs(contract.stall_seconds);
         loop {
@@ -125,6 +123,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use std::path::Path;
     use tempfile::tempdir;
 
     use super::ResourceLease;
@@ -197,7 +196,10 @@ mod tests {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
             workers.push(std::thread::spawn(move || {
-                let _lease = ResourceLease::acquire_snapshot_signing().expect("signing lease");
+                let _lease = ResourceLease::acquire_snapshot_signing_at(Path::new(
+                    "/tmp/cargo-reapi-resource-ledger-v1-test",
+                ))
+                .expect("signing lease");
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(current, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(4));

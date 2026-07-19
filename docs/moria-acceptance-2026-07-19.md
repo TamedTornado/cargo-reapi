@@ -1,8 +1,15 @@
-# Moria locked local acceptance — 2026-07-19
+# Historical self-reported Moria experiment — 2026-07-19
 
-This is the first passing result under the immutable contract embedded from
-`acceptance/contract.toml`. It supersedes the 2026-07-18 bounded experiment as
-the current acceptance result but does not erase that failed evidence.
+> Historical unaudited evidence, retained for comparison. This run met its
+> timing and self-reported action-count thresholds, but it predated the external
+> `rustc` observer and the adversarial invalidation contract. It is **not** a
+> current acceptance result and does not prove that zero physical compiler work
+> occurred.
+
+This was the first timing pass under the earlier immutable contract embedded
+from `acceptance/contract.toml`. It superseded the 2026-07-18 bounded experiment
+at the time, but was later rejected as acceptance evidence when the harness was
+made independent of cargo-reapi's own classifications.
 
 The proof ran on native Apple Silicon against Moria's real Bevy/wgpu workspace.
 A cold producer completed the canonical `fmt`, `check`, `clippy`, and `test`

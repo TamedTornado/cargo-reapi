@@ -3,6 +3,7 @@ mod action;
 mod cache;
 mod capture;
 mod gate;
+mod hermetic;
 mod invocation;
 mod proof;
 mod reclient;
@@ -22,6 +23,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::cache::{CacheOptions, execute_cached};
 use crate::capture::{CaptureOptions, capture_invocation};
 use crate::gate::GateSnapshot;
+use crate::hermetic::SnapshotPolicy;
 use crate::invocation::RustcInvocation;
 use crate::reclient::{ReclientOptions, execute_reapi, validate_platform_template};
 
@@ -31,6 +33,21 @@ enum Backend {
     Capture,
     Cache,
     Reapi,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SnapshotPolicyArg {
+    Strict,
+    Off,
+}
+
+impl From<SnapshotPolicyArg> for SnapshotPolicy {
+    fn from(value: SnapshotPolicyArg) -> Self {
+        match value {
+            SnapshotPolicyArg::Strict => Self::Strict,
+            SnapshotPolicyArg::Off => Self::Off,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -56,6 +73,14 @@ struct Cli {
     /// Shared filesystem CAS used by the cache backend.
     #[arg(long, env = "CARGO_REAPI_CACHE_DIR")]
     cache_dir: Option<PathBuf>,
+
+    /// Hermetic policy for whole-gate snapshots. Strict is fail-closed.
+    #[arg(long, value_enum, default_value_t = SnapshotPolicyArg::Strict)]
+    snapshot_policy: SnapshotPolicyArg,
+
+    /// Additional read-only input made visible to strict build/proc-macro sandboxes.
+    #[arg(long = "declared-input")]
+    declared_inputs: Vec<PathBuf>,
 
     /// Path to reclient's rewrapper binary.
     #[arg(long, env = "CARGO_REAPI_REWRAPPER")]
@@ -96,6 +121,8 @@ struct ProveCli {
 enum ProveCommand {
     /// Capture and enforce the locked host CPU, memory, OS, and architecture contract.
     Environment {
+        #[arg(long, value_enum)]
+        storage_profile: StorageProfileArg,
         #[arg(long)]
         report: PathBuf,
     },
@@ -104,14 +131,27 @@ enum ProveCommand {
         #[arg(long)]
         action_log: PathBuf,
         #[arg(long)]
+        rustc_trace: PathBuf,
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long)]
         report: PathBuf,
     },
     /// Validate that N or 2N complete gates were truly simultaneous and physically warm.
     Population {
         #[arg(long, value_enum)]
         kind: PopulationProofKind,
+        #[arg(long, value_enum)]
+        storage_profile: StorageProfileArg,
         #[arg(long)]
         evidence: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+    },
+    /// Fail closed unless every receipt required by the embedded criteria is present and valid.
+    Complete {
+        #[arg(long)]
+        receipts: PathBuf,
         #[arg(long)]
         report: PathBuf,
     },
@@ -122,6 +162,21 @@ enum PopulationProofKind {
     Single,
     Five,
     Stress,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum StorageProfileArg {
+    Ssd,
+    Rotational,
+}
+
+impl From<StorageProfileArg> for proof::StorageProfile {
+    fn from(value: StorageProfileArg) -> Self {
+        match value {
+            StorageProfileArg::Ssd => Self::Ssd,
+            StorageProfileArg::Rotational => Self::Rotational,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -172,7 +227,10 @@ fn run() -> Result<i32> {
         .unwrap_or_else(|| PathBuf::from("target/cargo-reapi/actions.jsonl"));
     let action_log_for_snapshot = action_log.clone();
     let cache_dir = cli.cache_dir.clone();
+    let snapshot_policy: SnapshotPolicy = cli.snapshot_policy.into();
+    let snapshots_enabled = snapshot_policy == SnapshotPolicy::Strict;
     let mut gate_snapshot = if matches!(cli.backend, Backend::Cache)
+        && snapshots_enabled
         && env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_none()
     {
         Some(GateSnapshot::prepare(
@@ -183,11 +241,39 @@ fn run() -> Result<i32> {
             &target_root,
             &action_log_for_snapshot,
             &cli.cargo_args,
+            &cli.declared_inputs,
         )?)
     } else {
         None
     };
-    let mut cargo = Command::new("cargo");
+    if let Some(snapshot) = gate_snapshot.as_ref()
+        && snapshot.is_restored()
+    {
+        snapshot.record_successful_hit(&action_log_for_snapshot)?;
+        return Ok(0);
+    }
+    let hermetic = if matches!(cli.backend, Backend::Cache) && snapshots_enabled {
+        crate::hermetic::cargo_command(
+            snapshot_policy,
+            &workspace_root,
+            &target_root,
+            cache_dir
+                .as_deref()
+                .context("cache directory is required")?,
+            &action_log_for_snapshot,
+            &cli.declared_inputs,
+        )?
+    } else {
+        crate::hermetic::cargo_command(
+            SnapshotPolicy::Off,
+            &workspace_root,
+            &target_root,
+            cache_dir.as_deref().unwrap_or(&target_root),
+            &action_log_for_snapshot,
+            &[],
+        )?
+    };
+    let mut cargo = hermetic.command;
     cargo
         .args(&cli.cargo_args)
         .env("RUSTC_WRAPPER", executable)
@@ -204,7 +290,12 @@ fn run() -> Result<i32> {
         .env("CARGO_REAPI_WORKSPACE_ROOT", workspace_root)
         .env("CARGO_REAPI_TARGET_ROOT", target_root);
     if let Some(cache_dir) = cache_dir {
-        cargo.env("CARGO_REAPI_CACHE_DIR", cache_dir);
+        cargo
+            .env(
+                "CARGO_REAPI_RESOURCE_LEDGER",
+                cache_dir.join("resource-ledger-v1"),
+            )
+            .env("CARGO_REAPI_CACHE_DIR", cache_dir);
     }
     for (name, value) in [
         (
@@ -273,18 +364,31 @@ fn run_prove(mut args: Vec<OsString>) -> Result<i32> {
     args.remove(1);
     let cli = ProveCli::parse_from(args);
     match cli.command {
-        ProveCommand::Environment { report } => {
-            let proof = proof::EnvironmentProof::capture()?;
+        ProveCommand::Environment {
+            storage_profile,
+            report,
+        } => {
+            let proof = proof::EnvironmentProof::capture(storage_profile.into())?;
             proof.write_and_require_pass(&report)?;
             println!("PASS  {}", report.display());
         }
-        ProveCommand::ActionLog { action_log, report } => {
-            let proof = proof::ActionLogProof::verify(&action_log)?;
+        ProveCommand::ActionLog {
+            action_log,
+            rustc_trace,
+            worktree,
+            report,
+        } => {
+            let proof = proof::ActionLogProof::verify_with_trace(
+                &action_log,
+                Some(&rustc_trace),
+                Some(&worktree),
+            )?;
             proof.write_and_require_pass(&report)?;
             println!("PASS  {}", report.display());
         }
         ProveCommand::Population {
             kind,
+            storage_profile,
             evidence,
             report,
         } => {
@@ -293,7 +397,12 @@ fn run_prove(mut args: Vec<OsString>) -> Result<i32> {
                 PopulationProofKind::Five => proof::PopulationKind::Five,
                 PopulationProofKind::Stress => proof::PopulationKind::Stress,
             };
-            let proof = proof::PopulationProof::verify(&evidence, kind)?;
+            let proof = proof::PopulationProof::verify(&evidence, kind, storage_profile.into())?;
+            proof.write_and_require_pass(&report)?;
+            println!("PASS  {}", report.display());
+        }
+        ProveCommand::Complete { receipts, report } => {
+            let proof = proof::CompleteProof::verify(&receipts)?;
             proof.write_and_require_pass(&report)?;
             println!("PASS  {}", report.display());
         }

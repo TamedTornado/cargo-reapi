@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -6,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const EMBEDDED_CONTRACT: &str = include_str!("../acceptance/contract.toml");
+pub const EMBEDDED_CRITERIA: &str = include_str!("../acceptance/ACCEPTANCE_CRITERIA.md");
+
+pub fn criteria_digest() -> String {
+    format!("{:x}", Sha256::digest(EMBEDDED_CRITERIA.as_bytes()))
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -19,8 +25,7 @@ pub struct AcceptanceContract {
     pub minimum_bro_concurrency: usize,
     pub admission_stress_multiplier: usize,
     pub scheduler_property_population: usize,
-    pub single_warm_deadline_seconds: u64,
-    pub population_warm_deadline_seconds: u64,
+    pub storage_profiles: BTreeMap<String, StorageProfileContract>,
     pub maximum_build_rss_gib: u64,
     pub maximum_swap_growth_mib: u64,
     pub stall_seconds: u64,
@@ -31,13 +36,22 @@ pub struct AcceptanceContract {
     pub require_empty_consumer_targets: bool,
     pub require_producer_exit_before_persistent_restore: bool,
     pub require_zero_warm_physical_actions: bool,
+    pub require_external_rustc_observation: bool,
     pub require_mixed_key_physical_overlap: bool,
+    pub require_adversarial_invalidation: bool,
     pub require_bevy_fixture: bool,
     pub require_real_moria: bool,
     pub canonical_moria_gate: Vec<String>,
     pub allowed_local_ineligible_reasons: Vec<String>,
     pub required_clause_prefixes: Vec<String>,
     pub clauses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StorageProfileContract {
+    pub single: u64,
+    pub five: u64,
+    pub stress: u64,
 }
 
 impl AcceptanceContract {
@@ -83,6 +97,24 @@ impl AcceptanceContract {
         if self.cache_time_to_live_seconds != 0 {
             bail!("the artifact cache may not use time-based expiry");
         }
+        let ssd = self
+            .storage_profiles
+            .get("ssd")
+            .context("acceptance contract requires the SSD storage profile")?;
+        let rotational = self
+            .storage_profiles
+            .get("rotational")
+            .context("acceptance contract requires the rotational storage profile")?;
+        if self.storage_profiles.len() != 2
+            || ssd.single != 60
+            || ssd.five != 120
+            || ssd.stress != 120
+            || rotational.single != 300
+            || rotational.five != 900
+            || rotational.stress != 1_800
+        {
+            bail!("storage profiles are immutable: SSD=60/120/120s and rotational=300/900/1800s");
+        }
         if self.canonical_moria_gate.len() != 4 {
             bail!("the canonical Moria gate must contain exactly four commands");
         }
@@ -101,7 +133,7 @@ impl AcceptanceContract {
 
 #[cfg(test)]
 mod tests {
-    use super::AcceptanceContract;
+    use super::{AcceptanceContract, criteria_digest};
 
     #[test]
     fn embedded_contract_has_no_durability_or_concurrency_escape_clauses() {
@@ -111,14 +143,24 @@ mod tests {
         assert!(!contract.allow_gate_admission_limit);
         assert!(contract.require_producer_exit_before_persistent_restore);
         assert!(contract.require_zero_warm_physical_actions);
+        assert!(contract.require_external_rustc_observation);
         assert!(contract.require_mixed_key_physical_overlap);
+        assert!(contract.require_adversarial_invalidation);
         assert!(contract.minimum_bro_concurrency >= 5);
         assert!(contract.admission_stress_multiplier >= 2);
+        assert_eq!(contract.storage_profiles.len(), 2);
+        assert_eq!(contract.storage_profiles["ssd"].single, 60);
+        assert_eq!(contract.storage_profiles["rotational"].stress, 1_800);
         assert!(contract.clauses.iter().any(|clause| clause.starts_with(
             "PAR-1: Five independent clean Moria worktrees start the entire canonical gate simultaneously"
         )));
         assert!(contract.clauses.iter().any(|clause| clause.starts_with(
             "SCALE-1: Ten independent clean Moria worktrees (2N) are admitted simultaneously"
         )));
+    }
+
+    #[test]
+    fn criteria_are_embedded_in_the_binary() {
+        assert_eq!(criteria_digest().len(), 64);
     }
 }

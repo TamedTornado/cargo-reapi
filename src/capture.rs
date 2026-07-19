@@ -51,6 +51,7 @@ struct ActionCapture {
     crate_name: Option<String>,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    keyed_environment: BTreeMap<String, String>,
     inputs: Vec<ActionInput>,
     output_directory: Option<String>,
     output_files: Vec<String>,
@@ -67,6 +68,7 @@ pub struct PreparedInvocation {
     pub path_mappings: Vec<(String, String)>,
     pub arguments: Vec<String>,
     pub environment: BTreeMap<String, String>,
+    pub keyed_environment: BTreeMap<String, String>,
     pub inputs: Vec<PreparedInput>,
     pub toolchain_sha256: String,
     pub platform_os: &'static str,
@@ -148,6 +150,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         .into_iter()
         .map(|(name, value)| (name, roots.normalize_text(&value)))
         .collect();
+    let key_environment = keyed_environment(&roots);
     let deterministic_action = DeterministicAction {
         compiler: ToolchainIdentity {
             sha256: toolchain.sha256.clone(),
@@ -160,7 +163,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         },
         working_directory: working_directory.clone(),
         arguments: arguments.clone(),
-        environment: environment.clone(),
+        environment: key_environment.clone(),
         inputs: inputs
             .iter()
             .map(|input| ActionInput {
@@ -193,6 +196,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         crate_name: invocation.crate_name().map(lossy),
         arguments,
         environment,
+        keyed_environment: key_environment,
         inputs,
         output_directory: invocation
             .out_dir()
@@ -232,6 +236,7 @@ pub fn record_invocation(
         crate_name: prepared.crate_name.clone(),
         arguments: prepared.arguments.clone(),
         environment: prepared.environment.clone(),
+        keyed_environment: prepared.keyed_environment.clone(),
         inputs: prepared
             .inputs
             .iter()
@@ -262,17 +267,25 @@ impl CaptureRoots {
         let target = env::var_os("CARGO_REAPI_TARGET_ROOT")
             .map(PathBuf::from)
             .context("CARGO_REAPI_TARGET_ROOT is required in capture mode")?;
-        let toolchain = invocation
-            .compiler
+        let compiler_for_roots = resolved_identity_compiler(&invocation.compiler, &invocation.cwd)?;
+        let toolchain = compiler_for_roots
             .parent()
             .and_then(Path::parent)
             .context("compiler path has no toolchain root")?
             .to_path_buf();
+        let package = env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .map(|path| absolute(&path, &invocation.cwd))
+            .filter(|package| {
+                invocation.args.iter().any(|argument| {
+                    let path = PathBuf::from(argument);
+                    (path.is_absolute() || path.components().count() > 1)
+                        && absolute(&path, &invocation.cwd).starts_with(package)
+                })
+            });
         Ok(Self {
             workspace: absolute(&workspace, &invocation.cwd),
-            package: env::var_os("CARGO_MANIFEST_DIR")
-                .map(PathBuf::from)
-                .map(|path| absolute(&path, &invocation.cwd)),
+            package,
             target: absolute(&target, &invocation.cwd),
             toolchain: absolute(&toolchain, &invocation.cwd),
         })
@@ -345,9 +358,12 @@ fn discover_inputs(
     roots: &CaptureRoots,
 ) -> Result<(Vec<PreparedInput>, Vec<String>)> {
     let mut candidates = BTreeSet::new();
+    let audit_observer = env::var_os("CARGO_REAPI_REAL_RUSTC")
+        .and_then(|_| env::var_os("RUSTC"))
+        .map(PathBuf::from);
     for (index, arg) in invocation.args.iter().enumerate() {
         let path = PathBuf::from(arg);
-        if path.is_file() {
+        if path.is_file() && audit_observer.as_ref() != Some(&path) {
             candidates.insert(path);
         }
         if let Some(response_path) = arg.to_string_lossy().strip_prefix('@') {
@@ -363,14 +379,18 @@ fn discover_inputs(
         }
     }
 
-    for input_root in ["CARGO_MANIFEST_DIR", "OUT_DIR"]
-        .into_iter()
-        .filter_map(|name| env::var_os(name).map(PathBuf::from))
-    {
+    let mut input_roots = Vec::new();
+    if let Some(package) = &roots.package {
+        input_roots.push(("CARGO_MANIFEST_DIR", package.clone()));
+    }
+    if let Some(out_dir) = env::var_os("OUT_DIR").map(PathBuf::from) {
+        input_roots.push(("OUT_DIR", out_dir));
+    }
+    for (name, input_root) in input_roots {
         for entry in WalkDir::new(input_root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|entry| !is_ignored(entry.path()))
+            .filter_entry(|entry| name == "OUT_DIR" || !is_ignored(entry.path()))
         {
             let entry = entry.context("walking Cargo package inputs")?;
             if entry.file_type().is_file() {
@@ -432,8 +452,13 @@ fn digest_file(
 }
 
 fn toolchain_identity(compiler: &Path) -> Result<ToolchainIdentity> {
-    let bytes = fs::read(compiler)
-        .with_context(|| format!("reading compiler executable {}", compiler.display()))?;
+    let identity_compiler = resolved_identity_compiler(compiler, &env::current_dir()?)?;
+    let bytes = fs::read(&identity_compiler).with_context(|| {
+        format!(
+            "reading compiler executable {}",
+            identity_compiler.display()
+        )
+    })?;
     let version = Command::new(compiler)
         .arg("-vV")
         .output()
@@ -452,6 +477,45 @@ fn toolchain_identity(compiler: &Path) -> Result<ToolchainIdentity> {
             .trim()
             .to_owned(),
     })
+}
+
+fn resolved_identity_compiler(compiler: &Path, cwd: &Path) -> Result<PathBuf> {
+    if let Some(real) = env::var_os("CARGO_REAPI_REAL_RUSTC").map(PathBuf::from) {
+        return real
+            .canonicalize()
+            .with_context(|| format!("resolving real compiler {}", real.display()));
+    }
+    let candidate = if compiler.is_absolute() || compiler.components().count() > 1 {
+        absolute(compiler, cwd)
+    } else {
+        env::var_os("PATH")
+            .and_then(|path| {
+                env::split_paths(&path)
+                    .map(|directory| directory.join(compiler))
+                    .find(|candidate| candidate.is_file())
+            })
+            .with_context(|| format!("resolving compiler {} through PATH", compiler.display()))?
+    };
+    let candidate = candidate
+        .canonicalize()
+        .with_context(|| format!("canonicalizing compiler {}", candidate.display()))?;
+    if candidate.file_name().is_some_and(|name| name == "rustup") {
+        let output = Command::new(&candidate)
+            .args(["which", "rustc"])
+            .output()
+            .context("resolving the active rustc through rustup")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "rustup could not resolve the active rustc: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let rustc = PathBuf::from(String::from_utf8(output.stdout)?.trim());
+        return rustc
+            .canonicalize()
+            .with_context(|| format!("canonicalizing rustup compiler {}", rustc.display()));
+    }
+    Ok(candidate)
 }
 
 fn absolute(path: &Path, cwd: &Path) -> PathBuf {
@@ -484,6 +548,26 @@ fn logical_path(root: &str, relative: &Path) -> String {
 fn captured_environment() -> BTreeMap<String, String> {
     env::vars()
         .filter(|(name, _)| is_compiler_environment(name))
+        .collect()
+}
+
+fn keyed_environment(roots: &CaptureRoots) -> BTreeMap<String, String> {
+    env::vars()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "CARGO_REAPI_ACTION_LOG"
+                    | "CARGO_REAPI_BACKEND"
+                    | "CARGO_REAPI_CACHE_DIR"
+                    | "CARGO_REAPI_RUSTC_TRACE"
+                    | "CARGO_REAPI_TARGET_ROOT"
+                    | "CARGO_REAPI_WORKSPACE_ROOT"
+            )
+        })
+        .map(|(name, value)| {
+            let normalized = roots.normalize_text(&value);
+            (name, format!("sha256:{:x}", Sha256::digest(normalized)))
+        })
         .collect()
 }
 

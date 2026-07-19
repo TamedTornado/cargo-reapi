@@ -17,7 +17,19 @@ Cargo already computes the authoritative unit graph, resolves features, runs bui
 
 Rust compiler actions are suitable for remote execution only when every file read by the action is present in the input root and the worker exposes an identical toolchain/platform contract. Package source discovery must include implicit Rust modules and macro inputs. Generated files under `OUT_DIR`, native libraries, linker inputs, response files, and proc-macro dependencies require explicit handling.
 
-Build scripts are initially executed by Cargo on the coordinator. Their compilation can be remote, but their execution is not moved until filesystem and environment tracing can prove a complete sandbox. This preserves Cargo behavior while still offloading the dominant Rust compilation work.
+Build scripts and proc macros are still executed by Cargo on the coordinator,
+but whole-gate snapshot mode now runs the entire Cargo process tree inside the
+exact pinned Anthropic Sandbox Runtime provider. macOS uses Seatbelt and Linux
+uses bubblewrap. Network is denied; filesystem reads are deny-root plus an
+explicit package/toolchain/configuration/declared-input allowlist; writes are
+restricted to build/cache/provider state. An undeclared effect fails the gate
+and cannot publish a snapshot. The provider package, recursive runtime
+dependencies, Node executable, platform helpers, generated policy, OS/SDK, and
+cargo-reapi executable are keyed.
+
+The per-action REAPI boundary remains narrower: compiling a build script or
+proc macro may be remotely cacheable, while executing it remains a
+Cargo-coordinator operation inside the whole-gate sandbox.
 
 ## Milestones
 
@@ -25,7 +37,9 @@ Build scripts are initially executed by Cargo on the coordinator. Their compilat
 2. **Complete:** Deterministic action model: normalize paths, predict outputs, identify toolchains, and reject incomplete inputs. Real-Cargo tests prove identical worktrees share an action key and links fail closed.
 3. **Complete:** The local CAS substrate provides path-normalized action keys, content-addressed blobs, single-flight locking, atomic publication, verified restore, fixed-width artifact relocation, macOS re-signing, whole-gate target snapshots, and a cross-process physical-action resource ledger. Linked artifacts include discovered native, linker, SDK, and response-file inputs. Producer-deletion tests cover runnable binaries and embedded manifest paths. Pinned Bevy and the locked one/five/ten-member Moria acceptance pass.
 4. **Infrastructure validation pending:** Run eligible `rustc` actions through reclient against a live REAPI service with platform-matched workers, then compare artifacts and failure behavior with local Cargo.
-5. Build-script sandboxing: trace and declare filesystem/environment effects before allowing remote execution.
+5. Build-script execution remains local to Cargo but is fail-closed inside the
+   whole-gate external sandbox; remote execution of the script process itself
+   is not claimed.
 6. **In validation:** Bro invokes the standalone driver for cacheable canonical gates and may launch five or ten logical gates simultaneously; resource control belongs around physical cache misses, not around whole Cargo gates. cargo-reapi remains a separate project and deployment artifact.
 
 ## Schedule guardrails

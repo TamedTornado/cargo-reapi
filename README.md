@@ -1,8 +1,23 @@
 # cargo-reapi
 
+The binding project acceptance requirements are recorded in
+[`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). The
+current status is **not yet satisfied**: individual timing reports and test
+passes are partial evidence until the aggregate proof required by that document
+exists and passes.
+
 `cargo-reapi` is an experimental Cargo-native path to remote execution. Cargo remains the build planner and source of truth; the tool observes the exact `rustc` commands Cargo schedules through `RUSTC_WRAPPER`, captures their inputs, and will translate those actions to the Remote Execution API (REAPI).
 
 The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a second maintained build graph. That is a poor fit for arbitrary Cargo projects and is particularly costly around workspace feature selection, build scripts, proc macros, and Cargo-provided environment variables.
+
+## Real-world benchmarks
+
+The [benchmark index](benchmarks/README.md) contains the pinned Bevy linked-
+binary proof, real Moria one/five/ten rotational qualification, Bro's five-job
+qualification, reproduction commands, and explicit SSD status. Rotational
+results are not presented as SSD acceptance, and the README does not treat a
+warm clock as a substitute for adversarial correctness or OS-level process
+evidence.
 
 ## Current status
 
@@ -14,18 +29,37 @@ The local shared-cache backend implements content-addressed output blobs, per-ac
 
 The reclient transport adapter stages eligible actions into explicit input roots, invokes the production `rewrapper` client with declared inputs and outputs, and materializes successful outputs back into Cargo's target directory. Its platform template must bind `{os}`, `{arch}`, and `{toolchain_sha256}` so an action cannot silently execute against a mismatched worker toolchain. Real remote execution still requires an operator-provided reclient installation, a running `reproxy`, and a platform-matched REAPI service. The repository test suite exercises the complete adapter against a behaviorally faithful fake `rewrapper`; validation against a live service is the next infrastructure milestone.
 
-The first bounded [five-worktree Moria experiment](docs/moria-acceptance-2026-07-18.md) is retained as failed evidence: it used serialized two-process waves and executed cacheable work. It is not an acceptance result. The subsequent [locked Moria acceptance](docs/moria-acceptance-2026-07-19.md) passed with the producer deleted: one worktree in 15.431 seconds, five truly simultaneous worktrees in 54.808 seconds, and ten truly simultaneous worktrees in 110.513 seconds, all with zero cacheable physical actions. The thresholds and anti-escape clauses are embedded from `acceptance/contract.toml`; only a complete `cargo reapi prove` report can claim success.
+The first bounded [five-worktree Moria experiment](docs/moria-acceptance-2026-07-18.md) is retained as failed evidence: it used serialized two-process waves and executed cacheable work. The later [self-reported Moria experiment](docs/moria-acceptance-2026-07-19.md) met its timing thresholds, but predates external compiler observation and is therefore also historical, unaudited evidence rather than an acceptance result. The thresholds and anti-escape clauses are embedded from `acceptance/contract.toml`; only a complete externally observed `cargo reapi prove` report can claim success.
 
 The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
 
 ## Usage
+
+Whole-gate snapshots are strict by default and currently support macOS and
+Linux. They require the exact audited sandbox provider release; cargo-reapi
+rejects missing, older, newer, or modified installations:
+
+```sh
+npm install --global @anthropic-ai/sandbox-runtime@0.0.66
+```
+
+On macOS this uses Seatbelt through `/usr/bin/sandbox-exec`. On Linux the same
+provider uses bubblewrap and requires `bwrap`, `socat`, and `rg` on `PATH`.
+Sandbox-runtime is still beta infrastructure, so cargo-reapi hashes its full
+recursive Node dependency closure and the platform helper executables into
+every snapshot key. `CARGO_REAPI_SRT` may point to an exact pinned installation
+for development and CI; it is not a version bypass.
 
 ```sh
 cargo install --path .
 cargo reapi --backend capture -- test
 cargo reapi --backend cache --cache-dir /shared/cargo-reapi-cache -- check
 cargo reapi contract verify --path acceptance/contract.toml
-cargo reapi prove action-log --action-log /path/to/actions.jsonl --report /path/to/proof.json
+cargo reapi prove action-log \
+  --action-log /path/to/actions.jsonl \
+  --rustc-trace /path/to/external-rustc-trace \
+  --worktree /path/to/audited-worktree \
+  --report /path/to/proof.json
 cargo reapi --backend reapi \
   --rewrapper /opt/reclient/rewrapper \
   --rewrapper-cfg /etc/cargo-reapi/rewrapper.cfg \
@@ -45,10 +79,31 @@ ten clean worktrees. The five and ten populations are launched simultaneously an
 timestamps and action logs are revalidated by the embedded contract:
 
 ```sh
-acceptance/run-moria-local.sh /path/to/Moria /shared/cargo-reapi-cache /path/to/proof-report
+sudo -v
+target/release/cargo-reapi-auditor run \
+  --report /path/to/proof-report/resource-proof.json -- \
+  acceptance/run-moria-local.sh \
+  /path/to/Moria \
+  /shared/cargo-reapi-cache \
+  /path/to/proof-report \
+  ssd
 ```
 
+The final local runner requires macOS Full Disk Access for `/usr/bin/eslogger`
+and a current operator-authorized `sudo` session. Its tool-selected OS event
+stream is independent of cargo-reapi's wrapper and action log. Rotational mode
+uses the fixed compatibility clocks but cannot substitute for the SSD result.
+
 The default log is `target/cargo-reapi/actions.jsonl`. Cache mode deliberately requires an explicit cache directory so separate worktrees share only the operator-selected store. REAPI mode expects `reproxy` to be started and stopped through reclient's `bootstrap` lifecycle outside each individual Cargo action. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
+
+Strict snapshot execution denies network access, denies reads outside the
+workspace/package/toolchain/configuration/declared-input set, and denies writes
+outside target, cache, action log, Cargo locks, and provider-private temporary
+state. Build scripts and proc macros that need another deterministic input must
+receive it through `--declared-input`; undeclared filesystem or network effects
+fail the gate and publish no snapshot. `--snapshot-policy off` is an explicit
+uncached compatibility mode, not a fallback: strict mode never silently
+degrades when the provider or an OS primitive is unavailable.
 
 For Linux container consumers, build the repository's image rather than bind-mounting a host binary across an OS boundary:
 

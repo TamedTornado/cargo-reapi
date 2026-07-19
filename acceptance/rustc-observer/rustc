@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+: "${CARGO_REAPI_REAL_RUSTC:?CARGO_REAPI_REAL_RUSTC is required}"
+: "${CARGO_REAPI_RUSTC_TRACE:?CARGO_REAPI_RUSTC_TRACE is required}"
+
+test -d "$CARGO_REAPI_RUSTC_TRACE"
+kind=compile
+previous=
+crate_name=
+for argument in "$@"; do
+  if [ "$previous" = "--crate-name" ]; then
+    crate_name=$argument
+  fi
+  case "$argument" in
+    --print|--print=*) kind=query ;;
+  esac
+  previous=$argument
+done
+if [ -z "$crate_name" ]; then
+  kind=query
+  crate_name=control
+fi
+
+record=$(mktemp "$CARGO_REAPI_RUSTC_TRACE/rustc-observation.XXXXXX")
+{
+  printf 'kind=%s\n' "$kind"
+  printf 'crate_name=%s\n' "$crate_name"
+  printf 'cwd=%s\n' "$(pwd -P)"
+} >"$record"
+
+exec "$CARGO_REAPI_REAL_RUSTC" "$@"

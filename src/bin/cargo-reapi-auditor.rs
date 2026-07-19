@@ -1,0 +1,388 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+
+const MAXIMUM_RSS_BYTES: u64 = 15 * 1024 * 1024 * 1024;
+const MAXIMUM_SWAP_GROWTH_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Debug, Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: AuditorCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditorCommand {
+    /// Verify a dedicated, tool-selected eslogger JSON stream.
+    Eslog {
+        #[arg(long)]
+        events: PathBuf,
+        #[arg(long, value_enum)]
+        expected: EventExpectation,
+        #[arg(long)]
+        report: PathBuf,
+    },
+    /// Run a command while sampling its complete process tree and host swap.
+    Run {
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        stall_seconds: u64,
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EventExpectation {
+    Zero,
+    Nonzero,
+}
+
+#[derive(Debug, Serialize)]
+struct EslogReport {
+    schema_version: u32,
+    evidence: PathBuf,
+    parsed_event_count: usize,
+    invalid_line_count: usize,
+    expected: String,
+    violations: Vec<String>,
+    passed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProcessSample {
+    pid: u32,
+    ppid: u32,
+    cpu_percent: f32,
+    rss_bytes: u64,
+    cpu_time: String,
+    command: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceSample {
+    at_unix_ms: u128,
+    aggregate_rss_bytes: u64,
+    swap_bytes: u64,
+    processes: Vec<ProcessSample>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceReport {
+    schema_version: u32,
+    root_pid: u32,
+    command: Vec<String>,
+    started_at_unix_ms: u128,
+    completed_at_unix_ms: u128,
+    exit_code: i32,
+    peak_aggregate_rss_bytes: u64,
+    peak_simultaneous_progress_processes: usize,
+    maximum_rss_bytes: u64,
+    swap_start_bytes: u64,
+    swap_end_bytes: u64,
+    swap_growth_bytes: u64,
+    maximum_swap_growth_bytes: u64,
+    stall_seconds: u64,
+    infrastructure_stall: bool,
+    samples: Vec<ResourceSample>,
+    violations: Vec<String>,
+    passed: bool,
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("cargo-reapi-auditor: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
+    match Cli::parse().command {
+        AuditorCommand::Eslog {
+            events,
+            expected,
+            report,
+        } => verify_eslog(&events, expected, &report),
+        AuditorCommand::Run {
+            report,
+            stall_seconds,
+            command,
+        } => monitor_command(&command, stall_seconds, &report),
+    }
+}
+
+fn verify_eslog(events: &Path, expected: EventExpectation, report: &Path) -> Result<()> {
+    let input = fs::read_to_string(events)
+        .with_context(|| format!("reading eslogger evidence {}", events.display()))?;
+    let mut parsed_event_count = 0;
+    let mut invalid_line_count = 0;
+    for line in input.lines().filter(|line| !line.trim().is_empty()) {
+        if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+            parsed_event_count += 1;
+        } else {
+            invalid_line_count += 1;
+        }
+    }
+    let mut violations = Vec::new();
+    if invalid_line_count != 0 {
+        violations.push(format!(
+            "eslogger evidence contains {invalid_line_count} non-JSON lines"
+        ));
+    }
+    match expected {
+        EventExpectation::Zero if parsed_event_count != 0 => violations.push(format!(
+            "OS observer recorded {parsed_event_count} selected compiler/linker events"
+        )),
+        EventExpectation::Nonzero if parsed_event_count == 0 => {
+            violations.push("OS observer did not record the required producer event".to_owned());
+        }
+        _ => {}
+    }
+    let proof = EslogReport {
+        schema_version: 1,
+        evidence: events.to_path_buf(),
+        parsed_event_count,
+        invalid_line_count,
+        expected: match expected {
+            EventExpectation::Zero => "zero",
+            EventExpectation::Nonzero => "nonzero",
+        }
+        .to_owned(),
+        passed: violations.is_empty(),
+        violations,
+    };
+    write_report(report, &proof)?;
+    if !proof.passed {
+        bail!("eslogger evidence failed; report: {}", report.display());
+    }
+    Ok(())
+}
+
+fn monitor_command(command: &[String], stall_seconds: u64, report: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let (program, arguments) = command
+        .split_first()
+        .context("monitored command is empty")?;
+    let started_at_unix_ms = unix_ms();
+    let swap_start_bytes = swap_bytes()?;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("starting monitored command {program}"))?;
+    let root_pid = child.id();
+    let mut samples = Vec::new();
+    let mut peak_aggregate_rss_bytes = 0;
+    let mut peak_simultaneous_progress_processes = 0;
+    let mut last_progress = Instant::now();
+    let mut previous_heavy_cpu = BTreeMap::new();
+    let mut infrastructure_stall = false;
+    let exit_code;
+
+    loop {
+        if let Some(status) = child.try_wait().context("polling monitored command")? {
+            exit_code = status.code().unwrap_or(1);
+            break;
+        }
+        let all = process_table()?;
+        let descendants = descendant_processes(root_pid, &all);
+        let aggregate_rss_bytes = descendants.iter().map(|process| process.rss_bytes).sum();
+        peak_aggregate_rss_bytes = peak_aggregate_rss_bytes.max(aggregate_rss_bytes);
+        let heavy_cpu = descendants
+            .iter()
+            .filter(|process| is_progress_process(&process.command))
+            .map(|process| (process.pid, process.cpu_time.clone()))
+            .collect::<BTreeMap<_, _>>();
+        peak_simultaneous_progress_processes =
+            peak_simultaneous_progress_processes.max(heavy_cpu.len());
+        if heavy_cpu != previous_heavy_cpu {
+            last_progress = Instant::now();
+            previous_heavy_cpu = heavy_cpu;
+        } else if last_progress.elapsed() >= Duration::from_secs(stall_seconds) {
+            infrastructure_stall = true;
+            let _ = Command::new("/bin/kill")
+                .args(["-TERM", &format!("-{root_pid}")])
+                .status();
+            let status = child
+                .wait()
+                .context("waiting for stalled command shutdown")?;
+            exit_code = status.code().unwrap_or(1);
+            break;
+        }
+        samples.push(ResourceSample {
+            at_unix_ms: unix_ms(),
+            aggregate_rss_bytes,
+            swap_bytes: swap_bytes()?,
+            processes: descendants,
+        });
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    let swap_end_bytes = swap_bytes()?;
+    let swap_growth_bytes = swap_end_bytes.saturating_sub(swap_start_bytes);
+    let mut violations = Vec::new();
+    if peak_aggregate_rss_bytes > MAXIMUM_RSS_BYTES {
+        violations.push(format!(
+            "peak process-tree RSS {peak_aggregate_rss_bytes} exceeds {MAXIMUM_RSS_BYTES}"
+        ));
+    }
+    if swap_growth_bytes > MAXIMUM_SWAP_GROWTH_BYTES {
+        violations.push(format!(
+            "swap growth {swap_growth_bytes} exceeds {MAXIMUM_SWAP_GROWTH_BYTES}"
+        ));
+    }
+    if infrastructure_stall {
+        violations
+            .push("compiler/linker progress stalled; classified as infrastructure".to_owned());
+    }
+    if exit_code != 0 {
+        violations.push(format!("monitored command exited {exit_code}"));
+    }
+    let proof = ResourceReport {
+        schema_version: 1,
+        root_pid,
+        command: command.to_vec(),
+        started_at_unix_ms,
+        completed_at_unix_ms: unix_ms(),
+        exit_code,
+        peak_aggregate_rss_bytes,
+        peak_simultaneous_progress_processes,
+        maximum_rss_bytes: MAXIMUM_RSS_BYTES,
+        swap_start_bytes,
+        swap_end_bytes,
+        swap_growth_bytes,
+        maximum_swap_growth_bytes: MAXIMUM_SWAP_GROWTH_BYTES,
+        stall_seconds,
+        infrastructure_stall,
+        samples,
+        passed: violations.is_empty(),
+        violations,
+    };
+    write_report(report, &proof)?;
+    if !proof.passed {
+        bail!(
+            "monitored command failed resource acceptance; report: {}",
+            report.display()
+        );
+    }
+    Ok(())
+}
+
+fn process_table() -> Result<Vec<ProcessSample>> {
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,%cpu=,rss=,time=,command="])
+        .output()
+        .context("sampling process table")?;
+    if !output.status.success() {
+        bail!("ps failed while sampling the monitored process tree");
+    }
+    let text = String::from_utf8(output.stdout).context("ps output is not UTF-8")?;
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let mut rest = line.trim_start();
+            let pid = take_field(&mut rest)?.parse().ok()?;
+            let ppid = take_field(&mut rest)?.parse().ok()?;
+            let cpu_percent = take_field(&mut rest)?.parse().ok()?;
+            let rss_kib = take_field(&mut rest)?.parse::<u64>().ok()?;
+            let cpu_time = take_field(&mut rest)?.to_owned();
+            Some(ProcessSample {
+                pid,
+                ppid,
+                cpu_percent,
+                rss_bytes: rss_kib.saturating_mul(1024),
+                cpu_time,
+                command: rest.trim_start().to_owned(),
+            })
+        })
+        .collect())
+}
+
+fn take_field<'a>(input: &mut &'a str) -> Option<&'a str> {
+    let trimmed = input.trim_start();
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let field = &trimmed[..end];
+    *input = &trimmed[end..];
+    (!field.is_empty()).then_some(field)
+}
+
+fn descendant_processes(root_pid: u32, all: &[ProcessSample]) -> Vec<ProcessSample> {
+    let mut pids = BTreeSet::from([root_pid]);
+    loop {
+        let before = pids.len();
+        for process in all {
+            if pids.contains(&process.ppid) {
+                pids.insert(process.pid);
+            }
+        }
+        if pids.len() == before {
+            break;
+        }
+    }
+    all.iter()
+        .filter(|process| pids.contains(&process.pid))
+        .cloned()
+        .collect()
+}
+
+fn is_progress_process(command: &str) -> bool {
+    let executable = command.split_whitespace().next().unwrap_or(command);
+    let name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable);
+    matches!(
+        name,
+        "rustc" | "clang" | "clang++" | "cc" | "ld" | "codesign"
+    )
+}
+
+fn swap_bytes() -> Result<u64> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "vm.swapusage"])
+        .output()
+        .context("sampling host swap")?;
+    if !output.status.success() {
+        bail!("sysctl vm.swapusage failed");
+    }
+    let text = String::from_utf8(output.stdout).context("swap usage is not UTF-8")?;
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    let used_index = fields
+        .iter()
+        .position(|field| *field == "used")
+        .context("vm.swapusage has no used value")?;
+    let used_mib = fields
+        .get(used_index + 2)
+        .context("vm.swapusage used value is incomplete")?
+        .trim_end_matches('M')
+        .parse::<f64>()
+        .context("parsing used swap MiB")?;
+    Ok((used_mib * 1024.0 * 1024.0) as u64)
+}
+
+fn write_report<T: Serialize>(path: &Path, report: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(report)?)
+        .with_context(|| format!("writing audit report {}", path.display()))
+}
+
+fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
