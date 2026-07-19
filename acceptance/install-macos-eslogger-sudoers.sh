@@ -19,10 +19,7 @@ rule_target=/etc/sudoers.d/$rule_name
 rule_staging=$(mktemp "${TMPDIR:-/tmp}/$rule_name.XXXXXX")
 trap 'rm -f "$rule_staging"' EXIT HUP INT TERM
 
-{
-  printf '%s ALL=(root) NOPASSWD: /usr/bin/eslogger\n' "$operator"
-  printf '%s ALL=(root) NOPASSWD: /usr/bin/execsnoop\n' "$operator"
-} >"$rule_staging"
+printf '%s ALL=(root) NOPASSWD: /usr/bin/eslogger\n' "$operator" >"$rule_staging"
 chmod 0440 "$rule_staging"
 
 echo "Validating the scoped sudoers rule..."
@@ -34,10 +31,9 @@ sudo /usr/bin/install -o root -g wheel -m 0440 "$rule_staging" "$rule_target"
 echo "Validating the complete sudoers policy..."
 sudo /usr/sbin/visudo -c
 
-if ! sudo -n -l /usr/bin/eslogger >/dev/null 2>&1 ||
-   ! sudo -n -l /usr/bin/execsnoop >/dev/null 2>&1; then
+if ! sudo -n -l /usr/bin/eslogger >/dev/null 2>&1; then
   echo "installed rule is not active; check that /etc/sudoers includes /etc/sudoers.d" >&2
   exit 1
 fi
 
-echo "Ready: the macOS execution observers are passwordless for $operator; all other sudo commands are unchanged."
+echo "Ready: /usr/bin/eslogger is passwordless for $operator; all other sudo commands are unchanged."

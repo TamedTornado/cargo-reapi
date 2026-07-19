@@ -31,8 +31,10 @@ fi
 start_os_observer() {
   os_events=$1
   : >"$os_events"
-  sudo -n /usr/bin/eslogger --format json \
-    --select "$observed_rustc" --select "$observed_clang" exec \
+  # eslogger suppresses its own process group. Start it in a distinct session
+  # so it observes, rather than suppresses, the build being audited.
+  perl -MPOSIX=setsid -e 'setsid(); exec @ARGV' \
+    sudo -n /usr/bin/eslogger --format json exec \
     >"$os_events" 2>"$os_events.stderr" &
   os_observer_pid=$!
   sleep 1
@@ -42,9 +44,14 @@ start_os_observer() {
 stop_os_observer() {
   expected=$1
   proof=$2
-  kill -INT "$os_observer_pid" 2>/dev/null || true
+  kill -TERM "$os_observer_pid" 2>/dev/null || true
   wait "$os_observer_pid" 2>/dev/null || true
-  "$auditor" eslog --events "$os_events" --expected "$expected" --report "$proof"
+  "$auditor" eslog \
+    --events "$os_events" \
+    --select "$observed_rustc" \
+    --select "$observed_clang" \
+    --expected "$expected" \
+    --report "$proof"
 }
 
 "$driver" contract verify --path "$contract"

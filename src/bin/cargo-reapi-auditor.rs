@@ -24,6 +24,8 @@ enum AuditorCommand {
     Eslog {
         #[arg(long)]
         events: PathBuf,
+        #[arg(long, required = true)]
+        select: Vec<PathBuf>,
         #[arg(long, value_enum)]
         expected: EventExpectation,
         #[arg(long)]
@@ -50,6 +52,8 @@ enum EventExpectation {
 struct EslogReport {
     schema_version: u32,
     evidence: PathBuf,
+    selected_executables: Vec<PathBuf>,
+    total_event_count: usize,
     parsed_event_count: usize,
     invalid_line_count: usize,
     expected: String,
@@ -111,9 +115,10 @@ fn run() -> Result<()> {
     match Cli::parse().command {
         AuditorCommand::Eslog {
             events,
+            select,
             expected,
             report,
-        } => verify_eslog(&events, expected, &report),
+        } => verify_eslog(&events, &select, expected, &report),
         AuditorCommand::Run {
             report,
             stall_seconds,
@@ -122,16 +127,36 @@ fn run() -> Result<()> {
     }
 }
 
-fn verify_eslog(events: &Path, expected: EventExpectation, report: &Path) -> Result<()> {
+fn verify_eslog(
+    events: &Path,
+    selected_executables: &[PathBuf],
+    expected: EventExpectation,
+    report: &Path,
+) -> Result<()> {
     let input = fs::read_to_string(events)
         .with_context(|| format!("reading eslogger evidence {}", events.display()))?;
     let mut parsed_event_count = 0;
+    let mut total_event_count = 0;
     let mut invalid_line_count = 0;
     for line in input.lines().filter(|line| !line.trim().is_empty()) {
-        if serde_json::from_str::<serde_json::Value>(line).is_ok() {
-            parsed_event_count += 1;
-        } else {
-            invalid_line_count += 1;
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(event) => {
+                total_event_count += 1;
+                let Some(executable) = event
+                    .pointer("/event/exec/target/executable/path")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    invalid_line_count += 1;
+                    continue;
+                };
+                if selected_executables
+                    .iter()
+                    .any(|selected| selected == Path::new(executable))
+                {
+                    parsed_event_count += 1;
+                }
+            }
+            Err(_) => invalid_line_count += 1,
         }
     }
     let mut violations = Vec::new();
@@ -152,6 +177,8 @@ fn verify_eslog(events: &Path, expected: EventExpectation, report: &Path) -> Res
     let proof = EslogReport {
         schema_version: 1,
         evidence: events.to_path_buf(),
+        selected_executables: selected_executables.to_vec(),
+        total_event_count,
         parsed_event_count,
         invalid_line_count,
         expected: match expected {
@@ -385,4 +412,59 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eslog_counts_only_selected_exec_targets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let events = temporary.path().join("events.jsonl");
+        let report = temporary.path().join("report.json");
+        fs::write(
+            &events,
+            concat!(
+                "{\"event\":{\"exec\":{\"target\":{\"executable\":{\"path\":\"/bin/echo\"}}}}}\n",
+                "{\"event\":{\"exec\":{\"target\":{\"executable\":{\"path\":\"/bin/sleep\"}}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        verify_eslog(
+            &events,
+            &[PathBuf::from("/bin/echo")],
+            EventExpectation::Nonzero,
+            &report,
+        )
+        .unwrap();
+
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(report["total_event_count"], 2);
+        assert_eq!(report["parsed_event_count"], 1);
+        assert_eq!(report["passed"], true);
+    }
+
+    #[test]
+    fn eslog_rejects_unparseable_or_schema_incomplete_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let events = temporary.path().join("events.jsonl");
+        let report = temporary.path().join("report.json");
+        fs::write(&events, "not-json\n{\"event\":{\"exec\":{}}}\n").unwrap();
+
+        assert!(
+            verify_eslog(
+                &events,
+                &[PathBuf::from("/bin/echo")],
+                EventExpectation::Zero,
+                &report,
+            )
+            .is_err()
+        );
+
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(report["invalid_line_count"], 2);
+        assert_eq!(report["passed"], false);
+    }
 }
