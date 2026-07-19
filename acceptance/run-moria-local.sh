@@ -22,8 +22,9 @@ real_rustc=$(rustup which rustc)
 observed_rustc=$real_rustc
 observed_clang=$(/usr/bin/xcrun --find clang)
 
-if ! sudo -n true 2>/dev/null; then
-  echo "acceptance requires an operator-authorized sudo session for eslogger (run sudo -v first)" >&2
+if ! sudo -n -l /usr/bin/eslogger >/dev/null 2>&1; then
+  echo "acceptance requires passwordless permission for /usr/bin/eslogger" >&2
+  echo "see acceptance/ACCEPTANCE_CRITERIA.md for the scoped macOS sudoers rule" >&2
   exit 2
 fi
 
