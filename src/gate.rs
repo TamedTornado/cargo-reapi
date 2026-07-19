@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 use crate::relocation::{RecordedPathMapping, execution_slot, replace_bytes};
 use crate::resource::ResourceLease;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 14;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct GateSnapshotManifest {
@@ -277,7 +277,7 @@ impl GateSnapshot {
     }
 
     fn target_marker(&self) -> PathBuf {
-        self.target.join("cargo-reapi/gate-state-v14")
+        self.target.join("cargo-reapi/gate-state-v15")
     }
 
     fn target_marker_matches(&self, selected_key: &str) -> bool {
@@ -316,7 +316,7 @@ fn gate_key(
     declared_inputs: &[PathBuf],
 ) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"cargo-reapi-gate-state-v14\0");
+    hasher.update(b"cargo-reapi-gate-state-v15\0");
     hash_field(&mut hasher, std::env::consts::OS.as_bytes());
     hash_field(&mut hasher, std::env::consts::ARCH.as_bytes());
     let current_executable = std::env::current_exe()?.canonicalize()?;
@@ -423,7 +423,7 @@ fn gate_key(
     }
     let state_key = format!("{:x}", hasher.finalize());
     let mut exact = Sha256::new();
-    exact.update(b"cargo-reapi-exact-gate-v14\0");
+    exact.update(b"cargo-reapi-exact-gate-v15\0");
     hash_field(&mut exact, state_key.as_bytes());
     for argument in cargo_args {
         hash_field(&mut exact, argument.to_string_lossy().as_bytes());

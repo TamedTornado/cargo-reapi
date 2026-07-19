@@ -25,6 +25,16 @@ observer=$(cd "$(dirname "$0")/.." && pwd)/acceptance/rustc-observer/rustc
 real_rustc=$(rustup which rustc)
 observed_rustc=$real_rustc
 observed_clang=$(/usr/bin/xcrun --find clang)
+os_observer_pid=
+
+cleanup_os_observer() {
+  if [ -n "${os_observer_pid:-}" ]; then
+    kill -TERM "$os_observer_pid" 2>/dev/null || true
+    wait "$os_observer_pid" 2>/dev/null || true
+    os_observer_pid=
+  fi
+}
+trap cleanup_os_observer EXIT HUP INT TERM
 
 if ! sudo -n -l /usr/bin/eslogger >/dev/null 2>&1; then
   echo "acceptance requires passwordless permission for /usr/bin/eslogger" >&2
@@ -50,6 +60,7 @@ stop_os_observer() {
   proof=$2
   kill -TERM "$os_observer_pid" 2>/dev/null || true
   wait "$os_observer_pid" 2>/dev/null || true
+  os_observer_pid=
   "$auditor" eslog \
     --events "$os_events" \
     --select "$observed_rustc" \

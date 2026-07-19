@@ -287,19 +287,20 @@ fn normalize_policy_identity_bytes(
     action_log: &Path,
 ) -> Result<Vec<u8>> {
     let mut text = String::from_utf8(bytes)?;
+    let mut mappings = vec![
+        (control_temporary.to_path_buf(), "<srt-control>"),
+        (workspace.to_path_buf(), "<workspace>"),
+        (target.to_path_buf(), "<target>"),
+        (cache.to_path_buf(), "<cache>"),
+        (action_log.to_path_buf(), "<action-log>"),
+    ];
     if let Some(trace) = rustc_trace {
-        let trace = canonical_or_absolute(trace)?;
-        text = text.replace(&trace.to_string_lossy().to_string(), "<rustc-trace>");
+        mappings.push((canonical_or_absolute(trace)?, "<rustc-trace>"));
     }
-    let text = text
-        .replace(
-            &control_temporary.to_string_lossy().to_string(),
-            "<srt-control>",
-        )
-        .replace(&workspace.to_string_lossy().to_string(), "<workspace>")
-        .replace(&target.to_string_lossy().to_string(), "<target>")
-        .replace(&cache.to_string_lossy().to_string(), "<cache>")
-        .replace(&action_log.to_string_lossy().to_string(), "<action-log>");
+    mappings.sort_by_key(|(path, _)| std::cmp::Reverse(path.as_os_str().len()));
+    for (path, replacement) in mappings {
+        text = text.replace(&path.to_string_lossy().to_string(), replacement);
+    }
     let mut policy: serde_json::Value = serde_json::from_str(&text)?;
     sort_string_arrays(&mut policy);
     Ok(serde_json::to_vec_pretty(&policy)?)
@@ -791,23 +792,23 @@ mod tests {
     #[test]
     fn policy_identity_ignores_external_observer_output_location() {
         let first = normalize_policy_identity_bytes(
-            br#"{"allowWrite":["/tmp/trace-one","/tmp/workspace/target"]}"#.to_vec(),
+            br#"{"allowWrite":["/tmp/trace-one","/tmp/workspace/target","/tmp/workspace-evidence/actions"]}"#.to_vec(),
             Path::new("/tmp/control"),
             Some(Path::new("/tmp/trace-one")),
             Path::new("/tmp/workspace"),
             Path::new("/tmp/workspace/target"),
             Path::new("/tmp/cache"),
-            Path::new("/tmp/actions"),
+            Path::new("/tmp/workspace-evidence/actions"),
         )
         .unwrap();
         let second = normalize_policy_identity_bytes(
-            br#"{"allowWrite":["/tmp/workspace-longer/target","/tmp/trace-two"]}"#.to_vec(),
+            br#"{"allowWrite":["/tmp/evidence/actions","/tmp/workspace-longer/target","/tmp/trace-two"]}"#.to_vec(),
             Path::new("/tmp/control"),
             Some(Path::new("/tmp/trace-two")),
             Path::new("/tmp/workspace-longer"),
             Path::new("/tmp/workspace-longer/target"),
             Path::new("/tmp/cache"),
-            Path::new("/tmp/actions"),
+            Path::new("/tmp/evidence/actions"),
         )
         .unwrap();
         assert_eq!(first, second);
