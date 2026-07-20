@@ -35,6 +35,9 @@ enum AuditorCommand {
     Run {
         #[arg(long)]
         report: PathBuf,
+        /// Cross-process token directory whose open leases are sampled externally.
+        #[arg(long)]
+        ledger_root: PathBuf,
         #[arg(long, default_value_t = 300)]
         stall_seconds: u64,
         #[arg(required = true, trailing_var_arg = true)]
@@ -77,6 +80,7 @@ struct ResourceSample {
     aggregate_rss_bytes: u64,
     swap_bytes: u64,
     processes: Vec<ProcessSample>,
+    lease_ownership: BTreeMap<u32, Vec<PathBuf>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +100,9 @@ struct ResourceReport {
     maximum_swap_growth_bytes: u64,
     stall_seconds: u64,
     infrastructure_stall: bool,
+    ledger_root: PathBuf,
+    observed_lease_owners: usize,
+    observed_action_identities: BTreeSet<String>,
     samples: Vec<ResourceSample>,
     violations: Vec<String>,
     passed: bool,
@@ -121,9 +128,10 @@ fn run() -> Result<()> {
         } => verify_eslog(&events, &select, expected, &report),
         AuditorCommand::Run {
             report,
+            ledger_root,
             stall_seconds,
             command,
-        } => monitor_command(&command, stall_seconds, &report),
+        } => monitor_command(&command, stall_seconds, &ledger_root, &report),
     }
 }
 
@@ -196,7 +204,12 @@ fn verify_eslog(
     Ok(())
 }
 
-fn monitor_command(command: &[String], stall_seconds: u64, report: &Path) -> Result<()> {
+fn monitor_command(
+    command: &[String],
+    stall_seconds: u64,
+    ledger_root: &Path,
+    report: &Path,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let (program, arguments) = command
@@ -216,6 +229,8 @@ fn monitor_command(command: &[String], stall_seconds: u64, report: &Path) -> Res
     let mut last_progress = Instant::now();
     let mut previous_heavy_cpu = BTreeMap::new();
     let mut infrastructure_stall = false;
+    let mut observed_lease_pids = BTreeSet::new();
+    let mut observed_action_identities = BTreeSet::new();
     let exit_code;
 
     loop {
@@ -225,6 +240,15 @@ fn monitor_command(command: &[String], stall_seconds: u64, report: &Path) -> Res
         }
         let all = process_table()?;
         let descendants = descendant_processes(root_pid, &all);
+        let descendant_pids = descendants
+            .iter()
+            .map(|process| process.pid)
+            .collect::<BTreeSet<_>>();
+        let lease_ownership = externally_observed_leases(ledger_root, &descendant_pids)?;
+        observed_lease_pids.extend(lease_ownership.keys().copied());
+        observed_action_identities.extend(descendants.iter().filter_map(|process| {
+            is_progress_process(&process.command).then(|| process.command.clone())
+        }));
         let aggregate_rss_bytes = descendants.iter().map(|process| process.rss_bytes).sum();
         peak_aggregate_rss_bytes = peak_aggregate_rss_bytes.max(aggregate_rss_bytes);
         let heavy_cpu = descendants
@@ -253,6 +277,7 @@ fn monitor_command(command: &[String], stall_seconds: u64, report: &Path) -> Res
             aggregate_rss_bytes,
             swap_bytes: swap_bytes()?,
             processes: descendants,
+            lease_ownership,
         });
         thread::sleep(Duration::from_millis(250));
     }
@@ -293,6 +318,9 @@ fn monitor_command(command: &[String], stall_seconds: u64, report: &Path) -> Res
         maximum_swap_growth_bytes: MAXIMUM_SWAP_GROWTH_BYTES,
         stall_seconds,
         infrastructure_stall,
+        ledger_root: ledger_root.to_path_buf(),
+        observed_lease_owners: observed_lease_pids.len(),
+        observed_action_identities,
         samples,
         passed: violations.is_empty(),
         violations,
@@ -305,6 +333,54 @@ fn monitor_command(command: &[String], stall_seconds: u64, report: &Path) -> Res
         );
     }
     Ok(())
+}
+
+fn externally_observed_leases(
+    ledger_root: &Path,
+    pids: &BTreeSet<u32>,
+) -> Result<BTreeMap<u32, Vec<PathBuf>>> {
+    let canonical_root = ledger_root
+        .canonicalize()
+        .unwrap_or_else(|_| ledger_root.to_path_buf());
+    if cfg!(target_os = "linux") {
+        let mut result = BTreeMap::new();
+        for pid in pids {
+            let directory = PathBuf::from(format!("/proc/{pid}/fd"));
+            let mut leases = Vec::new();
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if let Ok(target) = fs::read_link(entry.path())
+                    && target.starts_with(&canonical_root)
+                {
+                    leases.push(target);
+                }
+            }
+            if !leases.is_empty() {
+                result.insert(*pid, leases);
+            }
+        }
+        return Ok(result);
+    }
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-Fpn", "+D"])
+        .arg(&canonical_root)
+        .output()
+        .context("observing ledger leases with lsof")?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!("lsof failed while observing resource ledger");
+    }
+    let mut result = BTreeMap::<u32, Vec<PathBuf>>::new();
+    let mut current = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(pid) = line.strip_prefix('p').and_then(|v| v.parse::<u32>().ok()) {
+            current = pids.contains(&pid).then_some(pid);
+        } else if let (Some(pid), Some(path)) = (current, line.strip_prefix('n')) {
+            result.entry(pid).or_default().push(PathBuf::from(path));
+        }
+    }
+    Ok(result)
 }
 
 fn process_table() -> Result<Vec<ProcessSample>> {
@@ -377,6 +453,29 @@ fn is_progress_process(command: &str) -> bool {
 }
 
 fn swap_bytes() -> Result<u64> {
+    if cfg!(target_os = "linux") {
+        if let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup")
+            && let Some(relative) = cgroup.lines().find_map(|line| line.strip_prefix("0::"))
+        {
+            let path = Path::new("/sys/fs/cgroup")
+                .join(relative.trim_start_matches('/'))
+                .join("memory.swap.current");
+            if let Ok(value) = fs::read_to_string(path) {
+                return value.trim().parse().context("parsing cgroup v2 swap usage");
+            }
+        }
+        let meminfo = fs::read_to_string("/proc/meminfo")?;
+        let field = |name: &str| -> Result<u64> {
+            let kib = meminfo
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.split_whitespace().next())
+                .with_context(|| format!("{name} is absent from /proc/meminfo"))?
+                .parse::<u64>()?;
+            Ok(kib * 1024)
+        };
+        return Ok(field("SwapTotal:")?.saturating_sub(field("SwapFree:")?));
+    }
     let output = Command::new("/usr/sbin/sysctl")
         .args(["-n", "vm.swapusage"])
         .output()

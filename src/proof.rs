@@ -439,6 +439,7 @@ struct PopulationMember {
     action_log: String,
     worktree: String,
     rustc_trace: String,
+    target_empty_at_start: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -450,6 +451,7 @@ pub struct PopulationProof {
     expected_minimum_members: usize,
     observed_members: usize,
     all_started_before_any_completed: bool,
+    all_targets_empty_at_start: bool,
     elapsed_ms: u128,
     deadline_ms: u128,
     member_action_proofs: Vec<ActionLogProof>,
@@ -461,6 +463,7 @@ pub struct PopulationProof {
 pub struct EnvironmentProof {
     schema_version: u32,
     contract_sha256: String,
+    platform_profile_sha256: String,
     storage_profile: String,
     single_warm_deadline_seconds: u64,
     population_warm_deadline_seconds: u64,
@@ -470,6 +473,9 @@ pub struct EnvironmentProof {
     logical_cpus: usize,
     physical_memory_bytes: u64,
     rustc_verbose_version: String,
+    sandbox_provider: String,
+    sandbox_provider_version: String,
+    sandbox_provider_identity_sha256: String,
     violations: Vec<String>,
     passed: bool,
 }
@@ -637,6 +643,13 @@ impl PopulationProof {
             );
         }
         let elapsed_ms = latest_completion.saturating_sub(earliest_start);
+        let all_targets_empty_at_start = evidence
+            .members
+            .iter()
+            .all(|member| member.target_empty_at_start);
+        if !all_targets_empty_at_start {
+            violations.push("at least one consumer target was non-empty at gate start".to_owned());
+        }
         let deadline_ms = population_deadline_ms(&contract, kind, storage_profile)?;
         if elapsed_ms > deadline_ms {
             violations.push(format!(
@@ -672,6 +685,7 @@ impl PopulationProof {
             expected_minimum_members: expected,
             observed_members: evidence.members.len(),
             all_started_before_any_completed: simultaneous,
+            all_targets_empty_at_start,
             elapsed_ms,
             deadline_ms,
             member_action_proofs,
@@ -736,8 +750,17 @@ fn verify_population_member(member: &PopulationMember) -> Result<ActionLogProof>
 }
 
 impl EnvironmentProof {
-    pub fn capture(storage_profile: StorageProfile) -> Result<Self> {
+    pub fn capture(storage_profile: StorageProfile, platform_profile: &Path) -> Result<Self> {
         let contract = AcceptanceContract::embedded()?;
+        let profile_bytes = fs::read(platform_profile)
+            .with_context(|| format!("reading platform profile {}", platform_profile.display()))?;
+        let platform: crate::evidence::PlatformProfile =
+            toml::from_str(&String::from_utf8(profile_bytes.clone())?)?;
+        if platform.schema_version != 1
+            || platform.base_contract_sha256 != AcceptanceContract::digest()
+        {
+            bail!("platform profile does not inherit the embedded acceptance contract");
+        }
         let profile = contract
             .storage_profiles
             .get(storage_profile.name())
@@ -747,19 +770,20 @@ impl EnvironmentProof {
             .context("reading host logical CPU count")?;
         let physical_memory_bytes = physical_memory_bytes()?;
         let rustc_verbose_version = rustc_verbose_version()?;
+        let sandbox_provider_identity_sha256 = crate::hermetic::provider_identity_digest()?;
         let mut violations = Vec::new();
-        if std::env::consts::OS != contract.platform_os {
+        if std::env::consts::OS != platform.platform_os {
             violations.push(format!(
                 "host OS {} does not match {}",
                 std::env::consts::OS,
-                contract.platform_os
+                platform.platform_os
             ));
         }
-        if std::env::consts::ARCH != contract.platform_arch {
+        if std::env::consts::ARCH != platform.platform_arch {
             violations.push(format!(
                 "host architecture {} does not match {}",
                 std::env::consts::ARCH,
-                contract.platform_arch
+                platform.platform_arch
             ));
         }
         if logical_cpus < contract.minimum_logical_cpus {
@@ -777,6 +801,7 @@ impl EnvironmentProof {
         Ok(Self {
             schema_version: 1,
             contract_sha256: AcceptanceContract::digest(),
+            platform_profile_sha256: format!("{:x}", Sha256::digest(&profile_bytes)),
             storage_profile: storage_profile.name().to_owned(),
             single_warm_deadline_seconds: profile.single,
             population_warm_deadline_seconds: profile.five,
@@ -786,6 +811,9 @@ impl EnvironmentProof {
             logical_cpus,
             physical_memory_bytes,
             rustc_verbose_version,
+            sandbox_provider: crate::hermetic::SRT_REQUIRED_PACKAGE.to_owned(),
+            sandbox_provider_version: crate::hermetic::SRT_REQUIRED_VERSION.to_owned(),
+            sandbox_provider_identity_sha256,
             passed: violations.is_empty(),
             violations,
         })
@@ -1058,8 +1086,8 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
                 "members": [
-                    {"id":"one","started_at_unix_ms":0,"completed_at_unix_ms":10,"exit_code":0,"action_log":log,"worktree":worktree,"rustc_trace":trace},
-                    {"id":"two","started_at_unix_ms":11,"completed_at_unix_ms":20,"exit_code":0,"action_log":log,"worktree":worktree,"rustc_trace":trace}
+                    {"id":"one","started_at_unix_ms":0,"completed_at_unix_ms":10,"exit_code":0,"action_log":log,"worktree":worktree,"rustc_trace":trace,"target_empty_at_start":true},
+                    {"id":"two","started_at_unix_ms":11,"completed_at_unix_ms":20,"exit_code":0,"action_log":log,"worktree":worktree,"rustc_trace":trace,"target_empty_at_start":true}
                 ]
             }))
             .expect("serialize evidence"),
@@ -1099,6 +1127,7 @@ mod tests {
                     "action_log":log,
                     "worktree":worktree,
                     "rustc_trace":trace
+                    ,"target_empty_at_start":true
                 }]
             }))
             .expect("serialize evidence"),

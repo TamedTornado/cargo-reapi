@@ -1,0 +1,5 @@
+schema_version = 1
+id = "macos-arm64"
+base_contract_sha256 = "23112c312cbf0fab8bcb409522436934ebd099b33776d42cf0811b818f7f12a7"
+platform_os = "macos"
+platform_arch = "aarch64"

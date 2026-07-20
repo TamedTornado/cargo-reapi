@@ -489,6 +489,7 @@ fn is_gate_environment_key(name: &str) -> bool {
         "CARGO_REAPI_ACTION_LOG"
             | "CARGO_REAPI_BACKEND"
             | "CARGO_REAPI_CACHE_DIR"
+            | "CARGO_REAPI_CLONE_TRACE"
             | "CARGO_REAPI_RUSTC_TRACE"
             | "CARGO_REAPI_TARGET_ROOT"
             | "CARGO_REAPI_WORKSPACE_ROOT"
@@ -1016,6 +1017,23 @@ enum ClonePreference {
     Portable,
 }
 
+#[derive(Debug, Serialize)]
+struct CloneTraceEvent {
+    schema_version: u32,
+    at_unix_ms: u128,
+    pid: u32,
+    platform_os: &'static str,
+    source_location: &'static str,
+    source: String,
+    destination: String,
+    preference: &'static str,
+    attempted_primitive: &'static str,
+    attempt_succeeded: bool,
+    attempt_exit_code: Option<i32>,
+    attempt_error: String,
+    selected_method: &'static str,
+}
+
 fn clone_tree(source: &Path, destination: &Path) -> Result<CloneMethod> {
     clone_tree_with_preference(source, destination, ClonePreference::Auto)
 }
@@ -1028,31 +1046,114 @@ fn clone_tree_with_preference(
     fs::create_dir_all(destination)?;
     if preference == ClonePreference::Portable {
         copy_tree_portable(source, destination)?;
+        record_clone_trace(CloneTraceEvent {
+            schema_version: 1,
+            at_unix_ms: unix_ms(),
+            pid: std::process::id(),
+            platform_os: std::env::consts::OS,
+            source_location: "src/gate.rs:clone_tree_with_preference",
+            source: source.display().to_string(),
+            destination: destination.display().to_string(),
+            preference: "portable",
+            attempted_primitive: "portable-copy",
+            attempt_succeeded: true,
+            attempt_exit_code: Some(0),
+            attempt_error: String::new(),
+            selected_method: CloneMethod::PortableCopy.name(),
+        })?;
         return Ok(CloneMethod::PortableCopy);
     }
     #[cfg(target_os = "macos")]
-    let status = Command::new("/bin/cp")
+    let primitive = "/bin/cp -cR";
+    #[cfg(target_os = "macos")]
+    let attempt = Command::new("/bin/cp")
         .arg("-cR")
         .arg(source.join("."))
         .arg(destination)
-        .status();
+        .output();
     #[cfg(not(target_os = "macos"))]
     #[cfg(not(target_os = "windows"))]
-    let status = Command::new("cp")
+    let primitive = "cp --reflink=always -a";
+    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_os = "windows"))]
+    let attempt = Command::new("cp")
         .args(["--reflink=always", "-a"])
         .arg(source.join("."))
         .arg(destination)
-        .status();
+        .output();
     #[cfg(target_os = "windows")]
-    let status: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::new(
+    let primitive = "windows-block-clone-unavailable";
+    #[cfg(target_os = "windows")]
+    let attempt: std::io::Result<std::process::Output> = Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "Windows block cloning is unavailable through the portable standard library",
     ));
-    if status.is_ok_and(|status| status.success()) {
+    let attempt_succeeded = attempt.as_ref().is_ok_and(|output| output.status.success());
+    let attempt_exit_code = attempt
+        .as_ref()
+        .ok()
+        .and_then(|output| output.status.code());
+    let attempt_error = match &attempt {
+        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        Err(error) => error.to_string(),
+    };
+    if attempt_succeeded {
+        record_clone_trace(CloneTraceEvent {
+            schema_version: 1,
+            at_unix_ms: unix_ms(),
+            pid: std::process::id(),
+            platform_os: std::env::consts::OS,
+            source_location: "src/gate.rs:clone_tree_with_preference",
+            source: source.display().to_string(),
+            destination: destination.display().to_string(),
+            preference: "auto",
+            attempted_primitive: primitive,
+            attempt_succeeded,
+            attempt_exit_code,
+            attempt_error,
+            selected_method: CloneMethod::CopyOnWrite.name(),
+        })?;
         return Ok(CloneMethod::CopyOnWrite);
     }
     copy_tree_portable(source, destination)?;
+    record_clone_trace(CloneTraceEvent {
+        schema_version: 1,
+        at_unix_ms: unix_ms(),
+        pid: std::process::id(),
+        platform_os: std::env::consts::OS,
+        source_location: "src/gate.rs:clone_tree_with_preference",
+        source: source.display().to_string(),
+        destination: destination.display().to_string(),
+        preference: "auto",
+        attempted_primitive: primitive,
+        attempt_succeeded,
+        attempt_exit_code,
+        attempt_error,
+        selected_method: CloneMethod::PortableCopy.name(),
+    })?;
     Ok(CloneMethod::PortableCopy)
+}
+
+fn record_clone_trace(event: CloneTraceEvent) -> Result<()> {
+    let Some(path) = std::env::var_os("CARGO_REAPI_CLONE_TRACE").map(PathBuf::from) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    file.lock_exclusive()?;
+    writeln!(file, "{}", serde_json::to_string(&event)?)?;
+    file.sync_data()?;
+    FileExt::unlock(&file)?;
+    Ok(())
+}
+
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn collect_observed_inputs(target: &Path) -> Result<Vec<ObservedGateInput>> {

@@ -2,6 +2,7 @@ mod acceptance;
 mod action;
 mod cache;
 mod capture;
+mod evidence;
 mod gate;
 mod hermetic;
 mod invocation;
@@ -125,6 +126,8 @@ enum ProveCommand {
         #[arg(long, value_enum)]
         storage_profile: StorageProfileArg,
         #[arg(long)]
+        platform_profile: PathBuf,
+        #[arg(long)]
         report: PathBuf,
     },
     /// Validate a warm action log against the embedded zero-physical-action contract.
@@ -153,6 +156,13 @@ enum ProveCommand {
     Complete {
         #[arg(long)]
         receipts: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+    },
+    /// Verify complete macOS and Linux schema-v2 evidence graphs.
+    Aggregate {
+        #[arg(long)]
+        root: PathBuf,
         #[arg(long)]
         report: PathBuf,
     },
@@ -370,9 +380,11 @@ fn run_prove(mut args: Vec<OsString>) -> Result<i32> {
     match cli.command {
         ProveCommand::Environment {
             storage_profile,
+            platform_profile,
             report,
         } => {
-            let proof = proof::EnvironmentProof::capture(storage_profile.into())?;
+            let proof =
+                proof::EnvironmentProof::capture(storage_profile.into(), &platform_profile)?;
             proof.write_and_require_pass(&report)?;
             println!("PASS  {}", report.display());
         }
@@ -408,6 +420,17 @@ fn run_prove(mut args: Vec<OsString>) -> Result<i32> {
         ProveCommand::Complete { receipts, report } => {
             let proof = proof::CompleteProof::verify(&receipts)?;
             proof.write_and_require_pass(&report)?;
+            println!("PASS  {}", report.display());
+        }
+        ProveCommand::Aggregate { root, report } => {
+            let proof = evidence::AggregateProofV2::verify(&root)?;
+            proof.write(&report)?;
+            if !proof.passed {
+                bail!(
+                    "multi-platform aggregate acceptance failed closed; report: {}",
+                    report.display()
+                );
+            }
             println!("PASS  {}", report.display());
         }
     }

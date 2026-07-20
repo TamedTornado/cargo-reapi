@@ -146,6 +146,214 @@ fn normalized_test_stdout(bytes: &[u8]) -> String {
         .join("\n")
 }
 
+fn output_record(output: &Output) -> serde_json::Value {
+    serde_json::json!({
+        "exit_code": output.status.code(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr)
+    })
+}
+
+fn phased_bevy_root() -> PathBuf {
+    std::env::var_os("CARGO_REAPI_BEVY_ROOT")
+        .map(PathBuf::from)
+        .expect("CARGO_REAPI_BEVY_ROOT is required")
+}
+
+#[cfg(target_os = "linux")]
+fn record_elf_integrity(binary: &Path, label: &str, root: &Path) -> serde_json::Value {
+    let mut commands = serde_json::Map::new();
+    for (name, program, arguments) in [
+        ("readelf_header", "readelf", vec!["-h"]),
+        ("readelf_program_headers", "readelf", vec!["-l"]),
+        ("readelf_sections", "readelf", vec!["-S"]),
+        ("readelf_debug", "readelf", vec!["--debug-dump=decodedline"]),
+        ("objdump_headers", "objdump", vec!["-h"]),
+        ("ldd", "ldd", Vec::new()),
+        ("elflint", "eu-elflint", vec!["--gnu-ld"]),
+        ("strings", "strings", Vec::new()),
+    ] {
+        let output = Command::new(program)
+            .args(arguments)
+            .arg(binary)
+            .output()
+            .unwrap_or_else(|error| panic!("run {program} for {label}: {error}"));
+        let path = root.join(format!("{label}-{name}.txt"));
+        fs::write(
+            &path,
+            [output.stdout.as_slice(), output.stderr.as_slice()].concat(),
+        )
+        .expect("write ELF evidence");
+        commands.insert(
+            name.to_owned(),
+            serde_json::json!({"exit_code": output.status.code(), "evidence": path}),
+        );
+    }
+    serde_json::Value::Object(commands)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn record_elf_integrity(_binary: &Path, _label: &str, _root: &Path) -> serde_json::Value {
+    serde_json::json!({})
+}
+
+#[test]
+#[ignore = "run by the phased Bevy acceptance runner"]
+fn bevy_phase_prepare_deleted_producer() {
+    let root = phased_bevy_root();
+    let producer = root.join("producer");
+    let consumer = root.join("consumer-with-a-deliberately-different-path-length");
+    let cache = root.join("cache");
+    let trace = root.join("producer-wrapper-trace");
+    fs::create_dir_all(&trace).expect("producer trace");
+    copy_fixture(&producer);
+    copy_fixture(&consumer);
+    let (_, logs) = build_application_and_tests(&producer, &cache, &trace, "producer");
+    assert!(logs.iter().all(|log| !log.contains("gate-snapshot-hit")));
+    let producer_behavior = run_fixture(&producer);
+    let producer_test = test_binary(&producer);
+    let producer_test_list = run_test_binary(&producer_test, &["--list"]);
+    let producer_test_behavior = run_test_binary(&producer_test, &["--nocapture"]);
+    assert!(producer_test_list.status.success() && producer_test_behavior.status.success());
+    verify_signature(&producer.join("target/debug/cargo-reapi-bevy-fixture"));
+    verify_signature(&producer_test);
+    fs::write(
+        root.join("producer-result.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "application":{"stdout":producer_behavior.0,"stderr":producer_behavior.1},
+            "test_list":output_record(&producer_test_list),
+            "test_behavior":output_record(&producer_test_behavior),
+            "passed":true
+        }))
+        .unwrap(),
+    )
+    .expect("producer result");
+    fs::remove_dir_all(&producer).expect("delete producer");
+    assert!(!producer.exists());
+}
+
+#[test]
+#[ignore = "run by the phased Bevy acceptance runner"]
+fn bevy_phase_restore_under_os_observation() {
+    let root = phased_bevy_root();
+    let consumer = root.join("consumer-with-a-deliberately-different-path-length");
+    let cache = root.join("cache");
+    let trace = root.join("consumer-wrapper-trace");
+    fs::create_dir_all(&trace).expect("consumer trace");
+    let (elapsed, logs) = build_application_and_tests(&consumer, &cache, &trace, "consumer");
+    assert!(elapsed <= Duration::from_secs(60));
+    assert_eq!(observed_compiler_actions(&trace, &consumer), 0);
+    for log in &logs {
+        let actions = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["execution"], "gate-snapshot-hit");
+    }
+    let application = run_fixture(&consumer);
+    let (embedded_path, answer) = application.0.trim().rsplit_once(':').unwrap();
+    assert_eq!(answer, "42");
+    assert_eq!(
+        fs::canonicalize(embedded_path).unwrap(),
+        fs::canonicalize(&consumer).unwrap()
+    );
+    let test = test_binary(&consumer);
+    let test_list = run_test_binary(&test, &["--list"]);
+    let test_behavior = run_test_binary(&test, &["--nocapture"]);
+    assert!(test_list.status.success() && test_behavior.status.success());
+    verify_signature(&consumer.join("target/debug/cargo-reapi-bevy-fixture"));
+    verify_signature(&test);
+    let elf = serde_json::json!({
+        "application":record_elf_integrity(&consumer.join("target/debug/cargo-reapi-bevy-fixture"),"restored-application",&root),
+        "test":record_elf_integrity(&test,"restored-test",&root)
+    });
+    fs::write(
+        root.join("restored-result.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "warm_elapsed_ms":elapsed.as_millis(),
+            "wrapper_compile_events":0,
+            "application":{"stdout":application.0,"stderr":application.1},
+            "test_list":output_record(&test_list),
+            "test_behavior":{"exit_code":test_behavior.status.code(),"stdout":normalized_test_stdout(&test_behavior.stdout),"stderr":String::from_utf8_lossy(&test_behavior.stderr)},
+            "action_logs":logs,
+            "platform_signatures_valid":true,
+            "elf":elf,
+            "passed":true
+        }))
+        .unwrap(),
+    )
+    .expect("restored result");
+}
+
+#[test]
+#[ignore = "run by the phased Bevy acceptance runner"]
+fn bevy_phase_fresh_control_and_compare() {
+    let root = phased_bevy_root();
+    let consumer = root.join("consumer-with-a-deliberately-different-path-length");
+    let restored: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("restored-result.json")).unwrap()).unwrap();
+    fs::remove_dir_all(consumer.join("target")).expect("remove restored target");
+    fresh_control(&consumer);
+    let application = run_fixture(&consumer);
+    let test = test_binary(&consumer);
+    let test_list = run_test_binary(&test, &["--list"]);
+    let test_behavior = run_test_binary(&test, &["--nocapture"]);
+    verify_signature(&consumer.join("target/debug/cargo-reapi-bevy-fixture"));
+    verify_signature(&test);
+    let fresh = serde_json::json!({
+        "application":{"stdout":application.0,"stderr":application.1},
+        "test_list":output_record(&test_list),
+        "test_behavior":{"exit_code":test_behavior.status.code(),"stdout":normalized_test_stdout(&test_behavior.stdout),"stderr":String::from_utf8_lossy(&test_behavior.stderr)},
+        "platform_signatures_valid":true,
+        "elf":{
+            "application":record_elf_integrity(&consumer.join("target/debug/cargo-reapi-bevy-fixture"),"fresh-application",&root),
+            "test":record_elf_integrity(&test,"fresh-test",&root)
+        }
+    });
+    assert_eq!(restored["application"], fresh["application"]);
+    assert_eq!(restored["test_list"], fresh["test_list"]);
+    assert_eq!(restored["test_behavior"], fresh["test_behavior"]);
+    #[cfg(target_os = "linux")]
+    for binary in ["application", "test"] {
+        for check in [
+            "readelf_header",
+            "readelf_program_headers",
+            "readelf_sections",
+            "readelf_debug",
+            "objdump_headers",
+            "ldd",
+        ] {
+            assert_eq!(restored["elf"][binary][check]["exit_code"], 0);
+            assert_eq!(fresh["elf"][binary][check]["exit_code"], 0);
+        }
+        assert_eq!(
+            restored["elf"][binary]["elflint"]["exit_code"],
+            fresh["elf"][binary]["elflint"]["exit_code"]
+        );
+        let strings_path = restored["elf"][binary]["strings"]["evidence"]
+            .as_str()
+            .unwrap();
+        let strings = fs::read_to_string(strings_path).expect("restored ELF strings evidence");
+        assert!(!strings.contains("/producer"));
+        assert!(strings.contains(&consumer.display().to_string()));
+    }
+    fs::write(
+        root.join("bevy-integrity.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version":2,
+            "restored":restored,
+            "fresh":fresh,
+            "application_parity":true,
+            "test_parity":true,
+            "consumer_paths_only":true,
+            "passed":true
+        }))
+        .unwrap(),
+    )
+    .expect("Bevy integrity report");
+}
+
 fn fresh_control(root: &Path) {
     for arguments in [
         &["build", "--locked"][..],

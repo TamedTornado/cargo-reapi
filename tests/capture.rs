@@ -392,6 +392,86 @@ fn mutation_rebuilds_only_leaf_and_dependents_under_external_observation() {
     assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "43");
 }
 
+fn acceptance_mutation_root() -> PathBuf {
+    std::env::var_os("CARGO_REAPI_MUTATION_ROOT")
+        .map(PathBuf::from)
+        .expect("CARGO_REAPI_MUTATION_ROOT is required")
+}
+
+#[test]
+#[ignore = "run by the dedicated OS-attribution acceptance runner"]
+fn exact_mutation_prepare_for_os_observation() {
+    let root = acceptance_mutation_root();
+    let producer = root.join("producer");
+    let consumer = root.join("consumer-with-different-length");
+    let cache = root.join("cache");
+    let trace = root.join("producer-wrapper-trace");
+    fs::create_dir_all(&root).expect("mutation root");
+    fs::create_dir_all(&trace).expect("producer trace");
+    write_adversarial_workspace(&producer);
+    copy_adversarial_workspace(&producer, &consumer);
+    assert!(
+        run_snapshot_gate_with_environment(
+            &producer,
+            &cache,
+            &root.join("producer-actions.jsonl"),
+            &["build", "--workspace"],
+            &[],
+            Some(&trace),
+        )
+        .success()
+    );
+    fs::write(
+        consumer.join("leaf/src/lib.rs"),
+        "pub fn answer() -> u32 { 43 }\n",
+    )
+    .expect("mutate leaf");
+    fs::remove_dir_all(&producer).expect("retire producer");
+    assert!(!producer.exists());
+    fs::write(
+        root.join("consumer-root.txt"),
+        consumer.display().to_string(),
+    )
+    .expect("consumer root evidence");
+}
+
+#[test]
+#[ignore = "run by the dedicated OS-attribution acceptance runner"]
+fn exact_mutation_consumer_under_os_observation() {
+    let root = acceptance_mutation_root();
+    let consumer = root.join("consumer-with-different-length");
+    let cache = root.join("cache");
+    let trace = root.join("consumer-wrapper-trace");
+    fs::create_dir_all(&trace).expect("consumer trace");
+    assert!(
+        run_snapshot_gate_with_environment(
+            &consumer,
+            &cache,
+            &root.join("consumer-actions.jsonl"),
+            &["build", "--workspace"],
+            &[],
+            Some(&trace),
+        )
+        .success()
+    );
+    let crates = observed_crates(&trace, &consumer)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        crates,
+        ["leaf", "mid", "adversarial_app"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "wrapper attribution is a cross-check, not acceptance authority"
+    );
+    let output = Command::new(consumer.join("target/debug/adversarial-app"))
+        .output()
+        .expect("run mutated binary");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "43");
+}
+
 #[test]
 fn poisoned_dependency_makes_the_restored_gate_say_no() {
     let roots = tempdir().expect("adversarial roots");
@@ -1161,6 +1241,92 @@ fn identical_cold_gates_have_one_external_producer_and_one_waiter() {
             fs::canonicalize(worktree).expect("coalesced worktree path")
         );
     }
+}
+
+#[test]
+#[ignore = "run by the dedicated OS-observed coalescing acceptance runner"]
+fn exact_coalescing_under_os_observation() {
+    let root = std::env::var_os("CARGO_REAPI_COALESCING_ROOT")
+        .map(PathBuf::from)
+        .expect("CARGO_REAPI_COALESCING_ROOT is required");
+    let cache = root.join("cache");
+    let trace = root.join("wrapper-trace");
+    let first = root.join("first");
+    let second = root.join("second-with-different-length");
+    fs::create_dir_all(&trace).expect("wrapper trace");
+    write_fixture(&first, true);
+    write_fixture(&second, true);
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for (id, worktree) in [("first", first.clone()), ("second", second.clone())] {
+        let barrier = Arc::clone(&barrier);
+        let cache = cache.clone();
+        let trace = trace.clone();
+        let action_log = root.join(format!("{id}-actions.jsonl"));
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            let status = run_snapshot_gate_with_environment(
+                &worktree,
+                &cache,
+                &action_log,
+                &["build"],
+                &[],
+                Some(&trace),
+            );
+            (id, worktree, action_log, status)
+        }));
+    }
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("coalescing worker"))
+        .collect::<Vec<_>>();
+    assert!(results.iter().all(|(_, _, _, status)| status.success()));
+    let mut report_members = Vec::new();
+    for (id, worktree, action_log, _) in &results {
+        let compile_count = observed_crates(&trace, worktree).len();
+        let actions = fs::read_to_string(action_log).expect("coalescing actions");
+        let coalesced = actions.contains("coalesced-gate-hit");
+        let output = Command::new(worktree.join("target/debug/capture-fixture"))
+            .output()
+            .expect("run coalesced binary");
+        assert!(output.status.success());
+        assert_eq!(
+            fs::canonicalize(String::from_utf8(output.stdout).unwrap().trim()).unwrap(),
+            fs::canonicalize(worktree).unwrap()
+        );
+        report_members.push(serde_json::json!({
+            "id": id,
+            "worktree": worktree,
+            "action_log": action_log,
+            "wrapper_compile_count": compile_count,
+            "coalesced": coalesced,
+            "behavior_passed": true
+        }));
+    }
+    assert_eq!(
+        report_members
+            .iter()
+            .filter(|member| member["wrapper_compile_count"].as_u64().unwrap() > 0)
+            .count(),
+        1
+    );
+    assert_eq!(
+        report_members
+            .iter()
+            .filter(|member| member["coalesced"] == true)
+            .count(),
+        1
+    );
+    fs::write(
+        root.join("coalescing-result.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "members": report_members,
+            "passed": true
+        }))
+        .unwrap(),
+    )
+    .expect("coalescing result");
 }
 
 #[test]
