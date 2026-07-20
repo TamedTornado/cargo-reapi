@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -13,11 +13,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::relocation::{RecordedPathMapping, execution_slot, replace_bytes_in_place};
+use crate::relocation::{RecordedPathMapping, execution_slot};
 #[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 15;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct GateSnapshotManifest {
@@ -27,7 +27,15 @@ struct GateSnapshotManifest {
     producer_target: PathBuf,
     path_mappings: Vec<RecordedPathMapping>,
     relocation_files: Vec<PathBuf>,
+    executable_relocations: Vec<ExecutableRelocation>,
     observed_inputs: Vec<ObservedGateInput>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ExecutableRelocation {
+    path: PathBuf,
+    producer: PathBuf,
+    offsets: Vec<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -153,7 +161,7 @@ impl GateSnapshot {
             fs::remove_dir_all(&generated)?;
         }
         let path_mappings = read_path_mappings(&self.target)?;
-        let relocation_files = build_relocation_index(
+        let (relocation_files, executable_relocations) = build_relocation_index(
             &temporary.join("target"),
             &self.workspace,
             &self.target,
@@ -166,6 +174,7 @@ impl GateSnapshot {
             producer_target: self.target.clone(),
             path_mappings,
             relocation_files,
+            executable_relocations,
             observed_inputs,
         };
         fs::write(
@@ -278,7 +287,7 @@ impl GateSnapshot {
     }
 
     fn target_marker(&self) -> PathBuf {
-        self.target.join("cargo-reapi/gate-state-v15")
+        self.target.join("cargo-reapi/gate-state-v16")
     }
 
     fn target_marker_matches(&self, selected_key: &str) -> bool {
@@ -317,7 +326,7 @@ fn gate_key(
     declared_inputs: &[PathBuf],
 ) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"cargo-reapi-gate-state-v15\0");
+    hasher.update(b"cargo-reapi-gate-state-v16\0");
     hash_field(&mut hasher, std::env::consts::OS.as_bytes());
     hash_field(&mut hasher, std::env::consts::ARCH.as_bytes());
     let current_executable = std::env::current_exe()?.canonicalize()?;
@@ -701,6 +710,13 @@ fn relocate_target(
         return Ok(());
     }
 
+    relocate_executables(
+        target_root,
+        &manifest.executable_relocations,
+        &mappings,
+        resource_ledger,
+    )?;
+
     for relative in &manifest.relocation_files {
         let path = target_root.join(relative);
         if !path.is_file() {
@@ -709,15 +725,9 @@ fn relocate_target(
         let metadata = fs::metadata(&path)?;
         let modified = metadata.modified()?;
         let accessed = metadata.accessed()?;
-        let executable = is_executable(&metadata);
         let mut bytes = fs::read(&path)?;
         let mut changed = false;
         for (producer, consumer) in &mappings {
-            if executable {
-                let from = execution_slot(&producer.to_string_lossy())?;
-                let to = execution_slot(&consumer.to_string_lossy())?;
-                changed |= replace_bytes_in_place(&mut bytes, from.as_bytes(), to.as_bytes());
-            }
             if is_cargo_text_metadata(&path) {
                 let replaced = replace_variable(
                     &bytes,
@@ -739,9 +749,6 @@ fn relocate_target(
         }
         if changed {
             fs::write(&path, bytes)?;
-            if executable {
-                resign(&path, resource_ledger)?;
-            }
             OpenOptions::new().write(true).open(&path)?.set_times(
                 fs::FileTimes::new()
                     .set_accessed(accessed)
@@ -752,12 +759,67 @@ fn relocate_target(
     Ok(())
 }
 
+fn relocate_executables(
+    target_root: &Path,
+    relocations: &[ExecutableRelocation],
+    mappings: &BTreeMap<PathBuf, PathBuf>,
+    resource_ledger: &Path,
+) -> Result<()> {
+    let mut by_path: BTreeMap<&Path, Vec<&ExecutableRelocation>> = BTreeMap::new();
+    for relocation in relocations {
+        by_path
+            .entry(&relocation.path)
+            .or_default()
+            .push(relocation);
+    }
+    for (relative, file_relocations) in by_path {
+        let path = target_root.join(relative);
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("reading relocated executable {}", path.display()))?;
+        let modified = metadata.modified()?;
+        let accessed = metadata.accessed()?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        for relocation in file_relocations {
+            let consumer = mappings.get(&relocation.producer).with_context(|| {
+                format!(
+                    "snapshot has no consumer mapping for {}",
+                    relocation.producer.display()
+                )
+            })?;
+            let from = execution_slot(&relocation.producer.to_string_lossy())?;
+            let to = execution_slot(&consumer.to_string_lossy())?;
+            for offset in &relocation.offsets {
+                file.seek(SeekFrom::Start(*offset))?;
+                let mut observed = [0_u8; crate::relocation::RELOCATION_SLOT_BYTES];
+                file.read_exact(&mut observed)?;
+                if observed != from.as_bytes() {
+                    bail!(
+                        "snapshot relocation slot mismatch in {} at byte {}",
+                        path.display(),
+                        offset
+                    );
+                }
+                file.seek(SeekFrom::Start(*offset))?;
+                file.write_all(to.as_bytes())?;
+            }
+        }
+        file.set_times(
+            fs::FileTimes::new()
+                .set_accessed(accessed)
+                .set_modified(modified),
+        )?;
+        drop(file);
+        resign(&path, resource_ledger)?;
+    }
+    Ok(())
+}
+
 fn build_relocation_index(
     target_root: &Path,
     producer_workspace: &Path,
     producer_target: &Path,
     recorded: &[RecordedPathMapping],
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<PathBuf>, Vec<ExecutableRelocation>)> {
     let mut roots = vec![
         producer_workspace.to_path_buf(),
         producer_target.to_path_buf(),
@@ -778,6 +840,7 @@ fn build_relocation_index(
         .collect::<Result<Vec<_>>>()?;
 
     let mut files = Vec::new();
+    let mut executable_relocations = Vec::new();
     for entry in WalkDir::new(target_root).follow_links(false) {
         let entry = entry?;
         if !entry.file_type().is_file() {
@@ -794,24 +857,47 @@ fn build_relocation_index(
             && raw_needles
                 .iter()
                 .any(|needle| contains_bytes(&bytes, needle.as_bytes()));
-        let contains_slot = executable
-            && slot_needles
-                .iter()
-                .any(|needle| contains_bytes(&bytes, needle.as_bytes()))
+        let contains_runtime_slot = executable
             && executable_runtime_contains(entry.path(), &bytes, &slot_needles).unwrap_or(true);
-        if contains_raw || contains_slot {
+        if contains_raw {
             files.push(entry.path().strip_prefix(target_root)?.to_path_buf());
+        }
+        if contains_runtime_slot {
+            let relative = entry.path().strip_prefix(target_root)?.to_path_buf();
+            for (producer, needle) in roots.iter().zip(&slot_needles) {
+                let offsets = find_all_offsets(&bytes, needle.as_bytes());
+                if !offsets.is_empty() {
+                    executable_relocations.push(ExecutableRelocation {
+                        path: relative.clone(),
+                        producer: producer.clone(),
+                        offsets,
+                    });
+                }
+            }
         }
     }
     files.sort();
-    Ok(files)
+    executable_relocations
+        .sort_by(|left, right| (&left.path, &left.producer).cmp(&(&right.path, &right.producer)));
+    Ok((files, executable_relocations))
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+    !needle.is_empty() && memchr::memmem::find(haystack, needle).is_some()
+}
+
+fn find_all_offsets(haystack: &[u8], needle: &[u8]) -> Vec<u64> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut offsets = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = memchr::memmem::find(&haystack[search_from..], needle) {
+        let offset = search_from + relative;
+        offsets.push(offset as u64);
+        search_from = offset + needle.len();
+    }
+    offsets
 }
 
 fn executable_runtime_contains(path: &Path, bytes: &[u8], needles: &[String]) -> Result<bool> {
@@ -1343,6 +1429,19 @@ mod tests {
             expected.len()
         );
         assert_eq!(&relocated[4..4 + expected.len()], expected);
+    }
+
+    #[test]
+    fn executable_relocation_index_records_exact_non_overlapping_offsets() {
+        let needle = execution_slot("/tmp/producer").unwrap();
+        let mut bytes = b"prefix".to_vec();
+        bytes.extend_from_slice(needle.as_bytes());
+        bytes.extend_from_slice(b"middle");
+        bytes.extend_from_slice(needle.as_bytes());
+        assert_eq!(
+            find_all_offsets(&bytes, needle.as_bytes()),
+            vec![6, (6 + needle.len() + 6) as u64]
+        );
     }
 
     #[test]
