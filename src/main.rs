@@ -304,10 +304,14 @@ fn run() -> Result<i32> {
         .env("CARGO_REAPI_WORKSPACE_ROOT", workspace_root)
         .env("CARGO_REAPI_TARGET_ROOT", target_root);
     if matches!(cli.backend, Backend::Cache) {
-        cargo.env(
-            "CARGO_REAPI_DEFAULT_LINKER",
-            cache::default_linker_for_sandbox()?,
-        );
+        let default_linker = cache::default_linker_for_sandbox()?;
+        cargo.env("CARGO_REAPI_DEFAULT_LINKER", &default_linker);
+        if env::var_os("CC").is_none() {
+            // Native build scripts use cc-rs directly rather than rustc's
+            // linker setting. Supply the already-canonicalized distro
+            // default so /etc/alternatives does not have to be exposed.
+            cargo.env("CC", &default_linker);
+        }
     }
     if let Some(cache_dir) = cache_dir {
         cargo
