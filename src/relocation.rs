@@ -98,22 +98,6 @@ pub fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<
     result
 }
 
-pub fn replace_bytes_in_place(haystack: &mut [u8], needle: &[u8], replacement: &[u8]) -> bool {
-    debug_assert_eq!(needle.len(), replacement.len());
-    if needle.is_empty() {
-        return false;
-    }
-    let mut changed = false;
-    let mut offset = 0;
-    while let Some(found) = memchr::memmem::find(&haystack[offset..], needle) {
-        let position = offset + found;
-        haystack[position..position + needle.len()].copy_from_slice(replacement);
-        offset = position + needle.len();
-        changed = true;
-    }
-    changed
-}
-
 pub fn record_logical_digest(
     actual_path: &Path,
     logical_sha256: &str,
@@ -302,14 +286,6 @@ mod tests {
         let restored = materialize_artifact_slots(cached, &consumer).unwrap();
         let restored = String::from_utf8(restored).unwrap();
         assert!(restored.contains(&execution_slot(&consumer[0].1).unwrap()));
-    }
-
-    #[test]
-    fn in_place_replacement_reports_hits_without_changing_length() {
-        let mut bytes = b"before old middle old after".to_vec();
-        assert!(replace_bytes_in_place(&mut bytes, b"old", b"new"));
-        assert_eq!(bytes, b"before new middle new after");
-        assert!(!replace_bytes_in_place(&mut bytes, b"absent", b"unused"));
     }
 
     #[test]
