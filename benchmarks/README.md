@@ -6,11 +6,11 @@ binding correctness and timing rules live in
 and only `cargo reapi prove complete` can turn the full receipt set into an
 acceptance result.
 
-The current local measurements and exact workload definitions are recorded in
-[`results/2026-07-19-local.md`](results/2026-07-19-local.md). Raw reports are
-retained outside the Git repository because Moria target snapshots are large;
-the result page names their locations and records which contract digest they
-used.
+The macOS measurements and exact workload definitions are recorded in
+[`results/2026-07-19-local.md`](results/2026-07-19-local.md). The latest
+[`Linux ext4 population statistics`](results/2026-07-20-linux-ext4.md) retain
+the passing one- and five-consumer measurements from an otherwise failed batch;
+they are not presented as complete Linux qualification.
 
 Reproduction entry points:
 
