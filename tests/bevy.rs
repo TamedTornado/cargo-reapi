@@ -283,6 +283,7 @@ fn stop_os_compiler_observer(_observer: ()) -> PathBuf {
 #[test]
 #[ignore = "explicit pinned-Bevy acceptance proof"]
 fn bevy_linked_artifact_restores_after_producer_deletion() {
+    let acceptance_report = std::env::var_os("CARGO_REAPI_ACCEPTANCE_REPORT").map(PathBuf::from);
     let cache = tempdir().expect("shared cache");
     let worktrees = tempdir().expect("worktree parent");
     let trace = tempdir().expect("external rustc trace");
@@ -309,7 +310,12 @@ fn bevy_linked_artifact_restores_after_producer_deletion() {
     verify_signature(&producer.join("target/debug/cargo-reapi-bevy-fixture"));
     verify_signature(&producer_test);
     fs::remove_dir_all(&producer).expect("delete producer before consumer");
-    let os_observer = start_os_compiler_observer(worktrees.path());
+    let observer_root = acceptance_report
+        .as_ref()
+        .and_then(|report| report.parent())
+        .unwrap_or_else(|| worktrees.path());
+    fs::create_dir_all(observer_root).expect("OS observer evidence directory");
+    let os_observer = start_os_compiler_observer(observer_root);
     let (warm_elapsed, consumer_logs) =
         build_application_and_tests(&consumer, cache.path(), trace.path(), "consumer");
     let os_proof = stop_os_compiler_observer(os_observer);
@@ -374,7 +380,7 @@ fn bevy_linked_artifact_restores_after_producer_deletion() {
     verify_signature(&consumer.join("target/debug/cargo-reapi-bevy-fixture"));
     verify_signature(&fresh_test);
 
-    if let Some(report) = std::env::var_os("CARGO_REAPI_ACCEPTANCE_REPORT").map(PathBuf::from) {
+    if let Some(report) = acceptance_report {
         if let Some(parent) = report.parent() {
             fs::create_dir_all(parent).expect("Bevy acceptance report directory");
         }
