@@ -21,7 +21,7 @@ run_root=$data_root/$run_id
 mkdir -p "$run_root/cache" "$run_root/evidence"
 docker image inspect "$image" >"$run_root/evidence/container-image-inspect.json"
 
-docker run --rm --privileged --security-opt seccomp=unconfined \
+docker run --rm --privileged --security-opt seccomp=unconfined --user 0:0 --env HOME=/root \
   --mount "type=bind,src=$source_root,dst=/work" \
   --mount "type=bind,src=$run_root,dst=/qualification" \
   "$image" bash -lc '

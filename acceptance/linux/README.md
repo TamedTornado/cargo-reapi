@@ -3,8 +3,11 @@
 The Linux qualification uses the configured x86_64 build server, not GitHub
 Actions. The two official base images are digest-pinned in `Dockerfile`.
 `run-qualification.sh` records the final built-image inspection alongside the
-raw evidence, then runs the qualification as UID 1000 in a privileged container
-so bubblewrap/seccomp and ptrace-based `strace` observation can fail closed.
+raw evidence, then runs the qualification as container root in a privileged
+container. Root is confined to the disposable container and is required so
+nested bubblewrap can configure its loopback namespace; the sandboxed build
+itself still runs under bubblewrap/seccomp, and `strace` supplies OS exec
+observation.
 
 The container installs the exact local tool versions used by the project:
 Rust/Cargo 1.97.1, Node 22, pnpm 11.11.0, and Anthropic Sandbox Runtime 0.0.66.
