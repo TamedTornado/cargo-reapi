@@ -1,5 +1,5 @@
 schema_version = 1
 id = "macos-arm64"
-base_contract_sha256 = "23112c312cbf0fab8bcb409522436934ebd099b33776d42cf0811b818f7f12a7"
+base_contract_sha256 = "c833908214b7de8a7c593fee7799de7d1fbe5088b411b6d00fca7aa4ef4da500"
 platform_os = "macos"
 platform_arch = "aarch64"
