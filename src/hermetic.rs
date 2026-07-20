@@ -337,7 +337,14 @@ fn build_policy(
 ) -> Result<SrtPolicy> {
     let mut readable = package_roots(workspace, cache)?;
     #[cfg(target_os = "linux")]
-    readable.extend(workspace_inputs_excluding_target(workspace, target)?);
+    {
+        // A root package contributes `workspace` through cargo metadata. Do
+        // not let that broad read-only bind undo the target exclusion below.
+        // Nested workspace packages that are not ancestors of target remain
+        // independently readable.
+        remove_readonly_ancestors_of_writable_path(&mut readable, target);
+        readable.extend(workspace_inputs_excluding_target(workspace, target)?);
+    }
     #[cfg(not(target_os = "linux"))]
     readable.insert(workspace.to_path_buf());
     readable.extend([
@@ -485,6 +492,11 @@ fn build_policy(
         enable_weaker_network_isolation: false,
         allow_apple_events: false,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn remove_readonly_ancestors_of_writable_path(readable: &mut BTreeSet<PathBuf>, writable: &Path) {
+    readable.retain(|path| !writable.starts_with(path));
 }
 
 #[cfg(target_os = "linux")]
@@ -790,12 +802,12 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use super::workspace_inputs_excluding_target;
     use super::{
         SrtFilesystemPolicy, SrtNetworkPolicy, SrtPolicy, canonical_policy_bytes,
         normalize_policy_identity_bytes,
     };
+    #[cfg(target_os = "linux")]
+    use super::{remove_readonly_ancestors_of_writable_path, workspace_inputs_excluding_target};
     use std::path::Path;
 
     #[test]
@@ -869,6 +881,27 @@ mod tests {
         assert!(readable.contains(&workspace.join("Cargo.toml")));
         assert!(readable.contains(&workspace.join("crates")));
         assert!(!readable.contains(&workspace));
+        assert!(!readable.iter().any(|path| target.starts_with(path)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_root_package_does_not_reintroduce_readonly_workspace_mount() {
+        let workspace = Path::new("/qualification/worktree");
+        let target = workspace.join("target");
+        let nested_package = workspace.join("crates/leaf");
+        let external_package = Path::new("/dependencies/external").to_path_buf();
+        let mut readable = std::collections::BTreeSet::from([
+            workspace.to_path_buf(),
+            nested_package.clone(),
+            external_package.clone(),
+        ]);
+
+        remove_readonly_ancestors_of_writable_path(&mut readable, &target);
+
+        assert!(!readable.contains(workspace));
+        assert!(readable.contains(&nested_package));
+        assert!(readable.contains(&external_package));
         assert!(!readable.iter().any(|path| target.starts_with(path)));
     }
 }
