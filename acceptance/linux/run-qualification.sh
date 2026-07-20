@@ -73,6 +73,7 @@ test "$(cat "$run_root/evidence/host-userns-policy-during.txt")" = 0
 docker run --rm --cidfile "$run_root/qualification.cid" --network none --cap-drop ALL \
   --security-opt seccomp=unconfined \
   --security-opt apparmor=unconfined \
+  --security-opt systempaths=unconfined \
   --security-opt no-new-privileges=true \
   --env HOME=/home/qualifier \
   --mount "type=bind,src=$source_root,dst=/work,readonly" \
