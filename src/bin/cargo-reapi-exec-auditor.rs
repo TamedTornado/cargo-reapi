@@ -179,6 +179,7 @@ fn run(cli: Cli) -> Result<()> {
                     root.display().to_string(),
                     selected
                         .iter()
+                        .filter(|event| is_physical_cacheable_action(event))
                         .filter(|event| event_belongs_to_root(event, root))
                         .count(),
                 )
@@ -391,6 +392,13 @@ fn event_belongs_to_root(event: &NormalizedExec, root: &Path) -> bool {
         })
 }
 
+fn is_physical_cacheable_action(event: &NormalizedExec) -> bool {
+    let is_rustc = Path::new(&event.executable)
+        .file_name()
+        .is_some_and(|name| name == "rustc");
+    !is_rustc || event.crate_name.is_some()
+}
+
 fn derive_wrapper_crates(trace: &Path, root: Option<&Path>) -> Result<BTreeSet<String>> {
     let root = root.context("attribution selection has no worktree root")?;
     let mut crates = BTreeSet::new();
@@ -474,7 +482,10 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{crate_name, parse_eslogger, parse_strace_execve};
+    use super::{
+        NormalizedExec, crate_name, is_physical_cacheable_action, parse_eslogger,
+        parse_strace_execve,
+    };
 
     #[test]
     fn parses_strace_exec_arguments() {
@@ -517,5 +528,21 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[test]
+    fn physical_action_filter_keeps_compiles_and_linkers_but_not_rustc_probes() {
+        let event = |executable: &str, crate_name: Option<&str>| NormalizedExec {
+            executable: executable.to_owned(),
+            cwd: Some("/work".to_owned()),
+            arguments: Vec::new(),
+            crate_name: crate_name.map(str::to_owned),
+        };
+        assert!(!is_physical_cacheable_action(&event("/toolchain/rustc", None)));
+        assert!(is_physical_cacheable_action(&event(
+            "/toolchain/rustc",
+            Some("leaf")
+        )));
+        assert!(is_physical_cacheable_action(&event("/usr/bin/clang", None)));
     }
 }
