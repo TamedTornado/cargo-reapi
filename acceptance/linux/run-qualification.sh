@@ -29,6 +29,7 @@ docker run --rm --env HOME=/home/qualifier \
   --mount "type=bind,src=$run_root/cargo-git,dst=/usr/local/cargo/git" \
   "$image" bash -lc '
     set -euo pipefail
+    export PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
     git config --global --add safe.directory /work/cargo-reapi
     git config --global --add safe.directory /work/bro
     git config --global --add safe.directory /work/moria
