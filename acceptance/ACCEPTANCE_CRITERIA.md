@@ -1,6 +1,6 @@
 # cargo-reapi acceptance criteria
 
-Status: **NOT YET SATISFIED**
+Status: **macOS/arm64 empirical qualification passed, acceptance-gap closure pending; Linux/x86_64 qualification pending; publication-grade multi-platform aggregate acceptance not achieved.**
 
 This document is the acceptance authority for cargo-reapi. A benchmark, test
 binary, Moria run, Bro run, or `PASS` line is only partial evidence. The project
@@ -248,16 +248,13 @@ Before any public repository or package publication:
 - state the supported hermeticity boundary and fail-closed cases prominently;
 - do not claim acceptance until the aggregate verifier passes this document.
 
-## 9. Current qualification result
+## 9. Qualification history
 
-As of 2026-07-20, the local macOS/arm64 SSD acceptance run satisfies every
-receipt required by this document. The aggregate verifier binds all ten
-receipts to one contract, criteria revision, implementation tree, evidence
-driver, harness bundle, toolchain, platform, and run identity and verifies the
-digest of every raw evidence file.
+On 2026-07-20, the local macOS/arm64 SSD experiments produced passing timing,
+behavior, and resource results. Subsequent hostile review found provenance and
+evidence-binding gaps in the aggregate harness, so those experiments remain
+historical evidence while the gaps are closed.
 
-This result does not claim a Linux-host qualification or public release. Linux
-reflink/copy fallback behavior is covered by the portable-isolation test, but a
-Linux host should produce its own platform-bound receipt set. The earlier
-rotational proof remains storage-compatibility evidence only, and the
+No Linux-host qualification or public release was established by that run. The
+earlier rotational proof remains storage-compatibility evidence only, and the
 interrupted partial SSD proof remains invalid.

@@ -2,10 +2,9 @@
 
 The binding project acceptance requirements are recorded in
 [`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). The
-current local macOS/arm64 aggregate status is **satisfied**. Ten independently
-evidenced receipts pass the aggregate verifier under one implementation,
-executable, harness, toolchain, platform, and run identity. This is a local
-qualification result, not a Linux-host qualification or a publication.
+current macOS/arm64 empirical qualification passed, but acceptance-gap closure
+is pending. Linux/x86_64 qualification is pending, and publication-grade
+multi-platform aggregate acceptance has not been achieved.
 
 `cargo-reapi` is an experimental Cargo-native path to remote execution. Cargo remains the build planner and source of truth; the tool observes the exact `rustc` commands Cargo schedules through `RUSTC_WRAPPER`, captures their inputs, and will translate those actions to the Remote Execution API (REAPI).
 
