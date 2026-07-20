@@ -31,6 +31,8 @@ docker run --rm --privileged --security-opt seccomp=unconfined \
     pnpm install --frozen-lockfile
     cd /work/cargo-reapi
     cargo fetch --locked
+    (cd /work/moria && cargo fetch --locked)
+    (cd /work/cargo-reapi/acceptance/bevy-fixture && cargo fetch --locked)
     cargo build --release --bins
     acceptance/run-platform-qualification.sh \
       /work/moria /work/bro /qualification/cache /qualification/evidence ssd
