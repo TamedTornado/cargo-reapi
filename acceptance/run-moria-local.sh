@@ -261,6 +261,9 @@ if [ "$platform" = linux ]; then
   if [ -f "$evidence_root/container-image-inspect.json" ]; then
     environment_refs="$environment_refs container_image_inspect:$evidence_root/container-image-inspect.json"
   fi
+  if [ -f "$evidence_root/host-userns-policy-before.txt" ] && [ -f "$evidence_root/host-userns-policy-during.txt" ]; then
+    environment_refs="$environment_refs host_userns_policy_before:$evidence_root/host-userns-policy-before.txt host_userns_policy_during:$evidence_root/host-userns-policy-during.txt"
+  fi
 fi
 # shellcheck disable=SC2086
 write_receipt_v2 "$evidence_root" "$evidence_root/receipts/environment.receipt.json" environment \

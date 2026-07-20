@@ -21,6 +21,22 @@ run_root=$data_root/$run_id
 mkdir -p "$run_root/cache" "$run_root/evidence"
 docker image inspect "$image" >"$run_root/evidence/container-image-inspect.json"
 
+userns_policy=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+original_userns_policy=$(cat "$userns_policy")
+printf '%s\n' "$original_userns_policy" >"$run_root/evidence/host-userns-policy-before.txt"
+restore_userns_policy() {
+  docker run --rm --privileged --security-opt systempaths=unconfined --user 0:0 "$image" \
+    sh -c "printf '%s\\n' '$original_userns_policy' > '$userns_policy'"
+  cat "$userns_policy" >"$run_root/evidence/host-userns-policy-after.txt"
+}
+trap restore_userns_policy EXIT HUP INT TERM
+if [ "$original_userns_policy" != 0 ]; then
+  docker run --rm --privileged --security-opt systempaths=unconfined --user 0:0 "$image" \
+    sh -c "printf '0\\n' > '$userns_policy'"
+fi
+cat "$userns_policy" >"$run_root/evidence/host-userns-policy-during.txt"
+test "$(cat "$run_root/evidence/host-userns-policy-during.txt")" = 0
+
 docker run --rm --privileged --security-opt seccomp=unconfined --user 0:0 --env HOME=/root \
   --mount "type=bind,src=$source_root,dst=/work" \
   --mount "type=bind,src=$run_root,dst=/qualification" \
@@ -40,5 +56,8 @@ docker run --rm --privileged --security-opt seccomp=unconfined --user 0:0 --env 
     acceptance/run-platform-qualification.sh \
       /work/moria /work/bro /qualification/cache /qualification/evidence ssd
   '
+
+restore_userns_policy
+trap - EXIT HUP INT TERM
 
 echo "PASS  $run_root/evidence"

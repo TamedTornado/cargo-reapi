@@ -535,10 +535,30 @@ fn verify_receipt_semantics(
                 == Some("linux")
                 && (!roles.contains_key("cache_filesystem")
                     || !roles.contains_key("worktree_filesystem")
-                    || !roles.contains_key("container_image_inspect"))
+                    || !roles.contains_key("container_image_inspect")
+                    || !roles.contains_key("host_userns_policy_before")
+                    || !roles.contains_key("host_userns_policy_during"))
             {
                 violations
                     .push("Linux environment lacks cache/worktree filesystem evidence".to_owned());
+            }
+            if report
+                .get("platform_os")
+                .and_then(serde_json::Value::as_str)
+                == Some("linux")
+            {
+                let during = roles
+                    .get("host_userns_policy_during")
+                    .and_then(|paths| paths.first())
+                    .map(fs::read_to_string)
+                    .transpose()?
+                    .unwrap_or_default();
+                if during.trim() != "0" {
+                    violations.push(
+                        "Linux nested user-namespace policy was not qualified in fail-closed mode"
+                            .to_owned(),
+                    );
+                }
             }
         }
         "adversarial" => {
