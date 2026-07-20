@@ -30,6 +30,7 @@ esac
 
 . "$repo/acceptance/lib/provenance.sh"
 write_intrinsic_run_start "$report_root" "$runner" "$driver" "$auditor_identity" "$profile" "$batch_id"
+contract_sha256=$(jq -er '.contract_sha256 | select(test("^[0-9a-f]{64}$"))' "$report_root/run-start.json")
 test -f "$harness"
 git -C "$bro_root" diff --quiet -- packages/pm/src/benchmarks/cargo-reapi-moria-proof.ts
 git -C "$bro_root" diff --cached --quiet -- packages/pm/src/benchmarks/cargo-reapi-moria-proof.ts
@@ -54,7 +55,8 @@ selection_config() {
 run_bro() {
   pnpm --dir "$bro_root" --filter @bro/pm prove:moria:cargo-reapi -- \
     --repo "$moria_root" --cache-dir "$cache_dir" --driver "$driver" --observer "$observer" \
-    --auditor "$exec_auditor" --report-dir "$report_root" --storage-profile "$storage_profile" "$@"
+    --auditor "$exec_auditor" --report-dir "$report_root" --storage-profile "$storage_profile" \
+    --contract-sha256 "$contract_sha256" "$@"
 }
 
 selection_config "$report_root/producer-selection.json" nonzero
@@ -76,6 +78,7 @@ else
     pnpm --dir "$bro_root" --filter @bro/pm prove:moria:cargo-reapi -- \
       --repo "$moria_root" --cache-dir "$cache_dir" --driver "$driver" --observer "$observer" \
       --auditor "$exec_auditor" --report-dir "$report_root" --storage-profile "$storage_profile" \
+      --contract-sha256 "$contract_sha256" \
       --producer-only true \
       >"$report_root/bro-producer-cli.stdout" 2>"$report_root/bro-producer-cli.stderr" || status=$?
   : >"$report_root/producer-observer.stderr"
@@ -109,6 +112,7 @@ else
     pnpm --dir "$bro_root" --filter @bro/pm prove:moria:cargo-reapi -- \
       --repo "$moria_root" --cache-dir "$cache_dir" --driver "$driver" --observer "$observer" \
       --auditor "$exec_auditor" --report-dir "$report_root" --storage-profile "$storage_profile" \
+      --contract-sha256 "$contract_sha256" \
       --consumers-only true --producer-retirement "$producer_retirement" \
       >"$report_root/bro-cli.stdout" 2>"$report_root/bro-cli.stderr" || status=$?
   : >"$report_root/consumers-observer.stderr"
