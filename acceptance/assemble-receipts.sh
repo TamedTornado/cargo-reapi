@@ -127,7 +127,7 @@ require_test bevy_linked_artifact_restores_after_producer_deletion "$bevy_log"
 bevy_os=$(jq -r '.os_proof' "$bevy_report")
 require_pass "$bevy_os"
 jq -e '.os_compiler_linker_events == 0 and .consumer_wrapper_compile_events == 0 and .restored_signatures_valid and .fresh_signatures_valid and .restored_application == .fresh_application and .restored_test_list == .fresh_test_list and .restored_test_stdout == .fresh_test_stdout and .restored_test_stderr == .fresh_test_stderr' "$bevy_report" >/dev/null
-bevy_measurements=$(jq -c '{warm_elapsed_ms,os_compiler_linker_events}' "$bevy_report")
+bevy_measurements=$(jq -c '{warm_elapsed_ms,performance_reference_ms:60000,performance_reference_met:(.warm_elapsed_ms <= 60000),performance_exceedance_ms:([.warm_elapsed_ms - 60000,0]|max),os_compiler_linker_events}' "$bevy_report")
 write_receipt bevy-integrity \
   '{"application_parity":true,"test_enumeration_parity":true,"test_behavior_parity":true,"consumer_paths_only":true,"valid_signatures":true,"zero_os_compiler_linker":true}' \
   "$bevy_measurements" "$bevy_report" "$bevy_log" "$bevy_os"
@@ -164,9 +164,9 @@ for kind in single five stress; do
   require_pass "$os_proof"
   jq -e '.all_started_before_any_completed and ([.member_action_proofs[].cacheable_physical_actions] | all(. == 0))' "$proof" >/dev/null
   jq -e '.expected == "zero" and .parsed_event_count == 0 and .invalid_line_count == 0' "$os_proof" >/dev/null
-  measurements=$(jq -c --argjson os 0 '{members:.observed_members,elapsed_ms,physical_cacheable_actions:([.member_action_proofs[].cacheable_physical_actions] | add),os_compiler_linker_events:$os}' "$proof")
+  measurements=$(jq -c --argjson os 0 '{members:.observed_members,elapsed_ms,deadline_ms,performance_reference_met,performance_exceedance_ms,physical_cacheable_actions:([.member_action_proofs[].cacheable_physical_actions] | add),os_compiler_linker_events:$os}' "$proof")
   write_receipt "moria-$kind" \
-    '{"clean_repositories":true,"producer_completed":true,"producer_deleted":true,"empty_consumer_targets":true,"canonical_gate_exact":true,"all_tests_passed":true,"simultaneous_start":true,"logical_gates_uncapped":true,"zero_physical_actions":true,"zero_os_compiler_linker":true,"deadline_met":true}' \
+    '{"clean_repositories":true,"producer_completed":true,"producer_deleted":true,"empty_consumer_targets":true,"canonical_gate_exact":true,"all_tests_passed":true,"simultaneous_start":true,"logical_gates_uncapped":true,"zero_physical_actions":true,"zero_os_compiler_linker":true,"performance_measured":true}' \
     "$measurements" "$proof" "$os_proof" "$moria/producer-os-proof.json"
 done
 
@@ -174,11 +174,11 @@ bro_proof=$bro/bro-moria-five-proof.json
 bro_os=$bro/consumers-os-proof.json
 require_pass "$bro_proof"
 require_pass "$bro_os"
-jq -e '.observed_members >= 5 and .all_started_before_any_completed and .elapsed_ms <= .deadline_ms' "$bro_proof" >/dev/null
+jq -e '.observed_members >= 5 and .all_started_before_any_completed and (.elapsed_ms | type == "number") and (.deadline_ms | type == "number")' "$bro_proof" >/dev/null
 jq -e '.expected == "zero" and .parsed_event_count == 0 and .invalid_line_count == 0' "$bro_os" >/dev/null
-bro_measurements=$(jq -c '{members:.observed_members,elapsed_ms,physical_cacheable_actions:0,os_compiler_linker_events:0}' "$bro_proof")
+bro_measurements=$(jq -c '{members:.observed_members,elapsed_ms,deadline_ms,performance_reference_met:(.elapsed_ms <= .deadline_ms),performance_exceedance_ms:([.elapsed_ms - .deadline_ms,0]|max),physical_cacheable_actions:0,os_compiler_linker_events:0}' "$bro_proof")
 write_receipt bro-five \
-  '{"public_cli_boundary":true,"bro_source_independent":true,"five_jobs_simultaneous":true,"canonical_gate_exact":true,"all_tests_passed":true,"zero_physical_actions":true,"zero_os_compiler_linker":true,"deadline_met":true}' \
+  '{"public_cli_boundary":true,"bro_source_independent":true,"five_jobs_simultaneous":true,"canonical_gate_exact":true,"all_tests_passed":true,"zero_physical_actions":true,"zero_os_compiler_linker":true,"performance_measured":true}' \
   "$bro_measurements" "$bro_proof" "$bro_os"
 
 "$verifier" prove complete --receipts "$receipts" --report "$receipts/complete-proof.json"

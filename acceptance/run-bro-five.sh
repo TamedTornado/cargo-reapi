@@ -123,13 +123,13 @@ test "$status" -eq 0
 
 claims=$(jq -cn '
   def claim($roles): {status:"PASS",evidence_roles:$roles};
-  {public_cli_boundary:claim(["bro_cli_stdout","bro_harness_source"]),exact_environment_producer:claim(["bro_producer","producer_os_audit"]),producer_deleted:claim(["producer_retirement"]),five_jobs_simultaneous:claim(["bro_proof"]),canonical_gate:claim(["bro_proof","member_action_log"]),zero_physical_actions:claim(["bro_proof","member_action_log"]),zero_os_compiler_linker:claim(["bro_os_audit"]),deadline_met:claim(["bro_proof"])}')
+  {public_cli_boundary:claim(["bro_cli_stdout","bro_harness_source"]),exact_environment_producer:claim(["bro_producer","producer_os_audit"]),producer_deleted:claim(["producer_retirement"]),five_jobs_simultaneous:claim(["bro_proof"]),canonical_gate:claim(["bro_proof","member_action_log"]),zero_physical_actions:claim(["bro_proof","member_action_log"]),zero_os_compiler_linker:claim(["bro_os_audit"]),performance_measured:claim(["bro_proof"])}')
 references="bro_proof:$report_root/bro-moria-five-proof.json bro_population_proof:$report_root/bro-moria-five-population-proof.json bro_os_audit:$report_root/consumers-os-proof.json bro_producer:$report_root/bro-moria-producer.json producer_os_audit:$report_root/producer-os-proof.json producer_retirement:$producer_retirement bro_cli_stdout:$report_root/bro-cli.stdout bro_cli_stderr:$report_root/bro-cli.stderr bro_producer_cli_stdout:$report_root/bro-producer-cli.stdout bro_producer_cli_stderr:$report_root/bro-producer-cli.stderr bro_harness_source:$report_root/bro-harness-source.ts bro_source_revision:$report_root/bro-source-revision.txt"
 for file in "$report_root"/member-*-actions.jsonl; do references="$references member_action_log:$file"; done
 # shellcheck disable=SC2086
 write_receipt_v2 "$evidence_root" "$evidence_root/receipts/bro-five.receipt.json" bro-five \
   "$report_root/run-start.json" "$claims" \
-  "$(jq -c '{members:.observed_members,elapsed_ms,physical_cacheable_actions:0,os_compiler_linker_events:0}' "$report_root/bro-moria-five-proof.json")" \
+  "$(jq -c '{members:.observed_members,elapsed_ms,deadline_ms,performance_reference_met:(.elapsed_ms <= .deadline_ms),performance_exceedance_ms:([.elapsed_ms - .deadline_ms,0]|max),physical_cacheable_actions:0,os_compiler_linker_events:0}' "$report_root/bro-moria-five-proof.json")" \
   $references
 
 echo "PASS  $report_root"

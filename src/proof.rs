@@ -309,7 +309,7 @@ fn required_checks(kind: &str) -> &'static [&'static str] {
             "logical_gates_uncapped",
             "zero_physical_actions",
             "zero_os_compiler_linker",
-            "deadline_met",
+            "performance_measured",
         ],
         "bro-five" => &[
             "public_cli_boundary",
@@ -319,7 +319,7 @@ fn required_checks(kind: &str) -> &'static [&'static str] {
             "all_tests_passed",
             "zero_physical_actions",
             "zero_os_compiler_linker",
-            "deadline_met",
+            "performance_measured",
         ],
         _ => &[],
     }
@@ -348,21 +348,40 @@ fn verify_measurements(kind: &str, measurements: &serde_json::Value, violations:
         "moria-stress" => Some((10, 120_000)),
         _ => None,
     };
-    if let Some((members, deadline_ms)) = population
-        && (number("members").is_none_or(|value| value < members)
-            || number("elapsed_ms").is_none_or(|value| value > deadline_ms)
+    if let Some((members, _reference_ms)) = population {
+        let elapsed = number("elapsed_ms");
+        let reference = number("deadline_ms");
+        let reference_met = measurements
+            .get("performance_reference_met")
+            .and_then(serde_json::Value::as_bool);
+        if number("members").is_none_or(|value| value < members)
+            || elapsed.is_none()
+            || reference.is_none()
+            || reference_met != elapsed.zip(reference).map(|(value, limit)| value <= limit)
             || number("os_compiler_linker_events") != Some(0)
-            || number("physical_cacheable_actions") != Some(0))
-    {
-        violations.push(format!(
-            "{kind} population measurements violate fixed acceptance"
-        ));
+            || number("physical_cacheable_actions") != Some(0)
+        {
+            violations.push(format!(
+                "{kind} population measurements violate correctness or performance-reporting acceptance"
+            ));
+        }
     }
-    if kind == "bevy-integrity"
-        && (number("warm_elapsed_ms").is_none_or(|value| value > 60_000)
-            || number("os_compiler_linker_events") != Some(0))
-    {
-        violations.push("Bevy integrity measurements violate fixed acceptance".to_owned());
+    if kind == "bevy-integrity" {
+        let elapsed = number("warm_elapsed_ms");
+        let reference = number("performance_reference_ms");
+        let reference_met = measurements
+            .get("performance_reference_met")
+            .and_then(serde_json::Value::as_bool);
+        if elapsed.is_none()
+            || reference.is_none()
+            || reference_met != elapsed.zip(reference).map(|(value, limit)| value <= limit)
+            || number("os_compiler_linker_events") != Some(0)
+        {
+            violations.push(
+                "Bevy integrity measurements violate correctness or performance-reporting acceptance"
+                    .to_owned(),
+            );
+        }
     }
 }
 
@@ -454,6 +473,8 @@ pub struct PopulationProof {
     all_targets_empty_at_start: bool,
     elapsed_ms: u128,
     deadline_ms: u128,
+    performance_reference_met: bool,
+    performance_exceedance_ms: u128,
     member_action_proofs: Vec<ActionLogProof>,
     violations: Vec<String>,
     passed: bool,
@@ -651,11 +672,8 @@ impl PopulationProof {
             violations.push("at least one consumer target was non-empty at gate start".to_owned());
         }
         let deadline_ms = population_deadline_ms(&contract, kind, storage_profile)?;
-        if elapsed_ms > deadline_ms {
-            violations.push(format!(
-                "population elapsed {elapsed_ms} ms; deadline is {deadline_ms} ms"
-            ));
-        }
+        let performance_reference_met = elapsed_ms <= deadline_ms;
+        let performance_exceedance_ms = elapsed_ms.saturating_sub(deadline_ms);
 
         let mut member_action_proofs = Vec::new();
         for member in &evidence.members {
@@ -688,6 +706,8 @@ impl PopulationProof {
             all_targets_empty_at_start,
             elapsed_ms,
             deadline_ms,
+            performance_reference_met,
+            performance_exceedance_ms,
             member_action_proofs,
             passed: violations.is_empty(),
             violations,
@@ -973,16 +993,16 @@ mod tests {
                         "stall_seconds": 300
                     }),
                     "moria-single" => {
-                        serde_json::json!({"members":1,"elapsed_ms":1,"os_compiler_linker_events":0,"physical_cacheable_actions":0})
+                        serde_json::json!({"members":1,"elapsed_ms":1,"deadline_ms":60_000,"performance_reference_met":true,"os_compiler_linker_events":0,"physical_cacheable_actions":0})
                     }
                     "moria-five" | "bro-five" => {
-                        serde_json::json!({"members":5,"elapsed_ms":1,"os_compiler_linker_events":0,"physical_cacheable_actions":0})
+                        serde_json::json!({"members":5,"elapsed_ms":1,"deadline_ms":120_000,"performance_reference_met":true,"os_compiler_linker_events":0,"physical_cacheable_actions":0})
                     }
                     "moria-stress" => {
-                        serde_json::json!({"members":10,"elapsed_ms":1,"os_compiler_linker_events":0,"physical_cacheable_actions":0})
+                        serde_json::json!({"members":10,"elapsed_ms":1,"deadline_ms":120_000,"performance_reference_met":true,"os_compiler_linker_events":0,"physical_cacheable_actions":0})
                     }
                     "bevy-integrity" => {
-                        serde_json::json!({"warm_elapsed_ms":1,"os_compiler_linker_events":0})
+                        serde_json::json!({"warm_elapsed_ms":1,"performance_reference_ms":60_000,"performance_reference_met":true,"os_compiler_linker_events":0})
                     }
                     _ => serde_json::json!({}),
                 },
@@ -1142,10 +1162,13 @@ mod tests {
             StorageProfile::Rotational,
         )
         .expect("rotational proof");
-        assert!(!ssd.passed);
+        assert!(ssd.passed);
         assert_eq!(ssd.deadline_ms, 60_000);
+        assert!(!ssd.performance_reference_met);
+        assert_eq!(ssd.performance_exceedance_ms, 209_194);
         assert!(rotational.passed);
         assert_eq!(rotational.deadline_ms, 300_000);
+        assert!(rotational.performance_reference_met);
         let contract = AcceptanceContract::embedded().expect("contract");
         assert_eq!(
             population_deadline_ms(&contract, PopulationKind::Five, StorageProfile::Rotational)

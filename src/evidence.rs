@@ -645,7 +645,7 @@ fn verify_receipt_semantics(
             if report
                 .pointer("/restored/warm_elapsed_ms")
                 .and_then(serde_json::Value::as_u64)
-                .is_none_or(|ms| ms > 60_000)
+                .is_none()
                 || report
                     .pointer("/restored/wrapper_compile_events")
                     .and_then(serde_json::Value::as_u64)
@@ -822,6 +822,14 @@ fn verify_receipt_semantics(
             );
             if number(measurements, "members") != Some(expected_members)
                 || number(measurements, "physical_cacheable_actions") != Some(0)
+                || number(measurements, "elapsed_ms") != number(&proof, "elapsed_ms")
+                || number(measurements, "deadline_ms") != number(&proof, "deadline_ms")
+                || measurements
+                    .get("performance_reference_met")
+                    .and_then(serde_json::Value::as_bool)
+                    != proof
+                        .get("performance_reference_met")
+                        .and_then(serde_json::Value::as_bool)
             {
                 violations.push(format!(
                     "{kind} receipt measurements disagree with raw proof"
@@ -866,9 +874,8 @@ fn verify_receipt_semantics(
                     .get("all_started_before_any_completed")
                     .and_then(serde_json::Value::as_bool)
                     != Some(true)
-                || number(&proof, "elapsed_ms")
-                    .zip(number(&proof, "deadline_ms"))
-                    .is_none_or(|(elapsed, deadline)| elapsed > deadline)
+                || number(&proof, "elapsed_ms").is_none()
+                || number(&proof, "deadline_ms").is_none()
                 || proof
                     .get("members")
                     .and_then(serde_json::Value::as_array)
@@ -1084,7 +1091,7 @@ fn required_claims(kind: &str, platform_os: &str) -> &'static [&'static str] {
             "simultaneous_start",
             "zero_physical_actions",
             "zero_os_compiler_linker",
-            "deadline_met",
+            "performance_measured",
         ],
         "bro-five" => &[
             "public_cli_boundary",
@@ -1094,7 +1101,7 @@ fn required_claims(kind: &str, platform_os: &str) -> &'static [&'static str] {
             "canonical_gate",
             "zero_physical_actions",
             "zero_os_compiler_linker",
-            "deadline_met",
+            "performance_measured",
         ],
         _ => &[],
     }

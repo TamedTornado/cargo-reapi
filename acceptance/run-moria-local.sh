@@ -282,7 +282,7 @@ for kind in single five stress; do
   population_root=$run_root/$kind/evidence
   claims=$(jq -cn '
     def claim($roles): {status:"PASS",evidence_roles:$roles};
-    {producer_deleted:claim(["producer_retirement"]),empty_consumers:claim(["population_evidence"]),canonical_gate:claim(["population_proof","member_gate_log"]),simultaneous_start:claim(["population_proof"]),zero_physical_actions:claim(["population_proof","member_action_log"]),zero_os_compiler_linker:claim(["population_os_audit"]),deadline_met:claim(["population_proof"])}')
+    {producer_deleted:claim(["producer_retirement"]),empty_consumers:claim(["population_evidence"]),canonical_gate:claim(["population_proof","member_gate_log"]),simultaneous_start:claim(["population_proof"]),zero_physical_actions:claim(["population_proof","member_action_log"]),zero_os_compiler_linker:claim(["population_os_audit"]),performance_measured:claim(["population_proof"])}')
   references="producer_retirement:$report_root/producer-retirement.json population_proof:$report_root/$kind-proof.json population_os_audit:$report_root/$kind-os-proof.json population_evidence:$report_root/$kind-evidence.json"
   for file in "$population_root"/member-*-actions.jsonl; do references="$references member_action_log:$file"; done
   for file in "$population_root"/member-*.log; do references="$references member_gate_log:$file"; done
@@ -291,7 +291,7 @@ for kind in single five stress; do
   # shellcheck disable=SC2086
   write_receipt_v2 "$evidence_root" "$evidence_root/receipts/$receipt_kind.receipt.json" "$receipt_kind" \
     "$report_root/run-start.json" "$claims" \
-    "$(jq -c '{members:.observed_members,elapsed_ms,physical_cacheable_actions:([.member_action_proofs[].cacheable_physical_actions]|add),os_compiler_linker_events:0}' "$report_root/$kind-proof.json")" \
+    "$(jq -c '{members:.observed_members,elapsed_ms,deadline_ms,performance_reference_met,performance_exceedance_ms,physical_cacheable_actions:([.member_action_proofs[].cacheable_physical_actions]|add),os_compiler_linker_events:0}' "$report_root/$kind-proof.json")" \
     $references
 done
 

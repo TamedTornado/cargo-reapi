@@ -99,7 +99,7 @@ fi
 # shellcheck disable=SC2086
 write_receipt_v2 "$evidence_root" "$evidence_root/receipts/bevy-integrity.receipt.json" bevy-integrity \
   "$report_root/run-start.json" "$claims" \
-  "$(jq -c '{warm_elapsed_ms:.restored.warm_elapsed_ms,os_compiler_linker_events:0}' "$report_root/fixture/bevy-integrity.json")" \
+  "$(jq -c '{warm_elapsed_ms:.restored.warm_elapsed_ms,performance_reference_ms:60000,performance_reference_met:(.restored.warm_elapsed_ms <= 60000),performance_exceedance_ms:([.restored.warm_elapsed_ms - 60000,0]|max),os_compiler_linker_events:0}' "$report_root/fixture/bevy-integrity.json")" \
   $references
 
 echo "PASS  $report_root"

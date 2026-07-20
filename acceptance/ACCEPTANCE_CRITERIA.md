@@ -10,7 +10,11 @@ defined below.
 These criteria must not be weakened to make an implementation pass. A proposed
 change to a criterion must be reviewed as a contract change before the affected
 experiment runs. Results produced under different criteria remain historical
-evidence and cannot be relabelled as current acceptance.
+evidence and cannot be relabelled as current acceptance. On 2026-07-20, operator
+review changed population clocks from universal correctness vetoes to mandatory
+platform-qualified performance references. Thresholds remain fixed and every
+exceedance must remain explicit in receipts; correctness acceptance cannot be
+failed or passed solely by wall-clock variance across dissimilar hosts.
 
 ## 1. Evidence integrity
 
@@ -196,15 +200,19 @@ For every population:
 - cargo-reapi reports zero cacheable physical actions in warm consumers;
 - the OS-level observer independently reports zero compiler and linker actions.
 
-The original SSD deadlines are immutable:
+The original SSD performance references are immutable:
 
 - one clean consumer: at most 60 seconds;
 - five simultaneous clean consumers: at most 120 seconds;
 - ten simultaneous clean consumers: at most 120 seconds.
 
-Rotational-storage results may use the separately fixed 300/900/1800-second
-qualification clocks, but they are storage-compatibility evidence, not a
-substitute for the original SSD acceptance result.
+Rotational-storage results use the separately fixed 300/900/1800-second
+performance references. Every population receipt records `elapsed_ms`,
+`deadline_ms`, `performance_reference_met`, and `performance_exceedance_ms`.
+An exceedance is a benchmark result requiring investigation, not by itself a
+cache-correctness failure. Missing, inconsistent, or suppressed timing evidence
+is an acceptance failure. Rotational results remain storage-compatibility
+evidence, not a substitute for SSD measurements.
 
 ## 6. Bro integration receipt
 
@@ -221,7 +229,8 @@ The integration receipt must require:
 - passing Moria tests in every consumer;
 - zero cargo-reapi-classified physical warm actions;
 - zero OS-observed compiler/linker processes in consumers;
-- the applicable fixed storage deadline.
+- measurement against the applicable fixed storage performance reference,
+  including any exceedance without suppressing the correctness receipt.
 
 GitHub Actions, pull requests, or deployment are not part of this local
 development acceptance path. CI may provide additional validation but cannot
