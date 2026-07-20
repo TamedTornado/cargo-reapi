@@ -17,7 +17,7 @@ use crate::action::{
     ActionInput, DeterministicAction, PlatformIdentity, RemoteEligibility, ToolchainIdentity,
     action_key,
 };
-use crate::invocation::RustcInvocation;
+use crate::invocation::{NON_SEMANTIC_COMPILER_ENVIRONMENT, RustcInvocation};
 use crate::relocation::{
     cache_slot, execution_slot, normalize_artifact_slots, record_path_mappings,
     restored_logical_digest,
@@ -553,22 +553,24 @@ fn captured_environment() -> BTreeMap<String, String> {
 
 fn keyed_environment(roots: &CaptureRoots) -> BTreeMap<String, String> {
     env::vars()
-        .filter(|(name, _)| {
-            !matches!(
-                name.as_str(),
-                "CARGO_REAPI_ACTION_LOG"
-                    | "CARGO_REAPI_BACKEND"
-                    | "CARGO_REAPI_CACHE_DIR"
-                    | "CARGO_REAPI_RUSTC_TRACE"
-                    | "CARGO_REAPI_TARGET_ROOT"
-                    | "CARGO_REAPI_WORKSPACE_ROOT"
-            )
-        })
+        .filter(|(name, _)| is_keyed_environment(name))
         .map(|(name, value)| {
             let normalized = roots.normalize_text(&value);
             (name, format!("sha256:{:x}", Sha256::digest(normalized)))
         })
         .collect()
+}
+
+fn is_keyed_environment(name: &str) -> bool {
+    !matches!(
+        name,
+        "CARGO_REAPI_ACTION_LOG"
+            | "CARGO_REAPI_BACKEND"
+            | "CARGO_REAPI_CACHE_DIR"
+            | "CARGO_REAPI_RUSTC_TRACE"
+            | "CARGO_REAPI_TARGET_ROOT"
+            | "CARGO_REAPI_WORKSPACE_ROOT"
+    ) && !NON_SEMANTIC_COMPILER_ENVIRONMENT.contains(&name)
 }
 
 fn is_compiler_environment(name: &str) -> bool {
@@ -623,7 +625,7 @@ fn lossy(value: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_compiler_environment;
+    use super::{is_compiler_environment, is_keyed_environment};
 
     #[test]
     fn captures_cargo_compiler_contract() {
@@ -640,5 +642,13 @@ mod tests {
         assert!(!is_compiler_environment("CARGO_REGISTRY_TOKEN"));
         assert!(!is_compiler_environment("CARGO_REGISTRIES_PRIVATE_TOKEN"));
         assert!(!is_compiler_environment("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn keys_user_inputs_but_not_ephemeral_sandbox_transport_ports() {
+        assert!(is_keyed_environment("RUSTFLAGS"));
+        assert!(is_keyed_environment("MY_PROC_MACRO_INPUT"));
+        assert!(!is_keyed_environment("CLAUDE_CODE_HOST_HTTP_PROXY_PORT"));
+        assert!(!is_keyed_environment("CLAUDE_CODE_HOST_SOCKS_PROXY_PORT"));
     }
 }

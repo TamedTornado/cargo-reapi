@@ -6,6 +6,11 @@ use anyhow::{Context, Result, bail};
 
 use crate::relocation::execution_slot;
 
+pub const NON_SEMANTIC_COMPILER_ENVIRONMENT: [&str; 2] = [
+    "CLAUDE_CODE_HOST_HTTP_PROXY_PORT",
+    "CLAUDE_CODE_HOST_SOCKS_PROXY_PORT",
+];
+
 #[derive(Debug)]
 pub struct RustcInvocation {
     pub compiler: PathBuf,
@@ -37,6 +42,7 @@ impl RustcInvocation {
         let mut command = Command::new(&self.compiler);
         command.args(&self.args);
         apply_relocation_environment(&mut command)?;
+        remove_non_semantic_compiler_environment(&mut command);
         let status = command
             .status()
             .with_context(|| format!("executing {}", self.compiler.display()))?;
@@ -58,6 +64,7 @@ impl RustcInvocation {
         let mut command = Command::new(&self.compiler);
         command.args(arguments);
         apply_relocation_environment(&mut command)?;
+        remove_non_semantic_compiler_environment(&mut command);
         let status = command
             .env("CARGO_REAPI_LINKER_CAPTURE", capture_path)
             .env("CARGO_REAPI_REAL_LINKER", real_linker)
@@ -182,6 +189,12 @@ impl RustcInvocation {
         outputs.sort();
         outputs.dedup();
         Ok(outputs)
+    }
+}
+
+fn remove_non_semantic_compiler_environment(command: &mut Command) {
+    for name in NON_SEMANTIC_COMPILER_ENVIRONMENT {
+        command.env_remove(name);
     }
 }
 
@@ -331,6 +344,25 @@ mod tests {
         for command in ["fmt", "check", "clippy", "test"] {
             let args = vec![OsString::from("cargo-reapi"), OsString::from(command)];
             assert!(!RustcInvocation::looks_like_wrapper(&args));
+        }
+    }
+
+    #[test]
+    fn strips_ephemeral_sandbox_transport_ports_from_compiler_children() {
+        let mut command = Command::new("rustc");
+        for name in NON_SEMANTIC_COMPILER_ENVIRONMENT {
+            command.env(name, "ephemeral");
+        }
+
+        remove_non_semantic_compiler_environment(&mut command);
+
+        for name in NON_SEMANTIC_COMPILER_ENVIRONMENT {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(candidate, value)| candidate == name && value.is_none()),
+                "missing environment removal for {name}"
+            );
         }
     }
 
