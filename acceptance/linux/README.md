@@ -21,3 +21,24 @@ and restores the exact original value from an EXIT trap.
 ```sh
 acceptance/linux/run-qualification.sh /srv/cargo-reapi-qualification/source /srv/cargo-reapi-qualification/runs
 ```
+
+## Reflink qualification volume
+
+The ten-worktree qualification must not amplify one linked snapshot into ten
+physical copies. On an ext4-only host, create a disposable sparse XFS loop
+volume with reflink support and use it for the result base:
+
+```sh
+sudo acceptance/linux/setup-xfs-reflink-volume.sh
+acceptance/linux/run-qualification.sh \
+  /home/chandler/cargo-reapi-qualification/source \
+  /home/chandler/cargo-reapi-qualification-xfs/runs
+```
+
+The setup helper refuses to format an existing non-XFS image. It verifies that
+the mounted XFS filesystem reports `reflink=1`; the qualification must still
+retain and bind its own clone-selection and shared-extent evidence. The mount
+is deliberately not persistent across reboot. Tear it down explicitly after
+qualification with `sudo umount /home/chandler/cargo-reapi-qualification-xfs`;
+the sparse image may then be deleted when its retained evidence is no longer
+needed.
