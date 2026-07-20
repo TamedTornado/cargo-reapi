@@ -538,7 +538,10 @@ mod tests {
             arguments: Vec::new(),
             crate_name: crate_name.map(str::to_owned),
         };
-        assert!(!is_physical_cacheable_action(&event("/toolchain/rustc", None)));
+        assert!(!is_physical_cacheable_action(&event(
+            "/toolchain/rustc",
+            None
+        )));
         assert!(is_physical_cacheable_action(&event(
             "/toolchain/rustc",
             Some("leaf")

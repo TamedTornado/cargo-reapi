@@ -49,7 +49,7 @@ mkdir -p "$evidence_root/receipts" "$evidence_root/moria" "$evidence_root/advers
 "$repo/acceptance/run-adversarial.sh" "$evidence_root/adversarial" "$batch_id"
 "$repo/acceptance/run-bevy-integrity.sh" "$evidence_root/bevy" "$batch_id"
 "$repo/acceptance/run-bro-five.sh" "$evidence_root/bro" "$batch_id" "$bro_root" "$moria_root" "$cache_dir" \
-  "$evidence_root/moria/producer-retirement.json" "$storage_profile"
+  "$storage_profile"
 "$repo/acceptance/run-resources.sh" "$evidence_root/resources" "$batch_id" \
   "$evidence_root/resource-build-report.json" "$cache_dir/resource-ledger-v1" "$evidence_root/stall-ledger"
 

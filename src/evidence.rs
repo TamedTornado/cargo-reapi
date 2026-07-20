@@ -797,6 +797,36 @@ fn verify_receipt_semantics(
             }
         }
         "bro-five" => {
+            let producer = require_pass("bro_producer", violations)?;
+            let retirement = require_pass("producer_retirement", violations)?;
+            let producer_audit = require_pass("producer_os_audit", violations)?;
+            if producer
+                .get("target_empty_at_start")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+                || number(&producer, "exit_code") != Some(0)
+                || retirement
+                    .get("producer_deleted")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                || retirement
+                    .get("producer")
+                    .and_then(serde_json::Value::as_str)
+                    != producer.get("worktree").and_then(serde_json::Value::as_str)
+            {
+                violations.push(
+                    "Bro exact-environment producer or retirement evidence is invalid".to_owned(),
+                );
+            }
+            if producer_audit
+                .get("expected")
+                .and_then(serde_json::Value::as_str)
+                != Some("nonzero")
+                || number(&producer_audit, "selected_event_count").is_none_or(|count| count == 0)
+                || number(&producer_audit, "invalid_event_count") != Some(0)
+            {
+                violations.push("Bro producer lacks clean nonzero OS build evidence".to_owned());
+            }
             let proof = require_pass("bro_proof", violations)?;
             let population = require_pass("bro_population_proof", violations)?;
             if number(&proof, "observed_members").is_none_or(|n| n < 5)
@@ -1026,6 +1056,8 @@ fn required_claims(kind: &str, platform_os: &str) -> &'static [&'static str] {
         ],
         "bro-five" => &[
             "public_cli_boundary",
+            "exact_environment_producer",
+            "producer_deleted",
             "five_jobs_simultaneous",
             "canonical_gate",
             "zero_physical_actions",
