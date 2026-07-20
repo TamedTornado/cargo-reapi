@@ -13,7 +13,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::relocation::{RecordedPathMapping, execution_slot, replace_bytes};
+use crate::relocation::{RecordedPathMapping, execution_slot, replace_bytes_in_place};
 #[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
 
@@ -711,29 +711,33 @@ fn relocate_target(
         let accessed = metadata.accessed()?;
         let executable = is_executable(&metadata);
         let mut bytes = fs::read(&path)?;
-        let original = bytes.clone();
+        let mut changed = false;
         for (producer, consumer) in &mappings {
             if executable {
                 let from = execution_slot(&producer.to_string_lossy())?;
                 let to = execution_slot(&consumer.to_string_lossy())?;
-                bytes = replace_bytes(&bytes, from.as_bytes(), to.as_bytes());
+                changed |= replace_bytes_in_place(&mut bytes, from.as_bytes(), to.as_bytes());
             }
             if is_cargo_text_metadata(&path) {
-                bytes = replace_variable(
+                let replaced = replace_variable(
                     &bytes,
                     producer.to_string_lossy().as_bytes(),
                     consumer.to_string_lossy().as_bytes(),
                 );
+                changed |= replaced != bytes;
+                bytes = replaced;
             }
             if is_cargo_binary_dep_info(&path) {
-                bytes = replace_length_prefixed_paths(
+                let replaced = replace_length_prefixed_paths(
                     &bytes,
                     producer.to_string_lossy().as_bytes(),
                     consumer.to_string_lossy().as_bytes(),
                 )?;
+                changed |= replaced != bytes;
+                bytes = replaced;
             }
         }
-        if bytes != original {
+        if changed {
             fs::write(&path, bytes)?;
             if executable {
                 resign(&path, resource_ledger)?;

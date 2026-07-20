@@ -80,6 +80,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fs2",
+ "memchr",
  "serde",
  "serde_json",
  "sha2",
