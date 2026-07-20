@@ -1150,6 +1150,17 @@ fn identical_cold_gates_have_one_external_producer_and_one_waiter() {
         1,
         "the waiter must be distinguished from a pre-existing cache hit"
     );
+    for (worktree, _, _) in &results {
+        let output = Command::new(worktree.join("target/debug/capture-fixture"))
+            .output()
+            .expect("run coalesced restored binary");
+        assert!(output.status.success());
+        assert_eq!(
+            fs::canonicalize(String::from_utf8(output.stdout).unwrap().trim())
+                .expect("coalesced binary embedded path"),
+            fs::canonicalize(worktree).expect("coalesced worktree path")
+        );
+    }
 }
 
 #[test]

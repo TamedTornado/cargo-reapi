@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
@@ -32,12 +32,12 @@ fn cached_cargo(
     cargo_args: &[&str],
 ) -> (Duration, String) {
     let started = Instant::now();
-    let sysroot = Command::new("rustc")
-        .args(["--print", "sysroot"])
+    let real_rustc = Command::new("rustup")
+        .args(["which", "rustc"])
         .output()
-        .expect("query rustc sysroot");
-    assert!(sysroot.status.success());
-    let real_rustc = Path::new(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc");
+        .expect("resolve rustc through rustup");
+    assert!(real_rustc.status.success());
+    let real_rustc = PathBuf::from(String::from_utf8(real_rustc.stdout).unwrap().trim());
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     let status = command
         .current_dir(root)
@@ -196,6 +196,90 @@ fn verify_signature(executable: &Path) {
 #[cfg(not(target_os = "macos"))]
 fn verify_signature(_executable: &Path) {}
 
+#[cfg(target_os = "macos")]
+struct OsCompilerObserver {
+    child: Child,
+    events: PathBuf,
+    proof: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+fn start_os_compiler_observer(root: &Path) -> OsCompilerObserver {
+    let events = root.join("warm-os-events.jsonl");
+    let proof = root.join("warm-os-proof.json");
+    let stdout = fs::File::create(&events).expect("create warm eslogger evidence");
+    let stderr =
+        fs::File::create(root.join("warm-os-events.stderr")).expect("create warm eslogger stderr");
+    let child = Command::new("perl")
+        .args(["-MPOSIX=setsid", "-e", "setsid(); exec @ARGV"])
+        .args([
+            "sudo",
+            "-n",
+            "/usr/bin/eslogger",
+            "--format",
+            "json",
+            "exec",
+        ])
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .expect("start warm eslogger observer");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        Command::new("kill")
+            .args(["-0", &child.id().to_string()])
+            .status()
+            .expect("probe warm eslogger")
+            .success(),
+        "warm eslogger exited before the restored consumer"
+    );
+    OsCompilerObserver {
+        child,
+        events,
+        proof,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stop_os_compiler_observer(mut observer: OsCompilerObserver) -> PathBuf {
+    Command::new("kill")
+        .args(["-TERM", &observer.child.id().to_string()])
+        .status()
+        .expect("stop warm eslogger");
+    observer.child.wait().expect("wait for warm eslogger");
+    let rustc = Command::new("rustup")
+        .args(["which", "rustc"])
+        .output()
+        .expect("resolve observed rustc");
+    let clang = Command::new("/usr/bin/xcrun")
+        .args(["--find", "clang"])
+        .output()
+        .expect("resolve observed clang");
+    assert!(rustc.status.success() && clang.status.success());
+    let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi-auditor"))
+        .args(["eslog", "--events"])
+        .arg(&observer.events)
+        .arg("--select")
+        .arg(String::from_utf8(rustc.stdout).unwrap().trim())
+        .arg("--select")
+        .arg(String::from_utf8(clang.stdout).unwrap().trim())
+        .args(["--expected", "zero", "--report"])
+        .arg(&observer.proof)
+        .status()
+        .expect("audit warm eslogger evidence");
+    assert!(status.success(), "warm OS compiler/linker proof failed");
+    observer.proof
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_os_compiler_observer(_root: &Path) {}
+
+#[cfg(not(target_os = "macos"))]
+fn stop_os_compiler_observer(_observer: ()) -> PathBuf {
+    PathBuf::new()
+}
+
 #[test]
 #[ignore = "explicit pinned-Bevy acceptance proof"]
 fn bevy_linked_artifact_restores_after_producer_deletion() {
@@ -225,8 +309,10 @@ fn bevy_linked_artifact_restores_after_producer_deletion() {
     verify_signature(&producer.join("target/debug/cargo-reapi-bevy-fixture"));
     verify_signature(&producer_test);
     fs::remove_dir_all(&producer).expect("delete producer before consumer");
+    let os_observer = start_os_compiler_observer(worktrees.path());
     let (warm_elapsed, consumer_logs) =
         build_application_and_tests(&consumer, cache.path(), trace.path(), "consumer");
+    let os_proof = stop_os_compiler_observer(os_observer);
     assert!(
         warm_elapsed <= Duration::from_secs(60),
         "pinned Bevy whole-gate restore took {warm_elapsed:?}; contract allows 60s"
@@ -299,6 +385,8 @@ fn bevy_linked_artifact_restores_after_producer_deletion() {
                 "kind": "bevy-integrity",
                 "warm_elapsed_ms": warm_elapsed.as_millis(),
                 "consumer_wrapper_compile_events": observed_compiler_actions(trace.path(), &consumer),
+                "os_compiler_linker_events": 0,
+                "os_proof": os_proof,
                 "producer_application": {"stdout": producer_behavior.0, "stderr": producer_behavior.1},
                 "restored_application": {"stdout": consumer_behavior.0, "stderr": consumer_behavior.1},
                 "fresh_application": {"stdout": fresh_behavior.0, "stderr": fresh_behavior.1},
