@@ -359,7 +359,12 @@ fn discover_link_inputs(
                 paths.insert(path);
             }
         }
-        collect_link_argument_inputs(&captured.arguments, &invocation.cwd, &mut paths)?;
+        collect_link_argument_inputs(
+            &captured.arguments,
+            &invocation.cwd,
+            real_linker,
+            &mut paths,
+        )?;
     }
     collect_apple_platform_inputs(&mut paths)?;
 
@@ -504,6 +509,7 @@ fn is_rustc_generated_link_input(path: &Path, mappings: &[(String, String)]) -> 
 fn collect_link_argument_inputs(
     arguments: &[String],
     cwd: &Path,
+    real_linker: &Path,
     paths: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     let mut library_paths = Vec::new();
@@ -557,19 +563,25 @@ fn collect_link_argument_inputs(
         libraries.push("System".to_owned());
     }
     for library in libraries {
-        let resolved = library_paths
+        let traced = paths
+            .iter()
+            .find(|path| traced_path_matches_library(path, &library))
+            .cloned();
+        let explicit = library_paths
             .iter()
             .flat_map(|root| {
-                ["a", "dylib", "tbd"]
+                ["so", "a", "dylib", "tbd"]
                     .map(|extension| root.join(format!("lib{library}.{extension}")))
             })
-            .find(|path| path.is_file())
-            .or_else(|| {
-                paths
-                    .iter()
-                    .find(|path| traced_path_matches_library(path, &library))
-                    .cloned()
-            })
+            .find(|path| path.is_file());
+        let driver_reported = if traced.is_none() && explicit.is_none() {
+            linker_reported_library(real_linker, &library, cwd)?
+        } else {
+            None
+        };
+        let resolved = traced
+            .or(explicit)
+            .or(driver_reported)
             .with_context(|| format!("resolving native library -l{library}"))?;
         paths.insert(resolved);
     }
@@ -588,6 +600,38 @@ fn collect_link_argument_inputs(
         paths.insert(resolved);
     }
     Ok(())
+}
+
+fn linker_reported_library(linker: &Path, library: &str, cwd: &Path) -> Result<Option<PathBuf>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    for extension in ["so", "a"] {
+        let filename = format!("lib{library}.{extension}");
+        let output = Command::new(linker)
+            .arg(format!("-print-file-name={filename}"))
+            .output()
+            .with_context(|| {
+                format!(
+                    "asking linker driver {} to resolve {filename}",
+                    linker.display()
+                )
+            })?;
+        if !output.status.success() {
+            continue;
+        }
+        let reported = String::from_utf8(output.stdout)
+            .context("linker driver returned a non-UTF-8 library path")?;
+        let reported = reported.trim();
+        if reported.is_empty() || reported == filename {
+            continue;
+        }
+        let path = absolute_path(Path::new(reported), cwd);
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 fn traced_path_matches_library(path: &Path, library: &str) -> bool {
