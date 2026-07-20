@@ -27,6 +27,9 @@ docker run --rm --privileged --security-opt seccomp=unconfined --user 0:0 --env 
   "$image" bash -lc '
     set -euo pipefail
     export PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+    git config --global --add safe.directory /work/cargo-reapi
+    git config --global --add safe.directory /work/bro
+    git config --global --add safe.directory /work/moria
     cd /work/bro
     pnpm install --frozen-lockfile
     cd /work/cargo-reapi
