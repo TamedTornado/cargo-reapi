@@ -123,7 +123,7 @@ if [ "$platform" = linux ]; then
   findmnt -T "$moria_root" -J -o TARGET,SOURCE,FSTYPE,OPTIONS >"$report_root/worktree-filesystem.json"
   jq -n --rawfile os_release /etc/os-release \
     --arg kernel "$(uname -srvmo)" --arg cargo "$(cargo --version)" --arg rustc "$(rustc --version --verbose)" \
-    --arg sandbox "@anthropic-ai/sandbox-runtime 0.0.66 using bubblewrap + seccomp; fail-closed policy" \
+    --arg sandbox "@anthropic-ai/sandbox-runtime 0.0.66 using bubblewrap user/PID/mount/network namespaces with cap-drop; outer Docker network namespace is --network none with all capabilities dropped; no host Unix sockets are mounted" \
     --arg process_observer "strace -f execve with full arguments" \
     '{schema_version:1,os_release:$os_release,kernel:$kernel,cargo:$cargo,rustc:$rustc,sandbox_mechanism:$sandbox,process_observer:$process_observer,passed:true,violations:[]}' \
     >"$report_root/platform-environment.json"
@@ -260,6 +260,9 @@ if [ "$platform" = linux ]; then
   environment_refs="$environment_refs cache_filesystem:$report_root/cache-filesystem.json worktree_filesystem:$report_root/worktree-filesystem.json"
   if [ -f "$evidence_root/container-image-inspect.json" ]; then
     environment_refs="$environment_refs container_image_inspect:$evidence_root/container-image-inspect.json"
+  fi
+  if [ -f "$evidence_root/qualification-container-inspect.json" ]; then
+    environment_refs="$environment_refs qualification_container_inspect:$evidence_root/qualification-container-inspect.json"
   fi
   if [ -f "$evidence_root/host-userns-policy-before.txt" ] && [ -f "$evidence_root/host-userns-policy-during.txt" ]; then
     environment_refs="$environment_refs host_userns_policy_before:$evidence_root/host-userns-policy-before.txt host_userns_policy_during:$evidence_root/host-userns-policy-during.txt"

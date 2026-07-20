@@ -536,6 +536,7 @@ fn verify_receipt_semantics(
                 && (!roles.contains_key("cache_filesystem")
                     || !roles.contains_key("worktree_filesystem")
                     || !roles.contains_key("container_image_inspect")
+                    || !roles.contains_key("qualification_container_inspect")
                     || !roles.contains_key("host_userns_policy_before")
                     || !roles.contains_key("host_userns_policy_during"))
             {
@@ -558,6 +559,37 @@ fn verify_receipt_semantics(
                         "Linux nested user-namespace policy was not qualified in fail-closed mode"
                             .to_owned(),
                     );
+                }
+                let container = read("qualification_container_inspect")?;
+                let host_config = container
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("HostConfig"));
+                let security_options = host_config
+                    .and_then(|config| config.get("SecurityOpt"))
+                    .and_then(serde_json::Value::as_array);
+                if host_config
+                    .and_then(|config| config.get("NetworkMode"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some("none")
+                    || host_config
+                        .and_then(|config| config.get("Privileged"))
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(false)
+                    || host_config
+                        .and_then(|config| config.get("CapDrop"))
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|caps| caps.iter().all(|cap| cap.as_str() != Some("ALL")))
+                    || security_options.is_none_or(|options| {
+                        options.iter().all(|option| {
+                            option
+                                .as_str()
+                                .is_none_or(|value| !value.contains("no-new-privileges"))
+                        })
+                    })
+                {
+                    violations
+                        .push("Linux outer qualification container is not fail-closed".to_owned());
                 }
             }
         }

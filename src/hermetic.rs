@@ -461,6 +461,15 @@ fn build_policy(
             // srt's network-deny mux uses a private Unix socket beneath its
             // TMPDIR. No host or service socket is exposed to the build.
             allow_unix_sockets: vec![control_temporary.to_string_lossy().into_owned()],
+            // Linux bubblewrap creates a private network namespace and the
+            // filesystem policy hides host service sockets. Avoid srt's
+            // second, capability-bearing user namespace: it cannot be nested
+            // after bubblewrap's mandatory `--cap-drop ALL` on stock kernels.
+            // The qualification container adds an independent `--network
+            // none` boundary and exposes no host Unix sockets.
+            #[cfg(target_os = "linux")]
+            allow_all_unix_sockets: true,
+            #[cfg(not(target_os = "linux"))]
             allow_all_unix_sockets: false,
         },
         filesystem: SrtFilesystemPolicy {

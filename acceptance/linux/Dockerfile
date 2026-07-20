@@ -6,6 +6,7 @@ COPY --from=node /usr/local/ /usr/local/
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       binutils bubblewrap ca-certificates clang e2fsprogs elfutils git jq lsof perl \
       pkg-config ripgrep rsync socat strace util-linux \
+      libasound2-dev libudev-dev libwayland-dev libx11-dev libxi-dev libxkbcommon-dev \
     && rm -rf /var/lib/apt/lists/* \
     && npm install --global @anthropic-ai/sandbox-runtime@0.0.66 pnpm@11.11.0 \
     && rustup component add rustfmt clippy \
