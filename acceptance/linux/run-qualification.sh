@@ -37,7 +37,11 @@ fi
 cat "$userns_policy" >"$run_root/evidence/host-userns-policy-during.txt"
 test "$(cat "$run_root/evidence/host-userns-policy-during.txt")" = 0
 
-docker run --rm --privileged --security-opt seccomp=unconfined --user 0:0 --env HOME=/root \
+docker run --rm --privileged \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
+  --security-opt systempaths=unconfined \
+  --user 0:0 --env HOME=/root \
   --mount "type=bind,src=$source_root,dst=/work" \
   --mount "type=bind,src=$run_root,dst=/qualification" \
   "$image" bash -lc '
