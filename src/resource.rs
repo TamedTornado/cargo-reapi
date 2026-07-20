@@ -61,6 +61,7 @@ impl ResourceLease {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn acquire_snapshot_signing_at(lease_root: &Path) -> Result<Self> {
         let contract = AcceptanceContract::embedded()?;
         let root = lease_root.join("snapshot-signing");

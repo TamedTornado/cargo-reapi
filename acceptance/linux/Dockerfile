@@ -8,6 +8,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
       pkg-config ripgrep rsync socat strace util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && npm install --global @anthropic-ai/sandbox-runtime@0.0.66 pnpm@11.11.0 \
+    && rustup component add rustfmt clippy \
     && useradd --create-home --uid 1000 --user-group qualifier \
     && chown -R qualifier:qualifier /usr/local/cargo /usr/local/rustup /home/qualifier
 

@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::relocation::{RecordedPathMapping, execution_slot, replace_bytes};
+#[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 15;
@@ -974,10 +975,10 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn resign(path: &Path, resource_ledger: &Path) -> Result<()> {
+fn resign(path: &Path, _resource_ledger: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let _lease = ResourceLease::acquire_snapshot_signing_at(resource_ledger)?;
+        let _lease = ResourceLease::acquire_snapshot_signing_at(_resource_ledger)?;
         let output = Command::new("/usr/bin/codesign")
             .args(["--force", "--sign", "-"])
             .arg(path)
