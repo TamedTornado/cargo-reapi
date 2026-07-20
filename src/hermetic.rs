@@ -336,8 +336,11 @@ fn build_policy(
     explicit_inputs: &[PathBuf],
 ) -> Result<SrtPolicy> {
     let mut readable = package_roots(workspace, cache)?;
+    #[cfg(target_os = "linux")]
+    readable.extend(workspace_inputs_excluding_target(workspace, target)?);
+    #[cfg(not(target_os = "linux"))]
+    readable.insert(workspace.to_path_buf());
     readable.extend([
-        workspace.to_path_buf(),
         target.to_path_buf(),
         cache.to_path_buf(),
         action_log.to_path_buf(),
@@ -482,6 +485,36 @@ fn build_policy(
         enable_weaker_network_isolation: false,
         allow_apple_events: false,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_inputs_excluding_target(workspace: &Path, target: &Path) -> Result<BTreeSet<PathBuf>> {
+    let Ok(relative_target) = target.strip_prefix(workspace) else {
+        return Ok(BTreeSet::from([workspace.to_path_buf()]));
+    };
+    if relative_target.as_os_str().is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    // SRT emits writable binds before read-only binds on Linux. A read-only
+    // bind of the workspace would therefore shadow a writable target nested
+    // beneath it. Bind every sibling on the route to the target read-only,
+    // leaving the target itself to the writable binding.
+    let mut readable = BTreeSet::new();
+    let mut current = workspace.to_path_buf();
+    for component in relative_target.components() {
+        let next = current.join(component.as_os_str());
+        for entry in fs::read_dir(&current)
+            .with_context(|| format!("enumerating workspace input {}", current.display()))?
+        {
+            let path = entry?.path();
+            if path != next {
+                readable.insert(path);
+            }
+        }
+        current = next;
+    }
+    Ok(readable)
 }
 
 fn paths_to_strings(paths: BTreeSet<PathBuf>) -> Vec<String> {
@@ -757,6 +790,8 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::workspace_inputs_excluding_target;
     use super::{
         SrtFilesystemPolicy, SrtNetworkPolicy, SrtPolicy, canonical_policy_bytes,
         normalize_policy_identity_bytes,
@@ -818,5 +853,22 @@ mod tests {
         .unwrap();
         assert_eq!(first, second);
         assert!(String::from_utf8(first).unwrap().contains("<rustc-trace>"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_workspace_inputs_do_not_shadow_nested_writable_target() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let target = workspace.join("target");
+        std::fs::create_dir_all(workspace.join("crates/leaf")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let readable = workspace_inputs_excluding_target(&workspace, &target).unwrap();
+        assert!(readable.contains(&workspace.join("Cargo.toml")));
+        assert!(readable.contains(&workspace.join("crates")));
+        assert!(!readable.contains(&workspace));
+        assert!(!readable.iter().any(|path| target.starts_with(path)));
     }
 }
