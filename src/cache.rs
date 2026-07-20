@@ -267,21 +267,29 @@ fn resolve_real_linker(invocation: &RustcInvocation) -> Result<PathBuf> {
         .configured_linker()
         .or_else(|| std::env::var_os("RUSTC_LINKER").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/usr/bin/cc"));
-    if candidate.is_absolute() {
-        return Ok(candidate);
-    }
-    let output = Command::new("which")
-        .arg(&candidate)
-        .output()
-        .with_context(|| format!("resolving linker {}", candidate.display()))?;
-    if !output.status.success() {
-        anyhow::bail!("configured linker was not found: {}", candidate.display());
-    }
-    Ok(PathBuf::from(
-        String::from_utf8(output.stdout)
-            .context("linker path is not UTF-8")?
-            .trim(),
-    ))
+    let resolved = if candidate.is_absolute() {
+        candidate.clone()
+    } else {
+        let output = Command::new("which")
+            .arg(&candidate)
+            .output()
+            .with_context(|| format!("resolving linker {}", candidate.display()))?;
+        if !output.status.success() {
+            anyhow::bail!("configured linker was not found: {}", candidate.display());
+        }
+        PathBuf::from(
+            String::from_utf8(output.stdout)
+                .context("linker path is not UTF-8")?
+                .trim(),
+        )
+    };
+    fs::canonicalize(&resolved).with_context(|| {
+        format!(
+            "resolving linker {} through filesystem aliases from {}",
+            candidate.display(),
+            resolved.display()
+        )
+    })
 }
 
 fn discover_link_inputs(
