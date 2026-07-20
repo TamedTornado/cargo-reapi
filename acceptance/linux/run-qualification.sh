@@ -26,6 +26,7 @@ docker run --rm --privileged --security-opt seccomp=unconfined \
   --mount "type=bind,src=$run_root,dst=/qualification" \
   "$image" bash -lc '
     set -euo pipefail
+    export PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
     cd /work/bro
     pnpm install --frozen-lockfile
     cd /work/cargo-reapi
