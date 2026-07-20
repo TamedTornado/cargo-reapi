@@ -352,6 +352,12 @@ fn json_string_end(value: &str) -> Option<usize> {
 }
 
 fn crate_name(arguments: &[String]) -> Option<String> {
+    if arguments
+        .iter()
+        .any(|argument| argument == "--print" || argument.starts_with("--print="))
+    {
+        return None;
+    }
     arguments
         .windows(2)
         .find(|pair| pair[0] == "--crate-name")
@@ -500,6 +506,15 @@ mod tests {
     fn crate_name_ignores_control_probes() {
         assert_eq!(
             crate_name(&["--crate-name".to_owned(), "___".to_owned()]),
+            None
+        );
+        assert_eq!(
+            crate_name(&[
+                "--crate-name".to_owned(),
+                "unrelated".to_owned(),
+                "--print".to_owned(),
+                "file-names".to_owned(),
+            ]),
             None
         );
     }
