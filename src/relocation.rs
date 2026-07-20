@@ -153,7 +153,8 @@ pub fn record_path_mappings(mappings: &[(String, String)]) -> Result<()> {
         return Ok(());
     };
     let root = target.join("cargo-reapi").join("path-mappings");
-    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&root)
+        .with_context(|| format!("creating path mapping directory {}", root.display()))?;
     for (label, actual) in mappings {
         let mapping = RecordedPathMapping {
             label: label.clone(),

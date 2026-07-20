@@ -112,7 +112,14 @@ pub fn capture_invocation(invocation: &RustcInvocation, options: &CaptureOptions
 
 pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvocation> {
     let roots = CaptureRoots::from_env(invocation)?;
-    record_path_mappings(&roots.path_mappings())?;
+    // Cargo probes rustc through the wrapper with control invocations such as
+    // `rustc -vV`. Those invocations produce no artifact and may run while the
+    // outer target is deliberately mounted read-only by the sandbox. Path
+    // mappings are restore metadata, so only artifact-producing compilations
+    // need to persist them.
+    if should_record_path_mappings(invocation) {
+        record_path_mappings(&roots.path_mappings())?;
+    }
     let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots)?;
     let output_files = invocation.output_files()?;
     let normalized_outputs = output_files
@@ -212,6 +219,10 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
             .collect(),
         path_mappings: roots.path_mappings(),
     })
+}
+
+fn should_record_path_mappings(invocation: &RustcInvocation) -> bool {
+    invocation.crate_name().is_some() && invocation.out_dir().is_some()
 }
 
 pub fn record_invocation(
@@ -625,7 +636,33 @@ fn lossy(value: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_compiler_environment, is_keyed_environment};
+    use std::path::PathBuf;
+
+    use super::{is_compiler_environment, is_keyed_environment, should_record_path_mappings};
+    use crate::invocation::RustcInvocation;
+
+    fn invocation(arguments: &[&str]) -> RustcInvocation {
+        RustcInvocation {
+            compiler: PathBuf::from("rustc"),
+            args: arguments.iter().map(Into::into).collect(),
+            cwd: PathBuf::from("/workspace"),
+        }
+    }
+
+    #[test]
+    fn records_restore_metadata_only_for_artifact_producing_compilations() {
+        assert!(!should_record_path_mappings(&invocation(&["-vV"])));
+        assert!(!should_record_path_mappings(&invocation(&[
+            "--crate-name",
+            "probe"
+        ])));
+        assert!(should_record_path_mappings(&invocation(&[
+            "--crate-name",
+            "leaf",
+            "--out-dir",
+            "/workspace/target/debug/deps",
+        ])));
+    }
 
     #[test]
     fn captures_cargo_compiler_contract() {
