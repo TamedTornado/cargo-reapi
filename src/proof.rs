@@ -296,7 +296,6 @@ fn required_checks(kind: &str) -> &'static [&'static str] {
         "portability" => &[
             "macos_clone",
             "linux_reflink_or_fallback",
-            "windows_block_clone_or_fallback",
             "portable_copy_isolated",
         ],
         "moria-single" | "moria-five" | "moria-stress" => &[

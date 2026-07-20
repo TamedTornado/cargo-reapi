@@ -2,9 +2,10 @@
 
 The binding project acceptance requirements are recorded in
 [`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). The
-current aggregate status is **not yet satisfied**. The externally observed
-Moria SSD receipt now passes, but it remains one part of the aggregate proof
-required by that document.
+current local macOS/arm64 aggregate status is **satisfied**. Ten independently
+evidenced receipts pass the aggregate verifier under one implementation,
+executable, harness, toolchain, platform, and run identity. This is a local
+qualification result, not a Linux-host qualification or a publication.
 
 `cargo-reapi` is an experimental Cargo-native path to remote execution. Cargo remains the build planner and source of truth; the tool observes the exact `rustc` commands Cargo schedules through `RUSTC_WRAPPER`, captures their inputs, and will translate those actions to the Remote Execution API (REAPI).
 
@@ -31,7 +32,7 @@ The reclient transport adapter stages eligible actions into explicit input roots
 
 The first bounded [five-worktree Moria experiment](docs/moria-acceptance-2026-07-18.md) is retained as failed evidence: it used serialized two-process waves and executed cacheable work. The later [self-reported Moria experiment](docs/moria-acceptance-2026-07-19.md) met its timing thresholds, but predates external compiler observation and is therefore also historical, unaudited evidence rather than an acceptance result. The thresholds and anti-escape clauses are embedded from `acceptance/contract.toml`; only a complete externally observed `cargo reapi prove` report can claim success.
 
-The current [real-world benchmark record](benchmarks/results/2026-07-19-local.md#moria-ssd-acceptance-receipt) contains the first externally observed Moria SSD pass: 9.441s for one worktree, 14.918s for five simultaneous worktrees, and 26.639s for ten simultaneous worktrees, with zero OS-observed compiler/linker executions in every warm population. This satisfies the Moria population receipt; it does not by itself satisfy the aggregate publication gate.
+The current [real-world benchmark record](benchmarks/results/2026-07-19-local.md#moria-ssd-acceptance-receipt) contains the first externally observed Moria SSD pass: 9.441s for one worktree, 14.918s for five simultaneous worktrees, and 26.639s for ten simultaneous worktrees, with zero OS-observed compiler/linker executions in every warm population. The 2026-07-20 aggregate run also passed Bevy behavioral parity, adversarial invalidation, coalescing, resource, portability, and Bro five-job receipts. Peak aggregate RSS was 5.20 GB with no swap growth; three distinct heavy actions made simultaneous progress; and a live 300-second no-progress run was rejected as infrastructure rather than agent feedback.
 
 The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
 

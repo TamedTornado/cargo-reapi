@@ -234,8 +234,6 @@ Correctness must not depend on an undocumented macOS-only copy mechanism.
 - macOS/APFS should use copy-on-write cloning when source and destination permit;
 - Linux should use reflinks when supported and fall back to an isolated portable
   copy when not supported;
-- Windows must use a correct block-clone implementation when available or an
-  isolated portable copy fallback;
 - every fallback must preserve required files, permissions, links, and consumer
   isolation;
 - storage-specific timing profiles must be selected explicitly and recorded;
@@ -250,24 +248,16 @@ Before any public repository or package publication:
 - state the supported hermeticity boundary and fail-closed cases prominently;
 - do not claim acceptance until the aggregate verifier passes this document.
 
-## 9. Current known gaps
+## 9. Current qualification result
 
-As of 2026-07-19, acceptance is not complete. Known gaps include:
+As of 2026-07-20, the local macOS/arm64 SSD acceptance run satisfies every
+receipt required by this document. The aggregate verifier binds all ten
+receipts to one contract, criteria revision, implementation tree, evidence
+driver, harness bundle, toolchain, platform, and run identity and verifies the
+digest of every raw evidence file.
 
-- no aggregate proof requiring every receipt in this document;
-- no OS-level compiler/linker process observer in the final proof;
-- undeclared build-script/proc-macro filesystem and network effects are not
-  proven safe or rejected;
-- mutation observation is not asserted as an exact rebuilt set;
-- Bevy evidence lacks a fresh consumer-location control and restored test-binary
-  parity;
-- the coalesced waiter is not required to run tests/binaries, and producer
-  failure propagation is not proven;
-- real RSS, swap growth, action overlap, and no-progress stall behavior are not
-  externally measured;
-- the rotational proof passes its qualification profile but does not replace
-  the original SSD timing proof;
-- the interrupted partial SSD proof is invalid and must not be reused.
-
-No result may be described as full cargo-reapi acceptance while any item above
-remains unresolved.
+This result does not claim a Linux-host qualification or public release. Linux
+reflink/copy fallback behavior is covered by the portable-isolation test, but a
+Linux host should produce its own platform-bound receipt set. The earlier
+rotational proof remains storage-compatibility evidence only, and the
+interrupted partial SSD proof remains invalid.

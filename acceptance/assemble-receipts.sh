@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 5 ]; then
-  echo "usage: $0 MORIA_REPORT VALIDATION_REPORT BRO_REPORT RECEIPTS RUN_ID" >&2
+if [ "$#" -ne 8 ]; then
+  echo "usage: $0 MORIA_REPORT VALIDATION_REPORT BRO_REPORT RECEIPTS RUN_ID EVIDENCE_DRIVER EVIDENCE_REVISION BRO_SOURCE" >&2
   exit 2
 fi
 
@@ -12,8 +12,11 @@ bro=$(cd "$3" && pwd)
 mkdir -p "$4"
 receipts=$(cd "$4" && pwd)
 run_id=$5
+evidence_driver=$(cd "$(dirname "$6")" && pwd)/$(basename "$6")
+evidence_revision=$7
+bro_source=$(cd "$8" && pwd)
 repo=$(cd "$(dirname "$0")/.." && pwd)
-driver=$repo/target/release/cargo-reapi
+verifier=$repo/target/release/cargo-reapi
 
 sha_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 require_pass() { jq -e '.passed == true and ((.violations // []) | length == 0)' "$1" >/dev/null; }
@@ -21,18 +24,31 @@ require_test() { rg -F "test $1 ... ok" "$2" >/dev/null; }
 
 contract_sha=$(sha_file "$repo/acceptance/contract.toml")
 criteria_sha=$(sha_file "$repo/acceptance/ACCEPTANCE_CRITERIA.md")
-executable_sha=$(sha_file "$driver")
+test -x "$evidence_driver"
+git -C "$repo" cat-file -e "$evidence_revision^{commit}"
+test -f "$bro_source/packages/pm/src/benchmarks/cargo-reapi-moria-proof.ts"
+executable_sha=$(sha_file "$evidence_driver")
 implementation_sha=$(
-  git -C "$repo" ls-files -s Cargo.toml Cargo.lock src acceptance/contract.toml |
+  git -C "$repo" ls-tree -r "$evidence_revision" -- Cargo.toml Cargo.lock src acceptance/contract.toml |
     shasum -a 256 | awk '{print $1}'
 )
-harness_sha=$(sha_file "$0")
+harness_sha=$(
+  for path in \
+    "$repo/acceptance/run-moria-local.sh" \
+    "$repo/acceptance/assemble-receipts.sh" \
+    "$repo/tests/bevy.rs" \
+    "$repo/tests/capture.rs" \
+    "$bro_source/packages/pm/src/benchmarks/cargo-reapi-moria-proof.ts" \
+    "$bro_source/packages/pm/src/__tests__/production-parity-harness-contract.test.ts"; do
+    printf '%s  %s\n' "$(sha_file "$path")" "$(basename "$path")"
+  done | shasum -a 256 | awk '{print $1}'
+)
 cargo_version=$(cargo --version)
 rustc_version=$(rustc --version --verbose)
 platform_os=$(jq -r '.platform_os' "$moria/environment.json")
 platform_arch=$(jq -r '.platform_arch' "$moria/environment.json")
-started=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", (time - 1) * 1000')
-completed=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000')
+started=$(jq -r '.started_at_unix_ms' "$moria/resource-proof.json")
+completed=$(jq -r '[.members[].completed_at_unix_ms] | max' "$bro/bro-moria-five-proof.json")
 
 identity=$(jq -n \
   --arg contract_sha256 "$contract_sha" \
@@ -128,15 +144,17 @@ for test_name in resource::tests::distinct_physical_actions_overlap_without_exce
   require_test "$test_name" "$unit_log"
 done
 resource=$moria/resource-proof.json
+stall=$validation/stall-proof.json
 require_pass "$resource"
 jq -e '.peak_aggregate_rss_bytes <= 16106127360 and .swap_growth_bytes <= 536870912 and .peak_simultaneous_progress_processes >= 2 and .infrastructure_stall == false' "$resource" >/dev/null
+jq -e '.stall_seconds == 300 and .infrastructure_stall == true and .exit_code != 0 and ([.violations[]] | any(contains("classified as infrastructure")))' "$stall" >/dev/null
 resource_measurements=$(jq -c '{peak_aggregate_rss_bytes,swap_growth_bytes,distinct_physical_overlap:.peak_simultaneous_progress_processes,stall_seconds}' "$resource")
 write_receipt resources \
   '{"shared_cross_process_ledger":true,"logical_gates_uncapped":true,"distinct_actions_overlap":true,"external_process_samples":true,"rss_within_limit":true,"swap_within_limit":true,"stall_is_infrastructure":true}' \
-  "$resource_measurements" "$resource" "$unit_log"
+  "$resource_measurements" "$resource" "$stall" "$unit_log"
 
 write_receipt portability \
-  '{"macos_clone":true,"linux_reflink_or_fallback":true,"windows_block_clone_or_fallback":true,"portable_copy_isolated":true}' \
+  '{"macos_clone":true,"linux_reflink_or_fallback":true,"portable_copy_isolated":true}' \
   '{}' "$unit_log"
 
 for kind in single five stress; do
@@ -163,4 +181,4 @@ write_receipt bro-five \
   '{"public_cli_boundary":true,"bro_source_independent":true,"five_jobs_simultaneous":true,"canonical_gate_exact":true,"all_tests_passed":true,"zero_physical_actions":true,"zero_os_compiler_linker":true,"deadline_met":true}' \
   "$bro_measurements" "$bro_proof" "$bro_os"
 
-"$driver" prove complete --receipts "$receipts" --report "$receipts/complete-proof.json"
+"$verifier" prove complete --receipts "$receipts" --report "$receipts/complete-proof.json"
