@@ -80,6 +80,13 @@ struct FileDigestMemo {
     inode: u64,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct LinkerCaptureRecord {
+    pub schema_version: u32,
+    pub arguments: Vec<String>,
+    pub traced_inputs: Vec<String>,
+}
+
 pub fn execute_cached(
     invocation: &RustcInvocation,
     capture_options: &CaptureOptions,
@@ -316,11 +323,17 @@ fn discover_link_inputs(
         .with_context(|| format!("reading linker capture {}", capture_path.display()))?;
     let invocations = encoded
         .lines()
-        .map(serde_json::from_str::<Vec<String>>)
+        .map(serde_json::from_str::<LinkerCaptureRecord>)
         .collect::<Result<Vec<_>, _>>()
         .context("parsing linker capture")?;
     if invocations.is_empty() {
         anyhow::bail!("rustc completed without invoking the captured linker");
+    }
+    if invocations
+        .iter()
+        .any(|capture| capture.schema_version != 1)
+    {
+        anyhow::bail!("linker capture has an unsupported schema version");
     }
 
     let already_declared = prepared
@@ -339,8 +352,14 @@ fn discover_link_inputs(
         .collect::<BTreeSet<_>>();
     let mut paths = BTreeSet::new();
     paths.insert(real_linker.to_path_buf());
-    for arguments in &invocations {
-        collect_link_argument_inputs(arguments, &invocation.cwd, &mut paths)?;
+    for captured in &invocations {
+        for traced in &captured.traced_inputs {
+            let path = absolute_path(Path::new(traced), &invocation.cwd);
+            if path.is_file() {
+                paths.insert(path);
+            }
+        }
+        collect_link_argument_inputs(&captured.arguments, &invocation.cwd, &mut paths)?;
     }
     collect_apple_platform_inputs(&mut paths)?;
 
@@ -545,6 +564,12 @@ fn collect_link_argument_inputs(
                     .map(|extension| root.join(format!("lib{library}.{extension}")))
             })
             .find(|path| path.is_file())
+            .or_else(|| {
+                paths
+                    .iter()
+                    .find(|path| traced_path_matches_library(path, &library))
+                    .cloned()
+            })
             .with_context(|| format!("resolving native library -l{library}"))?;
         paths.insert(resolved);
     }
@@ -563,6 +588,15 @@ fn collect_link_argument_inputs(
         paths.insert(resolved);
     }
     Ok(())
+}
+
+fn traced_path_matches_library(path: &Path, library: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let prefix = format!("lib{library}.");
+            name.starts_with(&prefix)
+        })
 }
 
 fn collect_apple_platform_inputs(paths: &mut BTreeSet<PathBuf>) -> Result<()> {
@@ -1050,7 +1084,10 @@ fn set_unix_mode(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkDiscovery, LinkInput, discovered_action_key, resolve_linker_candidate};
+    use super::{
+        LinkDiscovery, LinkInput, discovered_action_key, resolve_linker_candidate,
+        traced_path_matches_library,
+    };
     use std::path::PathBuf;
 
     fn discovery(actual_path: &str, sha256: &str, modified: u128) -> LinkDiscovery {
@@ -1100,5 +1137,21 @@ mod tests {
             resolve_linker_candidate(&alias).unwrap(),
             executable.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn linux_link_trace_identifies_versioned_and_unversioned_libraries() {
+        assert!(traced_path_matches_library(
+            std::path::Path::new("/lib/x86_64-linux-gnu/libgcc_s.so.1"),
+            "gcc_s"
+        ));
+        assert!(traced_path_matches_library(
+            std::path::Path::new("/usr/lib/libc.a"),
+            "c"
+        ));
+        assert!(!traced_path_matches_library(
+            std::path::Path::new("/usr/lib/libgcc.a"),
+            "gcc_s"
+        ));
     }
 }

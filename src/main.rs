@@ -22,7 +22,7 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::cache::{CacheOptions, execute_cached};
+use crate::cache::{CacheOptions, LinkerCaptureRecord, execute_cached};
 use crate::capture::{CaptureOptions, capture_invocation};
 use crate::gate::GateSnapshot;
 use crate::hermetic::SnapshotPolicy;
@@ -456,6 +456,56 @@ fn run_linker_capture(args: Vec<OsString>) -> Result<i32> {
     let real_linker = env::var_os("CARGO_REAPI_REAL_LINKER")
         .map(PathBuf::from)
         .context("CARGO_REAPI_REAL_LINKER is required in linker mode")?;
+    let arguments = args
+        .iter()
+        .skip(1)
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let mut command = Command::new(&real_linker);
+    command.args(args.into_iter().skip(1));
+    #[cfg(target_os = "linux")]
+    let trace_argument = linux_linker_trace_argument(&real_linker);
+    #[cfg(target_os = "linux")]
+    if let Some(argument) = trace_argument {
+        command.arg(argument);
+    }
+
+    #[cfg(target_os = "linux")]
+    let (exit_code, traced_inputs) = if trace_argument.is_some() {
+        let output = command
+            .output()
+            .with_context(|| format!("executing real linker {}", real_linker.display()))?;
+        std::io::stderr()
+            .write_all(&output.stderr)
+            .context("replaying linker stderr")?;
+        if !output.status.success() {
+            std::io::stdout()
+                .write_all(&output.stdout)
+                .context("replaying failed linker stdout")?;
+        }
+        (
+            output.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        let status = command
+            .status()
+            .with_context(|| format!("executing real linker {}", real_linker.display()))?;
+        (status.code().unwrap_or(1), Vec::new())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (exit_code, traced_inputs) = {
+        let status = command
+            .status()
+            .with_context(|| format!("executing real linker {}", real_linker.display()))?;
+        (status.code().unwrap_or(1), Vec::new())
+    };
+
     if let Some(parent) = capture_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating linker capture directory {}", parent.display()))?;
@@ -466,23 +516,31 @@ fn run_linker_capture(args: Vec<OsString>) -> Result<i32> {
         .open(&capture_path)
         .with_context(|| format!("opening linker capture {}", capture_path.display()))?;
     capture.lock_exclusive().context("locking linker capture")?;
-    let arguments = args
-        .iter()
-        .skip(1)
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
+    let record = LinkerCaptureRecord {
+        schema_version: 1,
+        arguments,
+        traced_inputs,
+    };
     writeln!(
         capture,
         "{}",
-        serde_json::to_string(&arguments).context("serializing linker arguments")?
+        serde_json::to_string(&record).context("serializing linker capture")?
     )
     .context("writing linker capture")?;
     FileExt::unlock(&capture).context("unlocking linker capture")?;
-    let status = Command::new(&real_linker)
-        .args(args.into_iter().skip(1))
-        .status()
-        .with_context(|| format!("executing real linker {}", real_linker.display()))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(exit_code)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_linker_trace_argument(linker: &std::path::Path) -> Option<&'static str> {
+    let name = linker.file_name()?.to_str()?;
+    if name.contains("gcc") || name.contains("g++") || name.contains("clang") || name == "cc" {
+        Some("-Wl,-t")
+    } else if name == "ld" || name.starts_with("ld.") || name.ends_with("-ld") {
+        Some("-t")
+    } else {
+        None
+    }
 }
 
 fn run_contract(mut args: Vec<OsString>) -> Result<i32> {
@@ -534,4 +592,27 @@ fn strip_cargo_subcommand_name(mut args: Vec<OsString>) -> Vec<OsString> {
         args.remove(1);
     }
     args
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use std::path::Path;
+
+    use super::linux_linker_trace_argument;
+
+    #[test]
+    fn selects_trace_syntax_for_driver_and_direct_linker() {
+        assert_eq!(
+            linux_linker_trace_argument(Path::new("/usr/bin/x86_64-linux-gnu-gcc-12")),
+            Some("-Wl,-t")
+        );
+        assert_eq!(
+            linux_linker_trace_argument(Path::new("/usr/bin/ld")),
+            Some("-t")
+        );
+        assert_eq!(
+            linux_linker_trace_argument(Path::new("/opt/custom/linker")),
+            None
+        );
+    }
 }
