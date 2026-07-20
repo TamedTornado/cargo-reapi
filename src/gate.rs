@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -766,6 +766,7 @@ fn relocate_executables(
     resource_ledger: &Path,
 ) -> Result<()> {
     let mut by_path: BTreeMap<&Path, Vec<&ExecutableRelocation>> = BTreeMap::new();
+    let mut relocated_slots = BTreeSet::new();
     for relocation in relocations {
         by_path
             .entry(&relocation.path)
@@ -776,6 +777,7 @@ fn relocate_executables(
         let path = target_root.join(relative);
         let metadata = fs::metadata(&path)
             .with_context(|| format!("reading relocated executable {}", path.display()))?;
+        let identity = executable_file_identity(&path, &metadata);
         let modified = metadata.modified()?;
         let accessed = metadata.accessed()?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
@@ -792,15 +794,24 @@ fn relocate_executables(
                 file.seek(SeekFrom::Start(*offset))?;
                 let mut observed = [0_u8; crate::relocation::RELOCATION_SLOT_BYTES];
                 file.read_exact(&mut observed)?;
-                if observed != from.as_bytes() {
+                let slot = (identity.clone(), relocation.producer.clone(), *offset);
+                if observed == from.as_bytes() {
+                    file.seek(SeekFrom::Start(*offset))?;
+                    file.write_all(to.as_bytes())?;
+                    relocated_slots.insert(slot);
+                } else if observed == to.as_bytes() && relocated_slots.contains(&slot) {
+                    // `cp -a --reflink=always` preserves Cargo's hard-linked
+                    // executable aliases. A path visited earlier can therefore
+                    // have already relocated this exact inode slot. Only accept
+                    // consumer bytes when this restore verified and wrote the
+                    // same inode, producer mapping, and offset itself.
+                } else {
                     bail!(
                         "snapshot relocation slot mismatch in {} at byte {}",
                         path.display(),
                         offset
                     );
                 }
-                file.seek(SeekFrom::Start(*offset))?;
-                file.write_all(to.as_bytes())?;
             }
         }
         file.set_times(
@@ -812,6 +823,18 @@ fn relocate_executables(
         resign(&path, resource_ledger)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn executable_file_identity(_path: &Path, metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    format!("{}:{}", metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn executable_file_identity(path: &Path, _metadata: &fs::Metadata) -> String {
+    path.display().to_string()
 }
 
 fn build_relocation_index(
@@ -1442,6 +1465,70 @@ mod tests {
             find_all_offsets(&bytes, needle.as_bytes()),
             vec![6, (6 + needle.len() + 6) as u64]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_relocation_accepts_only_slots_patched_through_a_hard_link_alias() {
+        let directory = tempfile::tempdir().expect("relocation fixture");
+        let target = directory.path().join("target");
+        fs::create_dir_all(target.join("debug/deps")).expect("target tree");
+        let producer = PathBuf::from("/tmp/producer");
+        let consumer = PathBuf::from("/tmp/consumer");
+        let bytes = execution_slot(producer.to_str().unwrap()).unwrap();
+        let first = target.join("debug/example");
+        let second = target.join("debug/deps/example-hash");
+        fs::write(&first, bytes.as_bytes()).expect("executable fixture");
+        fs::hard_link(&first, &second).expect("Cargo-style executable alias");
+        let relocations = vec![
+            ExecutableRelocation {
+                path: PathBuf::from("debug/example"),
+                producer: producer.clone(),
+                offsets: vec![0],
+            },
+            ExecutableRelocation {
+                path: PathBuf::from("debug/deps/example-hash"),
+                producer: producer.clone(),
+                offsets: vec![0],
+            },
+        ];
+        let mappings = BTreeMap::from([(producer, consumer.clone())]);
+
+        relocate_executables(&target, &relocations, &mappings, directory.path())
+            .expect("relocate hard-linked aliases once");
+
+        let expected = execution_slot(consumer.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(&first).unwrap(), expected.as_bytes());
+        assert_eq!(fs::read(&second).unwrap(), expected.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_relocation_rejects_unverified_consumer_bytes() {
+        let directory = tempfile::tempdir().expect("relocation fixture");
+        let target = directory.path().join("target");
+        fs::create_dir_all(target.join("debug")).expect("target tree");
+        let producer = PathBuf::from("/tmp/producer");
+        let consumer = PathBuf::from("/tmp/consumer");
+        let executable = target.join("debug/example");
+        fs::write(
+            &executable,
+            execution_slot(consumer.to_str().unwrap())
+                .unwrap()
+                .as_bytes(),
+        )
+        .expect("pre-corrupted executable fixture");
+        let relocations = vec![ExecutableRelocation {
+            path: PathBuf::from("debug/example"),
+            producer: producer.clone(),
+            offsets: vec![0],
+        }];
+        let mappings = BTreeMap::from([(producer, consumer)]);
+
+        let error = relocate_executables(&target, &relocations, &mappings, directory.path())
+            .expect_err("unverified consumer bytes must fail closed");
+
+        assert!(error.to_string().contains("relocation slot mismatch"));
     }
 
     #[test]
