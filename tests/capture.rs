@@ -1575,7 +1575,10 @@ fn linked_binary_is_durably_cached_and_runs_in_a_later_worktree() {
     let second_actions = run(second.path(), "build", "cache", Some(cache.path()));
     let second_action = fixture_action(&second_actions);
 
-    assert_eq!(first_action["execution"], "local-cache-miss");
+    assert_eq!(
+        first_action["execution"], "local-cache-miss",
+        "first linked action: {first_action:#}"
+    );
     assert_eq!(second_action["execution"], "cache-hit");
     assert_eq!(first_action["action_key"], second_action["action_key"]);
     assert_eq!(second_action["cache_eligibility"]["eligible"], true);
@@ -1640,7 +1643,10 @@ fn restored_rlib_keeps_the_downstream_link_action_key() {
         .iter()
         .find(|action| action["crate_name"] == "relocated_app")
         .expect("first app link action");
-    assert_eq!(first_app["execution"], "local-cache-miss");
+    assert_eq!(
+        first_app["execution"], "local-cache-miss",
+        "first application link action: {first_app:#}"
+    );
     let first_key = first_app["action_key"].clone();
     drop(first);
 
@@ -1873,7 +1879,12 @@ fn reapi_backend_stages_explicit_inputs_and_materializes_fake_rewrapper_outputs(
     assert!(log.contains("Cargo.toml"), "{log}");
     assert!(log.contains("src/lib.rs"), "{log}");
     assert!(log.contains("--output_files=target/"));
-    assert!(log.contains("--platform=OSFamily=macos,Arch=aarch64,toolchain_sha256="));
+    let expected_platform = format!(
+        "--platform=OSFamily={},Arch={},toolchain_sha256=",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    assert!(log.contains(&expected_platform), "{log}");
     assert!(!log.contains("{toolchain_sha256}"));
 }
 
