@@ -303,6 +303,12 @@ fn run() -> Result<i32> {
         .env("CARGO_REAPI_ACTION_LOG", action_log)
         .env("CARGO_REAPI_WORKSPACE_ROOT", workspace_root)
         .env("CARGO_REAPI_TARGET_ROOT", target_root);
+    if matches!(cli.backend, Backend::Cache) {
+        cargo.env(
+            "CARGO_REAPI_DEFAULT_LINKER",
+            cache::default_linker_for_sandbox()?,
+        );
+    }
     if let Some(cache_dir) = cache_dir {
         cargo
             .env(

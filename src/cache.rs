@@ -263,15 +263,28 @@ fn execute_cached_link(
 }
 
 fn resolve_real_linker(invocation: &RustcInvocation) -> Result<PathBuf> {
-    let candidate = invocation
-        .configured_linker()
-        .or_else(|| std::env::var_os("RUSTC_LINKER").map(PathBuf::from))
+    if let Some(candidate) = invocation.configured_linker() {
+        return resolve_linker_candidate(&candidate);
+    }
+    if let Some(linker) = std::env::var_os("CARGO_REAPI_DEFAULT_LINKER") {
+        return Ok(PathBuf::from(linker));
+    }
+    default_linker_for_sandbox()
+}
+
+pub fn default_linker_for_sandbox() -> Result<PathBuf> {
+    let candidate = std::env::var_os("RUSTC_LINKER")
+        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/usr/bin/cc"));
+    resolve_linker_candidate(&candidate)
+}
+
+fn resolve_linker_candidate(candidate: &Path) -> Result<PathBuf> {
     let resolved = if candidate.is_absolute() {
-        candidate.clone()
+        candidate.to_path_buf()
     } else {
         let output = Command::new("which")
-            .arg(&candidate)
+            .arg(candidate)
             .output()
             .with_context(|| format!("resolving linker {}", candidate.display()))?;
         if !output.status.success() {
@@ -1037,7 +1050,7 @@ fn set_unix_mode(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkDiscovery, LinkInput, discovered_action_key};
+    use super::{LinkDiscovery, LinkInput, discovered_action_key, resolve_linker_candidate};
     use std::path::PathBuf;
 
     fn discovery(actual_path: &str, sha256: &str, modified: u128) -> LinkDiscovery {
@@ -1070,6 +1083,22 @@ mod tests {
         assert_ne!(
             discovered_action_key("base", &producer).expect("producer key"),
             discovered_action_key("base", &changed).expect("changed key")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linker_alias_is_resolved_before_entering_the_sandbox() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fixture.path().join("actual-linker");
+        let alias = fixture.path().join("cc");
+        std::fs::write(&executable, b"linker").unwrap();
+        symlink(&executable, &alias).unwrap();
+        assert_eq!(
+            resolve_linker_candidate(&alias).unwrap(),
+            executable.canonicalize().unwrap()
         );
     }
 }
