@@ -967,11 +967,23 @@ fn require_log_tests(
         .with_context(|| format!("log role {role} absent"))?;
     let log = fs::read_to_string(&paths[0])?;
     for test in tests {
-        if !log.contains(&format!("test {test} ... ok")) {
+        if !test_log_reports_pass(&log, test) {
             violations.push(format!("{role} does not contain passing test {test}"));
         }
     }
     Ok(())
+}
+
+fn test_log_reports_pass(log: &str, test: &str) -> bool {
+    let marker = format!("test {test} ...");
+    let Some((_, after_marker)) = log.split_once(&marker) else {
+        return false;
+    };
+    after_marker.lines().find_map(|line| match line.trim() {
+        "ok" => Some(true),
+        "FAILED" => Some(false),
+        _ => None,
+    }) == Some(true)
 }
 
 fn secure_relative(root: &Path, relative: &Path) -> Result<PathBuf> {
@@ -1135,7 +1147,28 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{EvidenceRef, secure_relative, sha256_file, verify_evidence};
+    use super::{
+        EvidenceRef, secure_relative, sha256_file, test_log_reports_pass, verify_evidence,
+    };
+
+    #[test]
+    fn test_log_parser_accepts_interleaved_child_output() {
+        let log = "test poison ...    Compiling leaf\nerror: deliberate failure\n\n\
+                   test nested ... FAILED\n\nfailures:\n    nested\nok\n\
+                   test next ... ok\n";
+        assert!(test_log_reports_pass(log, "poison"));
+        assert!(test_log_reports_pass(log, "next"));
+    }
+
+    #[test]
+    fn test_log_parser_rejects_missing_or_failed_terminal_status() {
+        assert!(!test_log_reports_pass("test poison ... FAILED\n", "poison"));
+        assert!(!test_log_reports_pass("test other ... ok\n", "poison"));
+        assert!(!test_log_reports_pass(
+            "test poison ... compiler output only\n",
+            "poison"
+        ));
+    }
 
     #[test]
     fn evidence_paths_reject_traversal_and_symlinks() {
