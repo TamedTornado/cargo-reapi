@@ -63,6 +63,9 @@ write_receipt_v2 "$evidence_root" "$evidence_root/receipts/resources.receipt.jso
   "cold_lane_action_log:$report_root/lane-b-actions.jsonl" \
   "cold_lane_output:$report_root/lane-a-output.log" \
   "cold_lane_output:$report_root/lane-b-output.log" \
+  "bevy_link_member:$report_root/bevy-link-member.json" \
+  "bevy_link_action_log:$report_root/bevy-link-actions.jsonl" \
+  "bevy_link_output:$report_root/bevy-link-output.log" \
   "stall_report:$report_root/stall-report.json" \
   "stall_auditor_stdout:$report_root/stall-auditor.stdout" \
   "stall_auditor_stderr:$report_root/stall-auditor.stderr" \
