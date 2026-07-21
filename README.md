@@ -121,6 +121,11 @@ for development and CI; it is not a version bypass.
 cargo install --path .
 cargo reapi --backend capture -- test
 cargo reapi --backend cache --cache-dir /shared/cargo-reapi-cache -- check
+cargo reapi doctor --cache-dir /shared/cargo-reapi-cache --json
+cargo reapi cache stats --cache-dir /shared/cargo-reapi-cache --json
+cargo reapi cache gc --cache-dir /shared/cargo-reapi-cache \
+  --max-bytes 96636764160 --min-free-bytes 32212254720 \
+  --target-free-bytes 48318382080 --json
 cargo reapi contract verify --path acceptance/contract.toml
 cargo reapi prove action-log \
   --action-log /path/to/actions.jsonl \
@@ -139,6 +144,14 @@ Long-lived runtimes may configure the backend and cache once, then use the ordin
 driver form `cargo-reapi check`, `cargo-reapi clippy ...`, or `cargo-reapi test`.
 `CARGO_REAPI_BACKEND`, `CARGO_REAPI_CACHE_DIR`, and the other documented driver
 options are environment-backed defaults; explicit CLI flags still take precedence.
+`CARGO_REAPI_RESOURCE_CPU_CAPACITY` and
+`CARGO_REAPI_RESOURCE_MEMORY_GIB_CAPACITY` define one host-wide physical-action
+ledger; they do not cap logical Cargo gates. `doctor` proves the pinned sandbox,
+copy-on-write selection, configured resource capacity, and cache readability
+before a worker is admitted. `cache gc` takes an exclusive maintenance lease,
+waits for all active restores and producers, evicts least-recently-used action
+and whole-gate entries, and then removes unreferenced blobs. A dry run reports
+the same selection without mutation.
 
 The complete local proof runner has no concurrency or threshold flags. It cold-seeds one
 producer, retires that producer path, then runs the full canonical gate in one, five, and

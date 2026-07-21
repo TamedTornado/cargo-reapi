@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::capture::{CaptureOptions, PreparedInvocation, prepare_invocation, record_invocation};
 use crate::invocation::RustcInvocation;
+use crate::maintenance::{AccessKind, acquire_shared, record_access};
 use crate::relocation::{
     materialize_artifact_slots, normalize_artifact_slots, record_logical_digest,
     restored_logical_digest,
@@ -92,6 +93,7 @@ pub fn execute_cached(
     capture_options: &CaptureOptions,
     cache_options: &CacheOptions,
 ) -> Result<i32> {
+    let _maintenance = acquire_shared(&cache_options.root)?;
     let prepared = prepare_invocation(invocation)?;
     if !prepared.cache_eligibility.eligible {
         let exit_code = invocation.execute()?;
@@ -162,6 +164,11 @@ fn finish_cached_execution(
     coalesced: bool,
 ) -> Result<i32> {
     let result = if restore(cache_options, prepared)? {
+        record_access(
+            &cache_options.root,
+            AccessKind::Action,
+            &prepared.action_key,
+        )?;
         record_invocation(
             capture_options,
             prepared,
@@ -177,6 +184,11 @@ fn finish_cached_execution(
         let _lease = ResourceLease::acquire(false)?;
         let exit_code = invocation.execute()?;
         let execution = if exit_code == 0 && publish(cache_options, prepared)? {
+            record_access(
+                &cache_options.root,
+                AccessKind::Action,
+                &prepared.action_key,
+            )?;
             "local-cache-miss"
         } else if exit_code == 0 {
             "local-output-incomplete"

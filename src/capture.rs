@@ -22,6 +22,7 @@ use crate::relocation::{
     cache_slot, execution_slot, normalize_artifact_slots, record_path_mappings,
     restored_logical_digest,
 };
+use crate::resource::ResourceCapacity;
 
 pub struct CaptureOptions {
     action_log: PathBuf,
@@ -57,6 +58,8 @@ struct ActionCapture {
     output_files: Vec<String>,
     execution: String,
     exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_capacity: Option<ResourceCapacity>,
 }
 
 #[derive(Debug)]
@@ -281,6 +284,11 @@ pub fn record_invocation(
             .collect(),
         execution: execution.to_owned(),
         exit_code,
+        resource_capacity: if env::var_os("CARGO_REAPI_RESOURCE_LEDGER").is_some() {
+            Some(ResourceCapacity::from_env()?)
+        } else {
+            None
+        },
     };
     append_capture(&options.action_log, &capture)?;
     Ok(())

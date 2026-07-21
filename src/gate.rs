@@ -13,6 +13,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::maintenance::{AccessKind, acquire_shared, record_access};
 use crate::relocation::{RecordedPathMapping, execution_slot};
 #[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
@@ -50,6 +51,7 @@ struct ObservedGateInput {
 /// The per-key lock only coalesces identical cold producers. Published snapshots
 /// restore without taking this lock, so independent warm gates remain concurrent.
 pub struct GateSnapshot {
+    cache_root: PathBuf,
     key: String,
     workspace: PathBuf,
     target: PathBuf,
@@ -73,6 +75,7 @@ impl GateSnapshot {
         cargo_args: &[OsString],
         declared_inputs: &[PathBuf],
     ) -> Result<Self> {
+        let _maintenance = acquire_shared(cache_root)?;
         let action_log = if action_log.is_absolute() {
             action_log.to_path_buf()
         } else {
@@ -91,6 +94,7 @@ impl GateSnapshot {
         fs::create_dir_all(root.join("objects"))?;
         let snapshot = root.join("objects").join(&key);
         let mut gate = Self {
+            cache_root: cache_root.to_path_buf(),
             key: key.clone(),
             workspace: workspace.to_path_buf(),
             target: target.to_path_buf(),
@@ -106,6 +110,7 @@ impl GateSnapshot {
         };
         if gate.is_published() && gate.observed_inputs_match()? {
             gate.restore_exact()?;
+            record_access(&gate.cache_root, AccessKind::Gate, &gate.key)?;
             return Ok(gate);
         }
 
@@ -131,6 +136,7 @@ impl GateSnapshot {
             if gate.observed_inputs_match()? {
                 gate.coalesced = waited;
                 gate.restore_exact()?;
+                record_access(&gate.cache_root, AccessKind::Gate, &gate.key)?;
                 gate.unlock()?;
             } else {
                 fs::remove_dir_all(&gate.snapshot)
@@ -141,6 +147,7 @@ impl GateSnapshot {
     }
 
     pub fn publish_after_success(&mut self) -> Result<()> {
+        let _maintenance = acquire_shared(&self.cache_root)?;
         if self.restored || self.lock.is_none() || self.is_published() {
             return self.unlock();
         }
@@ -189,6 +196,7 @@ impl GateSnapshot {
             }
             Err(error) => return Err(error).context("publishing gate snapshot"),
         }
+        record_access(&self.cache_root, AccessKind::Gate, &self.key)?;
         self.unlock()
     }
 
@@ -1178,6 +1186,24 @@ struct CloneTraceEvent {
 
 fn clone_tree(source: &Path, destination: &Path) -> Result<CloneMethod> {
     clone_tree_with_preference(source, destination, ClonePreference::Auto)
+}
+
+pub fn probe_clone_method(cache_root: &Path) -> Result<&'static str> {
+    let probe = cache_root.join(format!(".doctor-clone-{}", std::process::id()));
+    if probe.exists() {
+        fs::remove_dir_all(&probe)?;
+    }
+    let source = probe.join("source");
+    let destination = probe.join("destination");
+    fs::create_dir_all(&source)?;
+    fs::write(source.join("probe"), b"cargo-reapi-clone-probe")?;
+    let method = clone_tree(&source, &destination)?;
+    fs::write(destination.join("probe"), b"consumer-mutation")?;
+    if fs::read(source.join("probe"))? != b"cargo-reapi-clone-probe" {
+        bail!("clone probe destination mutation changed the source");
+    }
+    fs::remove_dir_all(&probe)?;
+    Ok(method.name())
 }
 
 fn clone_tree_with_preference(

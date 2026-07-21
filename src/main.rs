@@ -6,6 +6,7 @@ mod evidence;
 mod gate;
 mod hermetic;
 mod invocation;
+mod maintenance;
 mod proof;
 mod query;
 mod reclient;
@@ -27,7 +28,9 @@ use crate::capture::{CaptureOptions, capture_invocation};
 use crate::gate::GateSnapshot;
 use crate::hermetic::SnapshotPolicy;
 use crate::invocation::RustcInvocation;
+use crate::maintenance::{GcOptions, cache_stats, collect_garbage};
 use crate::reclient::{ReclientOptions, execute_reapi, validate_platform_template};
+use crate::resource::ResourceCapacity;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Backend {
@@ -117,6 +120,60 @@ struct ContractCli {
 struct ProveCli {
     #[command(subcommand)]
     command: ProveCommand,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "cargo reapi", bin_name = "cargo reapi")]
+struct CacheCli {
+    #[command(subcommand)]
+    command: CacheCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Report durable cache size and entry counts.
+    Stats {
+        #[arg(long, env = "CARGO_REAPI_CACHE_DIR")]
+        cache_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim least-recently-used entries without racing active cache operations.
+    Gc {
+        #[arg(long, env = "CARGO_REAPI_CACHE_DIR")]
+        cache_dir: PathBuf,
+        #[arg(long)]
+        max_bytes: u64,
+        #[arg(long, default_value_t = 0)]
+        min_free_bytes: u64,
+        #[arg(long, default_value_t = 0)]
+        target_free_bytes: u64,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "cargo reapi", bin_name = "cargo reapi")]
+struct DoctorCli {
+    #[arg(long, env = "CARGO_REAPI_CACHE_DIR")]
+    cache_dir: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(serde::Serialize)]
+struct DoctorReport {
+    schema_version: u32,
+    passed: bool,
+    platform_os: &'static str,
+    platform_arch: &'static str,
+    sandbox_provider_sha256: String,
+    clone_method: &'static str,
+    resource_capacity: ResourceCapacity,
+    cache: maintenance::CacheStats,
 }
 
 #[derive(Debug, Subcommand)]
@@ -231,6 +288,12 @@ fn run() -> Result<i32> {
     if args.get(1).is_some_and(|value| value == "prove") {
         return run_prove(args);
     }
+    if args.get(1).is_some_and(|value| value == "cache") {
+        return run_cache(args);
+    }
+    if args.get(1).is_some_and(|value| value == "doctor") {
+        return run_doctor(args);
+    }
     if RustcInvocation::looks_like_wrapper(&args) {
         return run_wrapper(args);
     }
@@ -238,6 +301,82 @@ fn run() -> Result<i32> {
     validate_cli(&cli)?;
 
     run_cli(&cli)
+}
+
+fn run_cache(mut args: Vec<OsString>) -> Result<i32> {
+    args.remove(1);
+    let cli = CacheCli::parse_from(args);
+    let value = match cli.command {
+        CacheCommand::Stats { cache_dir, json } => {
+            let report = cache_stats(&cache_dir)?;
+            if !json {
+                eprintln!(
+                    "cache={} bytes={} available={}",
+                    report.cache_root.display(),
+                    report.total_bytes,
+                    report.available_bytes
+                );
+            }
+            serde_json::to_value(report)?
+        }
+        CacheCommand::Gc {
+            cache_dir,
+            max_bytes,
+            min_free_bytes,
+            target_free_bytes,
+            dry_run,
+            json,
+        } => {
+            let report = collect_garbage(
+                &cache_dir,
+                GcOptions {
+                    max_bytes,
+                    min_free_bytes,
+                    target_free_bytes,
+                    dry_run,
+                },
+            )?;
+            if !json {
+                eprintln!(
+                    "cache={} before={} after={} freed={} satisfied={}",
+                    report.before.cache_root.display(),
+                    report.before.total_bytes,
+                    report.after.total_bytes,
+                    report.estimated_freed_bytes,
+                    report.capacity_satisfied
+                );
+            }
+            serde_json::to_value(report)?
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(0)
+}
+
+fn run_doctor(mut args: Vec<OsString>) -> Result<i32> {
+    args.remove(1);
+    let cli = DoctorCli::parse_from(args);
+    let report = DoctorReport {
+        schema_version: 1,
+        passed: true,
+        platform_os: env::consts::OS,
+        platform_arch: env::consts::ARCH,
+        sandbox_provider_sha256: hermetic::provider_identity_digest()?,
+        clone_method: gate::probe_clone_method(&cli.cache_dir)?,
+        resource_capacity: ResourceCapacity::from_env()?,
+        cache: cache_stats(&cli.cache_dir)?,
+    };
+    if !cli.json {
+        eprintln!(
+            "cargo-reapi doctor passed: sandbox={} clone={} cpu={} memory_gib={}",
+            report.sandbox_provider_sha256,
+            report.clone_method,
+            report.resource_capacity.cpu,
+            report.resource_capacity.memory_gib
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(0)
 }
 
 fn run_cli(cli: &Cli) -> Result<i32> {
