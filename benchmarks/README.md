@@ -14,9 +14,10 @@ or aggregate proof directories. Those artifacts are regenerated on demand by
 the pinned runners and independently checked before their statistics are
 recorded here.
 
-The latest current-schema macOS measurements are recorded in
-[`results/2026-07-21-macos-apfs.md`](results/2026-07-21-macos-apfs.md). The
-preceding-model final Linux qualification is recorded in
+The latest current-schema measurements are recorded in
+[`results/2026-07-21-macos-apfs.md`](results/2026-07-21-macos-apfs.md) and
+[`results/2026-07-21-linux-xfs-schema-v3.md`](results/2026-07-21-linux-xfs-schema-v3.md).
+The preceding-model final Linux qualification remains in
 [`results/2026-07-20-linux-xfs.md`](results/2026-07-20-linux-xfs.md). Earlier
 historical and partial results remain linked from the result files and are not
 presented as current multi-platform acceptance.
