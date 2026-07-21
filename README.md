@@ -16,7 +16,8 @@ The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a 
 The [benchmark index](benchmarks/README.md) contains the pinned Bevy linked-
 binary proof, real Moria one/five/ten rotational qualification, Bro's five-job
 qualification, reproduction commands, explicit SSD status, and the latest
-[final Linux XFS qualification statistics](benchmarks/results/2026-07-20-linux-xfs.md).
+[macOS APFS current-schema qualification](benchmarks/results/2026-07-21-macos-apfs.md)
+and [final preceding-model Linux XFS statistics](benchmarks/results/2026-07-20-linux-xfs.md).
 Rotational results are not presented as SSD acceptance, the partial Linux batch
 is not presented as full qualification, and the README does not treat a warm
 clock as a substitute for adversarial correctness or OS-level process evidence.

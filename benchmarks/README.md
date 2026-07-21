@@ -3,14 +3,15 @@
 Benchmark claims in this repository are evidence, not marketing estimates. The
 binding correctness and timing rules live in
 [`../acceptance/ACCEPTANCE_CRITERIA.md`](../acceptance/ACCEPTANCE_CRITERIA.md),
-and only `cargo reapi prove complete` can turn the full receipt set into an
-acceptance result.
+and only `cargo reapi prove aggregate` can turn both complete platform receipt
+sets into publication-grade acceptance.
 
-The macOS measurements and exact workload definitions are recorded in
-[`results/2026-07-19-local.md`](results/2026-07-19-local.md). The latest
-[`Linux ext4 population statistics`](results/2026-07-20-linux-ext4.md) retain
-the passing one- and five-consumer measurements from an otherwise failed batch;
-they are not presented as complete Linux qualification.
+The latest current-schema macOS measurements are recorded in
+[`results/2026-07-21-macos-apfs.md`](results/2026-07-21-macos-apfs.md). The
+preceding-model final Linux qualification is recorded in
+[`results/2026-07-20-linux-xfs.md`](results/2026-07-20-linux-xfs.md). Earlier
+historical and partial results remain linked from the result files and are not
+presented as current multi-platform acceptance.
 
 Reproduction entry points:
 
