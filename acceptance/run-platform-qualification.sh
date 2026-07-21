@@ -40,18 +40,14 @@ cp "$profile" "$evidence_root/platform.toml"
 mkdir -p "$evidence_root/receipts" "$evidence_root/moria" "$evidence_root/adversarial" \
   "$evidence_root/bevy" "$evidence_root/bro" "$evidence_root/resources"
 
-"$resource_auditor" run \
-  --report "$evidence_root/resource-build-report.json" \
-  --ledger-root "$cache_dir/resource-ledger-v1" \
-  --stall-seconds 300 -- \
-  "$repo/acceptance/run-moria-local.sh" "$moria_root" "$cache_dir" "$evidence_root/moria" "$storage_profile"
+"$repo/acceptance/run-moria-local.sh" "$moria_root" "$cache_dir" "$evidence_root/moria" "$storage_profile"
 
 "$repo/acceptance/run-adversarial.sh" "$evidence_root/adversarial" "$batch_id"
 "$repo/acceptance/run-bevy-integrity.sh" "$evidence_root/bevy" "$batch_id"
 "$repo/acceptance/run-bro-five.sh" "$evidence_root/bro" "$batch_id" "$bro_root" "$moria_root" "$cache_dir" \
   "$storage_profile"
 "$repo/acceptance/run-resources.sh" "$evidence_root/resources" "$batch_id" \
-  "$evidence_root/resource-build-report.json" "$cache_dir/resource-ledger-v1" "$evidence_root/stall-ledger"
+  "$moria_root" "$cache_dir/resource-cold" "$evidence_root/stall-ledger"
 
 if [ "$platform_id" = macos-arm64 ]; then
   copy_kind=macos-clone
