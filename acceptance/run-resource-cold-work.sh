@@ -30,6 +30,7 @@ trap cleanup EXIT HUP INT TERM
 git -C "$moria_root" diff --quiet
 git -C "$moria_root" diff --cached --quiet
 mkdir -p "$lane_a" "$lane_b"
+mkdir -p "$report_root/lane-a-rustc-trace" "$report_root/lane-b-rustc-trace"
 git -C "$moria_root" archive --format=tar HEAD | tar -xf - -C "$lane_a"
 git -C "$moria_root" archive --format=tar HEAD | tar -xf - -C "$lane_b"
 

@@ -6,6 +6,7 @@ fn cold_resource_receipt_runs_two_distinct_moria_gates_concurrently() {
 
     assert!(cold_work.contains("CARGO_PROFILE_DEV_DEBUG=1"));
     assert!(cold_work.contains("CARGO_PROFILE_DEV_DEBUG=2"));
+    assert!(cold_work.contains("mkdir -p \"$report_root/lane-a-rustc-trace\" \"$report_root/lane-b-rustc-trace\""));
     assert!(cold_work.contains("pid_a=$!"));
     assert!(cold_work.contains("pid_b=$!"));
     assert!(cold_work.contains("wait \"$pid_a\""));
