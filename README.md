@@ -1,21 +1,39 @@
 # cargo-reapi
 
+`cargo-reapi` lets ordinary Cargo projects reuse compiled artifacts across
+independent worktrees and processes without replacing Cargo's build graph. It
+was built for massively parallel Rust agent pipelines, where many clean
+worktrees otherwise repeat the same expensive checks, tests, compiler actions,
+and links.
+
+Cargo remains the build planner and source of truth. `cargo-reapi` observes the
+exact commands Cargo schedules through `RUSTC_WRAPPER`, captures and verifies
+their inputs and outputs, coalesces identical concurrent work, and restores
+artifacts from a shared local cache. It also includes a reclient adapter for
+eligible Remote Execution API (REAPI) actions; validation against a live
+production REAPI service remains a separate milestone.
+
+The current-schema macOS/arm64 APFS and Linux/x86_64 XFS platform batches each
+passed all 11 required qualification receipts. Independent recursive
+verification rehashed 152 macOS artifacts and 192 Linux artifacts and reported
+zero platform violations. A combined cross-platform aggregate is not claimed:
+the macOS raw evidence tree had already been intentionally discarded before the
+Linux verification run, so the enclosing two-platform command correctly
+reported macOS `UNMET`.
+
 The binding project acceptance requirements are recorded in
-[`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). The
-current-model macOS/arm64 and Linux/x86_64 qualification is not yet established
-by a passing multi-platform aggregate. Historical macOS empirical qualification
-and the preceding-model Linux local qualification passed; a matching
-multi-platform aggregate has not yet been regenerated under the current model.
-Raw proof trees are disposable generated artifacts, not repository content. The
+[`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). Raw
+proof trees are disposable generated artifacts, not repository content. The
 committed acceptance machinery and the
-[end-to-end reproduction procedure](acceptance/REPRODUCING.md) are the durable
-proof surface. Only concise benchmark statistics and pass matrices are
-committed—never raw OS events, receipt trees, caches, restored binaries, or
-aggregate evidence directories.
+[end-to-end reproduction procedure](acceptance/REPRODUCING.md) are the durable,
+reproducible validation surface. Only concise benchmark statistics and pass
+matrices are committed—never raw OS events, receipt trees, caches, restored
+binaries, or aggregate evidence directories.
 
-`cargo-reapi` is an experimental Cargo-native path to remote execution. Cargo remains the build planner and source of truth; the tool observes the exact `rustc` commands Cargo schedules through `RUSTC_WRAPPER`, captures their inputs, and will translate those actions to the Remote Execution API (REAPI).
-
-The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a second maintained build graph. That is a poor fit for arbitrary Cargo projects and is particularly costly around workspace feature selection, build scripts, proc macros, and Cargo-provided environment variables.
+The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a
+second maintained build graph. That is a poor fit for arbitrary Cargo projects
+and is particularly costly around workspace feature selection, build scripts,
+proc macros, and Cargo-provided environment variables.
 
 ## Real-world benchmarks
 
@@ -23,10 +41,11 @@ The [benchmark index](benchmarks/README.md) contains the pinned Bevy linked-
 binary proof, real Moria one/five/ten rotational qualification, Bro's five-job
 qualification, reproduction commands, explicit SSD status, and the latest
 [macOS APFS current-schema qualification](benchmarks/results/2026-07-21-macos-apfs.md)
-and [final preceding-model Linux XFS statistics](benchmarks/results/2026-07-20-linux-xfs.md).
-Rotational results are not presented as SSD acceptance, the partial Linux batch
-is not presented as full qualification, and the README does not treat a warm
-clock as a substitute for adversarial correctness or OS-level process evidence.
+and [Linux XFS current-schema qualification](benchmarks/results/2026-07-21-linux-xfs-schema-v3.md).
+Rotational results are not presented as SSD acceptance, platform qualification
+is not presented as a combined cross-platform aggregate, and the README does
+not treat a warm clock as a substitute for adversarial correctness or OS-level
+process evidence.
 The complete macOS, Linux/XFS, aggregation, benchmark-recording, and evidence-
 disposal procedure is documented in
 [`acceptance/REPRODUCING.md`](acceptance/REPRODUCING.md).
@@ -40,14 +59,14 @@ test, receipt, and independent evidence behind every row.
 
 | Area | What must be demonstrated | macOS APFS record | Linux XFS record |
 | --- | --- | --- | --- |
-| Invalidation | Exact dependent rebuild set; poison, flags/configuration, external inputs, and undeclared effects cannot produce stale hits | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
-| Linked artifacts | Relocated Bevy application and test binary match a fresh control | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
-| Coalescing | One producer/one waiter, correct waiter behavior, and failure propagation | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
-| Warm populations | Complete Moria gates in 1/5/10 simultaneous clean consumers with zero physical and OS-observed compiler/linker work | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
-| Bro integration | Five simultaneous public-boundary Moria jobs with complete gates and zero warm compilation | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
-| Resources | Distinct cold work overlaps within RSS/swap bounds; a 300-second stall is infrastructure | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
-| Portability | APFS clone or Linux reflink selection is proved; portable fallback remains isolated | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
-| Evidence integrity | Runner identity, criteria, raw OS events, derived audits, and all recursive evidence hashes verify fail-closed | schema-v3 pass | schema-v2 pass; matching aggregate pending |
+| Invalidation | Exact dependent rebuild set; poison, flags/configuration, external inputs, and undeclared effects cannot produce stale hits | schema-v3 pass | schema-v3 pass |
+| Linked artifacts | Relocated Bevy application and test binary match a fresh control | schema-v3 pass | schema-v3 pass |
+| Coalescing | One producer/one waiter, correct waiter behavior, and failure propagation | schema-v3 pass | schema-v3 pass |
+| Warm populations | Complete Moria gates in 1/5/10 simultaneous clean consumers with zero physical and OS-observed compiler/linker work | schema-v3 pass | schema-v3 pass |
+| Bro integration | Five simultaneous public-boundary Moria jobs with complete gates and zero warm compilation | schema-v3 pass | schema-v3 pass |
+| Resources | Distinct cold work overlaps within RSS/swap bounds; a 300-second stall is infrastructure | schema-v3 pass | schema-v3 pass |
+| Portability | APFS clone or Linux reflink selection is proved; portable fallback remains isolated | schema-v3 pass | schema-v3 pass |
+| Evidence integrity | Runner identity, criteria, raw OS events, derived audits, and all recursive evidence hashes verify fail-closed | 152 artifacts rehashed; zero violations | 192 artifacts rehashed; zero violations |
 
 Current deliberate limits are Windows, arbitrary Rust/native build systems and
 targets, untested filesystems and architectures, and validation against a live
@@ -67,7 +86,17 @@ The reclient transport adapter stages eligible actions into explicit input roots
 
 The first bounded [five-worktree Moria experiment](docs/moria-acceptance-2026-07-18.md) is retained as failed evidence: it used serialized two-process waves and executed cacheable work. The later [self-reported Moria experiment](docs/moria-acceptance-2026-07-19.md) met its timing thresholds, but predates external compiler observation and is therefore also historical, unaudited evidence rather than an acceptance result. Fixed timing references and anti-escape clauses are embedded from `acceptance/contract.toml`; receipts always report whether each host met or exceeded its selected reference, while correctness still requires a complete externally observed `cargo reapi prove` report with zero warm compiler/linker work.
 
-The current [real-world benchmark record](benchmarks/results/2026-07-19-local.md#moria-ssd-acceptance-receipt) contains the first externally observed Moria SSD pass: 9.441s for one worktree, 14.918s for five simultaneous worktrees, and 26.639s for ten simultaneous worktrees, with zero OS-observed compiler/linker executions in every warm population. The 2026-07-20 aggregate run also passed Bevy behavioral parity, adversarial invalidation, coalescing, resource, portability, and Bro five-job receipts. Peak aggregate RSS was 5.20 GB with no swap growth; three distinct heavy actions made simultaneous progress; and a live 300-second no-progress run was rejected as infrastructure rather than agent feedback.
+The current platform records report complete clean-consumer Moria gates in
+8.302s / 14.264s / 25.016s on [macOS APFS](benchmarks/results/2026-07-21-macos-apfs.md)
+and 6.455s / 10.818s / 18.852s on
+[Linux XFS](benchmarks/results/2026-07-21-linux-xfs-schema-v3.md) for one, five,
+and ten simultaneous worktrees respectively. Every warm population recorded
+zero physical actions and zero OS-observed compiler/linker executions. Both
+schema-v3 platform batches also passed Bevy behavioral parity, adversarial
+invalidation, coalescing, resource, portability, and Bro five-job receipts.
+Peak aggregate build-process RSS was 3.50 GB on macOS and 9.32 GB on Linux with
+no swap growth; deliberate no-progress runs were terminated and classified as
+infrastructure rather than agent feedback.
 
 The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
 

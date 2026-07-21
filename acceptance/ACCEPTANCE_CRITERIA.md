@@ -1,6 +1,6 @@
 # cargo-reapi acceptance criteria
 
-Status: **macOS/arm64 current-model qualification is not yet established by a passing multi-platform aggregate (historical empirical qualification passed); Linux/x86_64 current-model qualification is not yet established by a passing multi-platform aggregate (preceding-model local qualification passed); publication-grade multi-platform aggregate acceptance not achieved.**
+Status: **macOS/arm64 APFS and Linux/x86_64 XFS current-model platform qualifications each passed all required receipts under independent recursive verification; publication-grade combined multi-platform aggregate acceptance was not achieved because the disposable macOS raw evidence tree was no longer available during the Linux verification run.**
 
 This document is the acceptance authority for cargo-reapi. A benchmark, test
 binary, Moria run, Bro run, or `PASS` line is only partial evidence. The project
