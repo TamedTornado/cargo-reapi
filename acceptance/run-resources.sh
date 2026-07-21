@@ -44,7 +44,7 @@ stall_status=0
 "$resource_auditor" run --report "$report_root/stall-report.json" --ledger-root "$stall_ledger_root" \
   --stall-seconds 300 -- /bin/sleep 400 >"$report_root/stall-auditor.stdout" 2>"$report_root/stall-auditor.stderr" || stall_status=$?
 test "$stall_status" -ne 0
-jq -e '.stall_seconds == 300 and .infrastructure_stall == true and .exit_code != 0 and ([.violations[]] | any(contains("classified as infrastructure")))' "$report_root/stall-report.json" >/dev/null
+jq -e '.stall_seconds == 300 and .infrastructure_stall == true and .exit_code != 0 and (.completed_at_unix_ms - .started_at_unix_ms) <= 310000 and ([.violations[]] | any(contains("classified as infrastructure")))' "$report_root/stall-report.json" >/dev/null
 
 cargo test --bin cargo-reapi resource::tests::distinct_physical_actions_overlap_without_exceeding_the_ledger \
   >"$report_root/ledger-unit.log" 2>&1
@@ -52,7 +52,8 @@ cargo test --bin cargo-reapi resource::tests::distinct_physical_actions_overlap_
 claims=$(jq -cn '
   def claim($roles): {status:"PASS",evidence_roles:$roles};
   {shared_ledger:claim(["resource_report","ledger_unit_log"]),distinct_actions_overlap:claim(["resource_report"]),rss_within_limit:claim(["resource_report"]),swap_within_limit:claim(["resource_report"]),stall_is_infrastructure:claim(["stall_report","stall_auditor_stderr"])}')
-measurements=$(jq -c '{peak_aggregate_rss_bytes,swap_growth_bytes,distinct_physical_overlap:.peak_simultaneous_progress_processes,observed_lease_owners,observed_action_identities:(.observed_action_identities|length),stall_seconds:300}' "$resource_report")
+stall_duration_ms=$(jq '.completed_at_unix_ms - .started_at_unix_ms' "$report_root/stall-report.json")
+measurements=$(jq -c --argjson stall_duration_ms "$stall_duration_ms" '{peak_aggregate_rss_bytes,swap_growth_bytes,distinct_physical_overlap:.peak_simultaneous_progress_processes,observed_lease_owners,observed_action_identities:(.observed_action_identities|length),stall_seconds:300,stall_duration_ms:$stall_duration_ms}' "$resource_report")
 write_receipt_v2 "$evidence_root" "$evidence_root/receipts/resources.receipt.json" resources \
   "$report_root/run-start.json" "$claims" "$measurements" \
   "resource_report:$resource_report" \

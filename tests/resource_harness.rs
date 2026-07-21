@@ -22,6 +22,7 @@ fn cold_resource_receipt_runs_two_distinct_moria_gates_concurrently() {
 
     assert!(receipt.contains("\"$resource_auditor\" run"));
     assert!(receipt.contains("peak_simultaneous_progress_processes >= 2"));
+    assert!(receipt.contains("completed_at_unix_ms - .started_at_unix_ms) <= 310000"));
     assert!(receipt.contains("cold_work_runner:$report_root/resource-cold-work-source.sh"));
     assert!(platform.contains("$cache_dir/resource-cold"));
 }
