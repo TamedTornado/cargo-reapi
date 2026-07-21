@@ -74,13 +74,28 @@ zero physical warm actions and zero OS-observed compiler/linker executions.
 The deliberate no-progress command was classified as infrastructure and
 terminated after 300.057s rather than completing naturally at 400s.
 
-## Independent-verifier status at record creation
+## Independent recursive verification
 
-The first independent recursive verification attempt did not substantiate the
-Linux batch. It stopped while parsing `container-image-inspect.json` because
-the verifier treated every referenced `.json` artifact as an object containing
-`evidence_refs`; Docker inspection evidence is a valid top-level JSON array.
-The platform runner and all 11 receipts passed, but this record does not convert
-that verifier defect into an aggregate pass. The generated evidence tree is
-being retained temporarily so the repaired verifier can rehash the unchanged
-artifacts without rerunning the qualification.
+The first independent recursive verification attempt exposed a verifier defect:
+it treated every referenced `.json` artifact as an object containing
+`evidence_refs`, while Docker inspection evidence is a valid top-level JSON
+array. Verifier revision `63e634d96735b70f78c99b43589a785692e86990`
+repaired traversal without changing the evidence producer: every referenced
+artifact is digest-verified, arbitrary JSON is a leaf, and a top-level object
+with an explicit malformed `evidence_refs` field still fails closed.
+
+The repaired Linux x86_64 verifier binary SHA-256 was
+`de918d047bc9010d6d43f17293cb7cea568790a1644edd80171fbda1ea291f61`.
+It rehashed the unchanged generated evidence and reported:
+
+- Linux platform status: `PASS`;
+- all 11 receipt statuses: `PASS`;
+- recursively verified artifacts: 192;
+- Linux violations: zero.
+
+The verification report SHA-256 was
+`c18d3c495e5ad2a294830e1ba0b99210c006fe8f8bc0a7e6415186ee238c7131`.
+The enclosing two-platform command reported macOS `UNMET` because the previous
+macOS raw evidence tree had already been intentionally discarded. That absence
+does not alter this Linux platform result and is not presented as a combined
+cross-platform aggregate pass.
