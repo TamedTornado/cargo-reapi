@@ -3,8 +3,10 @@
 Benchmark claims in this repository are evidence, not marketing estimates. The
 binding correctness and timing rules live in
 [`../acceptance/ACCEPTANCE_CRITERIA.md`](../acceptance/ACCEPTANCE_CRITERIA.md),
-and only `cargo reapi prove aggregate` can turn both complete platform receipt
-sets into publication-grade acceptance.
+and only `cargo reapi prove aggregate` can validate both complete generated
+platform receipt sets as one cross-platform result. Raw receipt sets are
+disposable build artifacts: they are not committed or required to be retained
+after verification and statistics extraction.
 
 The latest current-schema macOS measurements are recorded in
 [`results/2026-07-21-macos-apfs.md`](results/2026-07-21-macos-apfs.md). The
@@ -14,6 +16,13 @@ historical and partial results remain linked from the result files and are not
 presented as current multi-platform acceptance.
 
 Reproduction entry points:
+
+The canonical end-to-end instructions, including the required source layout,
+macOS authorization, Linux XFS setup, cross-platform aggregation, benchmark
+fields, and disposal policy, are in
+[`../acceptance/REPRODUCING.md`](../acceptance/REPRODUCING.md). The shorter
+commands below are useful component entry points, not a substitute for that
+procedure.
 
 ```sh
 # Correctness, invalidation, coalescing, and portable-copy tests

@@ -1,5 +1,11 @@
 # Linux qualification environment
 
+This page describes the Linux-specific mechanism. See
+[`../REPRODUCING.md`](../REPRODUCING.md) for the canonical source layout,
+matching macOS run, aggregate verification, statistics record, and explicit
+disposal policy. The evidence directory produced here is generated output and
+is not committed.
+
 The Linux qualification uses the configured x86_64 build server, not GitHub
 Actions. The two official base images are digest-pinned in `Dockerfile`.
 `run-qualification.sh` records the final built-image inspection alongside the
@@ -37,8 +43,8 @@ acceptance/linux/run-qualification.sh \
 
 The setup helper refuses to format an existing non-XFS image. It verifies that
 the mounted XFS filesystem reports `reflink=1`; the qualification must still
-retain and bind its own clone-selection and shared-extent evidence. The mount
-is deliberately not persistent across reboot. Tear it down explicitly after
-qualification with `sudo umount /home/chandler/cargo-reapi-qualification-xfs`;
-the sparse image may then be deleted when its retained evidence is no longer
-needed.
+generate and bind its own clone-selection and shared-extent evidence. The mount
+is deliberately not persistent across reboot. After aggregate verification and
+statistics extraction, tear it down explicitly with
+`sudo umount /home/chandler/cargo-reapi-qualification-xfs`; the evidence tree
+and sparse image may then be deleted.

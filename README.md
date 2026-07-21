@@ -4,8 +4,12 @@ The binding project acceptance requirements are recorded in
 [`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). The
 current-model macOS/arm64 and Linux/x86_64 qualification is not yet established
 by a passing multi-platform aggregate. Historical macOS empirical qualification
-and the preceding-model Linux local qualification passed; publication-grade
-multi-platform aggregate acceptance has not been achieved.
+and the preceding-model Linux local qualification passed; a matching
+multi-platform aggregate has not yet been regenerated under the current model.
+Raw proof trees are disposable generated artifacts, not repository content. The
+committed acceptance machinery and the
+[end-to-end reproduction procedure](acceptance/REPRODUCING.md) are the durable
+proof surface.
 
 `cargo-reapi` is an experimental Cargo-native path to remote execution. Cargo remains the build planner and source of truth; the tool observes the exact `rustc` commands Cargo schedules through `RUSTC_WRAPPER`, captures their inputs, and will translate those actions to the Remote Execution API (REAPI).
 
@@ -21,6 +25,9 @@ and [final preceding-model Linux XFS statistics](benchmarks/results/2026-07-20-l
 Rotational results are not presented as SSD acceptance, the partial Linux batch
 is not presented as full qualification, and the README does not treat a warm
 clock as a substitute for adversarial correctness or OS-level process evidence.
+The complete macOS, Linux/XFS, aggregation, benchmark-recording, and evidence-
+disposal procedure is documented in
+[`acceptance/REPRODUCING.md`](acceptance/REPRODUCING.md).
 
 ## Current status
 

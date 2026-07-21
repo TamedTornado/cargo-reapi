@@ -6,8 +6,10 @@ whole-gate execution used `@anthropic-ai/sandbox-runtime@0.0.66` with macOS
 Seatbelt; independent process observation used `eslogger` exec events with full
 arguments.
 
-Evidence-producing cargo-reapi revision: `56a8c88`. Independent verifier
-revision: `4ae42b8`. Acceptance contract SHA-256:
+Evidence-producing cargo-reapi revision:
+`56a8c882688e5c8ed360237054492437d5671853`. Independent verifier revision:
+`4ae42b8`. Bro revision: `3ea6630740ce5d0d1640d0ba15a017b46b3fa726`.
+Moria revision: `6542cb53a636f191d9a4de72d476c3c4f06e3fe4`. Acceptance contract SHA-256:
 `c833908214b7de8a7c593fee7799de7d1fbe5088b411b6d00fca7aa4ef4da500`.
 Normative criteria SHA-256:
 `77ba9509f276f28112c5aadde3fca1a66b106d0d625e91e61eeb7c6fa386f73c`.
