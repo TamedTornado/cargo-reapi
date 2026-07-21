@@ -9,7 +9,9 @@ multi-platform aggregate has not yet been regenerated under the current model.
 Raw proof trees are disposable generated artifacts, not repository content. The
 committed acceptance machinery and the
 [end-to-end reproduction procedure](acceptance/REPRODUCING.md) are the durable
-proof surface.
+proof surface. Only concise benchmark statistics and pass matrices are
+committed—never raw OS events, receipt trees, caches, restored binaries, or
+aggregate evidence directories.
 
 `cargo-reapi` is an experimental Cargo-native path to remote execution. Cargo remains the build planner and source of truth; the tool observes the exact `rustc` commands Cargo schedules through `RUSTC_WRAPPER`, captures their inputs, and will translate those actions to the Remote Execution API (REAPI).
 
@@ -28,6 +30,30 @@ clock as a substitute for adversarial correctness or OS-level process evidence.
 The complete macOS, Linux/XFS, aggregation, benchmark-recording, and evidence-
 disposal procedure is documented in
 [`acceptance/REPRODUCING.md`](acceptance/REPRODUCING.md).
+
+### Qualification coverage at a glance
+
+The suite is exhaustive against the committed acceptance threat model, not
+against every possible Rust toolchain or project. The complete
+[requirement-to-runner-to-evidence map](acceptance/COVERAGE.md) identifies the
+test, receipt, and independent evidence behind every row.
+
+| Area | What must be demonstrated | macOS APFS record | Linux XFS record |
+| --- | --- | --- | --- |
+| Invalidation | Exact dependent rebuild set; poison, flags/configuration, external inputs, and undeclared effects cannot produce stale hits | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
+| Linked artifacts | Relocated Bevy application and test binary match a fresh control | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
+| Coalescing | One producer/one waiter, correct waiter behavior, and failure propagation | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
+| Warm populations | Complete Moria gates in 1/5/10 simultaneous clean consumers with zero physical and OS-observed compiler/linker work | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
+| Bro integration | Five simultaneous public-boundary Moria jobs with complete gates and zero warm compilation | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
+| Resources | Distinct cold work overlaps within RSS/swap bounds; a 300-second stall is infrastructure | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
+| Portability | APFS clone or Linux reflink selection is proved; portable fallback remains isolated | schema-v3 pass | schema-v2 pass; schema-v3 rerun pending |
+| Evidence integrity | Runner identity, criteria, raw OS events, derived audits, and all recursive evidence hashes verify fail-closed | schema-v3 pass | schema-v2 pass; matching aggregate pending |
+
+Current deliberate limits are Windows, arbitrary Rust/native build systems and
+targets, untested filesystems and architectures, and validation against a live
+production REAPI service. Unsupported effects fail closed in strict mode. The
+[coverage document](acceptance/COVERAGE.md#deliberate-limits) gives the exact
+boundary so “exhaustive” is not used as an unbounded compatibility claim.
 
 ## Current status
 

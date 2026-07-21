@@ -22,6 +22,27 @@ reported every macOS receipt PASS with no macOS violations. Publication-grade
 multi-platform aggregate acceptance remains pending until a matching
 current-schema Linux batch exists.
 
+## Complete receipt matrix
+
+| Required receipt | Result | Principal evidence |
+| --- | --- | --- |
+| `environment` | PASS | Intrinsic runner/source/criteria identity and APFS host/toolchain report |
+| `adversarial` | PASS | Exact OS-derived mutation set plus poison, flags/configuration, external-input, undeclared-read, and network tests |
+| `bevy-integrity` | PASS | Fresh-control behavioral parity, consumer paths, valid signatures, and zero warm `eslogger` compiler/linker events |
+| `coalescing` | PASS | One producer/one waiter OS attribution, waiter parity, failing-producer propagation, and no partial publication |
+| `resources` | PASS | External process-tree RSS/swap/overlap report and fail-closed 300-second stall report |
+| `portable-copy-isolated` | PASS | Forced portable-copy consumer-isolation test |
+| `macos-clone` | PASS | APFS clone-selection branch trace identifying successful copy-on-write restoration |
+| `moria-single` | PASS | Complete clean-consumer gate, zero physical actions, and zero OS-observed compiler/linker actions |
+| `moria-five` | PASS | Five simultaneous complete gates with the same two independent zero-work checks |
+| `moria-stress` | PASS | Ten simultaneous complete gates with the same two independent zero-work checks |
+| `bro-five` | PASS | Five simultaneous public-boundary Bro jobs, complete gates, producer retirement, and zero warm work |
+
+All 11 receipts belonged to one schema-v3 platform batch. The verifier
+recursively rehashed 152 referenced artifacts before reporting the macOS batch
+PASS; those generated artifacts were disposable after verification and
+statistics extraction.
+
 ## Moria populations
 
 Every consumer began with an empty target after producer deletion and ran the
