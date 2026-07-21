@@ -2,8 +2,9 @@
 
 The binding project acceptance requirements are recorded in
 [`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). The
-current macOS/arm64 empirical qualification passed, but acceptance-gap closure
-is pending. Linux/x86_64 qualification is pending, and publication-grade
+current-model macOS/arm64 and Linux/x86_64 qualification is not yet established
+by a passing multi-platform aggregate. Historical macOS empirical qualification
+and the preceding-model Linux local qualification passed; publication-grade
 multi-platform aggregate acceptance has not been achieved.
 
 `cargo-reapi` is an experimental Cargo-native path to remote execution. Cargo remains the build planner and source of truth; the tool observes the exact `rustc` commands Cargo schedules through `RUSTC_WRAPPER`, captures their inputs, and will translate those actions to the Remote Execution API (REAPI).
@@ -15,7 +16,7 @@ The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a 
 The [benchmark index](benchmarks/README.md) contains the pinned Bevy linked-
 binary proof, real Moria one/five/ten rotational qualification, Bro's five-job
 qualification, reproduction commands, explicit SSD status, and the latest
-[Linux ext4 population statistics](benchmarks/results/2026-07-20-linux-ext4.md).
+[final Linux XFS qualification statistics](benchmarks/results/2026-07-20-linux-xfs.md).
 Rotational results are not presented as SSD acceptance, the partial Linux batch
 is not presented as full qualification, and the README does not treat a warm
 clock as a substitute for adversarial correctness or OS-level process evidence.

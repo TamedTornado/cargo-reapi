@@ -29,7 +29,12 @@ write_intrinsic_run_start() {
   git -C "$repo" diff --quiet -- Cargo.toml Cargo.lock src acceptance
   git -C "$repo" diff --cached --quiet -- Cargo.toml Cargo.lock src acceptance
   runner_sha=$(sha256_file "$runner")
-  criteria_sha=$(sha256_file "$criteria")
+  criteria_identity=$($driver contract criteria-identity --path "$criteria")
+  criteria_sha=$(printf '%s\n' "$criteria_identity" | jq -er '.criteria_sha256')
+  criteria_document_sha=$(printf '%s\n' "$criteria_identity" | jq -er '.criteria_document_sha256')
+  criteria_copy=$report_root/criteria-at-start.md
+  cp "$criteria" "$criteria_copy"
+  test "$(sha256_file "$criteria_copy")" = "$criteria_document_sha"
   criteria_blob=$(git -C "$repo" hash-object "$criteria")
   criteria_commit=$(git -C "$repo" log -1 --format=%H -- "$criteria")
   source_revision=$(git -C "$repo" rev-parse HEAD)
@@ -43,6 +48,8 @@ write_intrinsic_run_start() {
     --arg runner_path "$runner_rel" \
     --arg runner_sha256 "$runner_sha" \
     --arg criteria_sha256 "$criteria_sha" \
+    --arg criteria_document_sha256 "$criteria_document_sha" \
+    --arg criteria_document_path "criteria-at-start.md" \
     --arg criteria_git_blob "$criteria_blob" \
     --arg criteria_commit "$criteria_commit" \
     --arg contract_sha256 "$(sha256_file "$contract")" \
@@ -57,7 +64,7 @@ write_intrinsic_run_start() {
     --arg platform_arch "$(rustc -vV | awk '/^host:/{print $2}' | cut -d- -f1)" \
     --arg batch_id "$batch_id" \
     --argjson started_at_unix_ms "$started" \
-    '{schema_version:2,harness_identity:"intrinsic",runner_path:$runner_path,runner_sha256:$runner_sha256,criteria_sha256:$criteria_sha256,criteria_git_blob:$criteria_git_blob,criteria_commit:$criteria_commit,contract_sha256:$contract_sha256,source_revision:$source_revision,implementation_tree_sha256:$implementation_tree_sha256,driver_sha256:$driver_sha256,auditor_sha256:$auditor_sha256,cargo_version:$cargo_version,rustc_version:$rustc_version,platform_profile_sha256:$platform_profile_sha256,platform_os:$platform_os,platform_arch:$platform_arch,batch_id:$batch_id,started_at_unix_ms:$started_at_unix_ms}' \
+    '{schema_version:3,harness_identity:"intrinsic",runner_path:$runner_path,runner_sha256:$runner_sha256,criteria_sha256:$criteria_sha256,criteria_document_sha256:$criteria_document_sha256,criteria_document_path:$criteria_document_path,criteria_git_blob:$criteria_git_blob,criteria_commit:$criteria_commit,contract_sha256:$contract_sha256,source_revision:$source_revision,implementation_tree_sha256:$implementation_tree_sha256,driver_sha256:$driver_sha256,auditor_sha256:$auditor_sha256,cargo_version:$cargo_version,rustc_version:$rustc_version,platform_profile_sha256:$platform_profile_sha256,platform_os:$platform_os,platform_arch:$platform_arch,batch_id:$batch_id,started_at_unix_ms:$started_at_unix_ms}' \
     >"$temporary"
   sync "$temporary" 2>/dev/null || true
   ln "$temporary" "$final"
@@ -85,11 +92,12 @@ write_receipt_v2() {
     refs=$(printf '%s\n' "$refs" | jq -c --arg role "$role" --arg path "$relative" --arg sha256 "$digest" '. + [{role:$role,path:$path,sha256:$sha256}]')
   }
   add_ref "run_start:$run_start"
+  add_ref "criteria_document:$(dirname "$run_start")/$(jq -er '.criteria_document_path' "$run_start")"
   for reference in "$@"; do
     add_ref "$reference"
   done
-  identity=$(jq '{contract_sha256,criteria_sha256,implementation_tree_sha256,source_revision,driver_sha256,auditor_sha256,cargo_version,rustc_version,platform_profile_sha256,platform_os,platform_arch,batch_id}' "$run_start")
-  provenance=$(jq '{harness_identity,runner_path,runner_sha256,criteria_sha256,criteria_git_blob,criteria_commit,started_at_unix_ms}' "$run_start")
+  identity=$(jq '{contract_sha256,criteria_sha256,criteria_document_sha256,implementation_tree_sha256,source_revision,driver_sha256,auditor_sha256,cargo_version,rustc_version,platform_profile_sha256,platform_os,platform_arch,batch_id}' "$run_start")
+  provenance=$(jq '{harness_identity,runner_path,runner_sha256,criteria_sha256,criteria_document_sha256,criteria_document_path,criteria_git_blob,criteria_commit,started_at_unix_ms}' "$run_start")
   mkdir -p "$(dirname "$receipt")"
   jq -n \
     --arg kind "$kind" \
@@ -98,7 +106,7 @@ write_receipt_v2() {
     --argjson refs "$refs" \
     --argjson claims "$claims" \
     --argjson measurements "$measurements" \
-    '{schema_version:2,kind:$kind,status:"PASS",identity:$identity,provenance:$provenance,evidence_refs:$refs,claims:$claims,measurements:$measurements,violations:[]}' \
+    '{schema_version:3,kind:$kind,status:"PASS",identity:$identity,provenance:$provenance,evidence_refs:$refs,claims:$claims,measurements:$measurements,violations:[]}' \
     >"$receipt"
 }
 
@@ -114,7 +122,7 @@ write_platform_batch_v2() {
     digest=$(sha256_file "$path")
     receipts=$(printf '%s\n' "$receipts" | jq -c --arg kind "$kind" --arg path "receipts/$kind.receipt.json" --arg sha256 "$digest" '. + {($kind):{path:$path,sha256:$sha256}}')
   done
-  identity=$(jq '{contract_sha256,criteria_sha256,implementation_tree_sha256,source_revision,driver_sha256,auditor_sha256,cargo_version,rustc_version,platform_profile_sha256,platform_os,platform_arch,batch_id}' "$run_start")
+  identity=$(jq '{contract_sha256,criteria_sha256,criteria_document_sha256,implementation_tree_sha256,source_revision,driver_sha256,auditor_sha256,cargo_version,rustc_version,platform_profile_sha256,platform_os,platform_arch,batch_id}' "$run_start")
   started=$(jq '.started_at_unix_ms' "$run_start")
   completed=$(timestamp_ms)
   jq -n \
@@ -123,7 +131,7 @@ write_platform_batch_v2() {
     --argjson started "$started" \
     --argjson completed "$completed" \
     --argjson receipts "$receipts" \
-    '{schema_version:2,platform_id:$platform_id,status:"PASS",identity:$identity,started_at_unix_ms:$started,completed_at_unix_ms:$completed,receipts:$receipts,violations:[]}' \
+    '{schema_version:3,platform_id:$platform_id,status:"PASS",identity:$identity,started_at_unix_ms:$started,completed_at_unix_ms:$completed,receipts:$receipts,violations:[]}' \
     >"$evidence_root/batch.json"
 }
 

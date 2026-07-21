@@ -159,7 +159,7 @@ enum ProveCommand {
         #[arg(long)]
         report: PathBuf,
     },
-    /// Verify complete macOS and Linux schema-v2 evidence graphs.
+    /// Verify complete macOS and Linux current-schema evidence graphs.
     Aggregate {
         #[arg(long)]
         root: PathBuf,
@@ -197,6 +197,11 @@ enum ContractCommand {
     /// Verify that a contract file exactly matches the embedded contract.
     Verify {
         #[arg(long, default_value = "acceptance/contract.toml")]
+        path: PathBuf,
+    },
+    /// Print the normative and exact-document identities for acceptance criteria.
+    CriteriaIdentity {
+        #[arg(long, default_value = "acceptance/ACCEPTANCE_CRITERIA.md")]
         path: PathBuf,
     },
 }
@@ -556,6 +561,23 @@ fn run_contract(mut args: Vec<OsString>) -> Result<i32> {
                 "{}  {}",
                 acceptance::AcceptanceContract::digest(),
                 path.display()
+            );
+        }
+        ContractCommand::CriteriaIdentity { path } => {
+            let (criteria_sha256, criteria_document_sha256) =
+                acceptance::criteria_file_identity(&path)?;
+            if criteria_sha256 != acceptance::criteria_digest() {
+                bail!(
+                    "normative criteria do not match the criteria embedded in this binary: {}",
+                    path.display()
+                );
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "criteria_sha256": criteria_sha256,
+                    "criteria_document_sha256": criteria_document_sha256,
+                })
             );
         }
     }

@@ -1,11 +1,18 @@
 # cargo-reapi acceptance criteria
 
-Status: **macOS/arm64 empirical qualification passed, acceptance-gap closure pending; Linux/x86_64 qualification pending; publication-grade multi-platform aggregate acceptance not achieved.**
+Status: **macOS/arm64 current-model qualification is not yet established by a passing multi-platform aggregate (historical empirical qualification passed); Linux/x86_64 current-model qualification is not yet established by a passing multi-platform aggregate (preceding-model local qualification passed); publication-grade multi-platform aggregate acceptance not achieved.**
 
 This document is the acceptance authority for cargo-reapi. A benchmark, test
 binary, Moria run, Bro run, or `PASS` line is only partial evidence. The project
 is accepted only when one aggregate proof requires and validates every receipt
 defined below.
+
+The status statement is operational metadata, not a normative acceptance
+criterion. Receipts bind both the normalized criteria digest (with only that
+single top status statement replaced by a fixed marker) and the exact criteria
+document digest, Git blob, and commit active at experiment start. A status-only
+edit cannot relabel an experiment; any change elsewhere in this document
+changes the normative criteria identity and invalidates incompatible receipts.
 
 These criteria must not be weakened to make an implementation pass. A proposed
 change to a criterion must be reviewed as a contract change before the affected

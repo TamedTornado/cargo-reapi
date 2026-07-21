@@ -10,7 +10,38 @@ pub const EMBEDDED_CONTRACT: &str = include_str!("../acceptance/contract.toml");
 pub const EMBEDDED_CRITERIA: &str = include_str!("../acceptance/ACCEPTANCE_CRITERIA.md");
 
 pub fn criteria_digest() -> String {
-    format!("{:x}", Sha256::digest(EMBEDDED_CRITERIA.as_bytes()))
+    criteria_digest_for(EMBEDDED_CRITERIA).expect("embedded criteria have one top status line")
+}
+
+fn criteria_digest_for(document: &str) -> Result<String> {
+    let mut status_lines = 0;
+    let mut normalized = String::with_capacity(document.len());
+    for (index, line) in document.split_inclusive('\n').enumerate() {
+        if line.starts_with("Status:") {
+            status_lines += 1;
+            if index > 2 {
+                bail!("acceptance status must appear at the top of the criteria document");
+            }
+            normalized.push_str("Status: <non-normative qualification state>\n");
+        } else {
+            normalized.push_str(line);
+        }
+    }
+    if status_lines != 1 {
+        bail!("acceptance criteria must contain exactly one status statement");
+    }
+    Ok(format!("{:x}", Sha256::digest(normalized.as_bytes())))
+}
+
+pub fn criteria_file_identity(path: &Path) -> Result<(String, String)> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading acceptance criteria {}", path.display()))?;
+    let document = std::str::from_utf8(&bytes)
+        .with_context(|| format!("acceptance criteria are not UTF-8: {}", path.display()))?;
+    Ok((
+        criteria_digest_for(document)?,
+        format!("{:x}", Sha256::digest(&bytes)),
+    ))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -133,7 +164,7 @@ impl AcceptanceContract {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceptanceContract, criteria_digest};
+    use super::{AcceptanceContract, EMBEDDED_CRITERIA, criteria_digest, criteria_digest_for};
 
     #[test]
     fn embedded_contract_has_no_durability_or_concurrency_escape_clauses() {
@@ -162,5 +193,42 @@ mod tests {
     #[test]
     fn criteria_are_embedded_in_the_binary() {
         assert_eq!(criteria_digest().len(), 64);
+    }
+
+    #[test]
+    fn status_changes_do_not_change_normative_criteria_identity() {
+        let changed = EMBEDDED_CRITERIA.replacen(
+            EMBEDDED_CRITERIA
+                .lines()
+                .find(|line| line.starts_with("Status:"))
+                .expect("status line"),
+            "Status: **a different, non-normative qualification state.**",
+            1,
+        );
+        assert_eq!(
+            criteria_digest_for(EMBEDDED_CRITERIA).expect("original"),
+            criteria_digest_for(&changed).expect("changed status")
+        );
+    }
+
+    #[test]
+    fn normative_changes_do_change_criteria_identity() {
+        let changed = EMBEDDED_CRITERIA.replacen(
+            "The aggregate verifier must reject",
+            "The aggregate verifier should reject",
+            1,
+        );
+        assert_ne!(
+            criteria_digest_for(EMBEDDED_CRITERIA).expect("original"),
+            criteria_digest_for(&changed).expect("changed criteria")
+        );
+    }
+
+    #[test]
+    fn criteria_reject_missing_duplicate_or_late_status_statements() {
+        assert!(criteria_digest_for(&EMBEDDED_CRITERIA.replace("Status:", "State:")).is_err());
+        assert!(criteria_digest_for(&format!("{EMBEDDED_CRITERIA}Status: duplicate\n")).is_err());
+        let late = EMBEDDED_CRITERIA.replacen("Status:", "\n\nStatus:", 1);
+        assert!(criteria_digest_for(&late).is_err());
     }
 }

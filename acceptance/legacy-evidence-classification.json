@@ -14,5 +14,5 @@
     "the aggregate did not recursively bind all raw OS event streams",
     "the portability receipt asserted Linux behavior without a Linux qualification"
   ],
-  "acceptance_use": "Historical context only; excluded from schema-v2 aggregate acceptance"
+  "acceptance_use": "Historical context only; excluded from current-schema aggregate acceptance"
 }

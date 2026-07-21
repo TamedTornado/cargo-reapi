@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::acceptance::{AcceptanceContract, criteria_digest};
 
-pub const EVIDENCE_SCHEMA_VERSION: u32 = 2;
+pub const EVIDENCE_SCHEMA_VERSION: u32 = 3;
 pub const PLATFORM_IDS: &[&str] = &["macos-arm64", "linux-x86_64"];
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -33,6 +33,8 @@ pub struct RunProvenance {
     pub runner_path: String,
     pub runner_sha256: String,
     pub criteria_sha256: String,
+    pub criteria_document_sha256: String,
+    pub criteria_document_path: String,
     pub criteria_git_blob: String,
     pub criteria_commit: String,
     pub started_at_unix_ms: u128,
@@ -42,6 +44,7 @@ pub struct RunProvenance {
 pub struct PlatformIdentity {
     pub contract_sha256: String,
     pub criteria_sha256: String,
+    pub criteria_document_sha256: String,
     pub implementation_tree_sha256: String,
     pub source_revision: String,
     pub driver_sha256: String,
@@ -289,6 +292,9 @@ fn verify_platform_identity(
     if identity.criteria_sha256 != criteria_digest() {
         violations.push("criteria digest does not match the embedded criteria".to_owned());
     }
+    if identity.criteria_document_sha256.trim().is_empty() {
+        violations.push("exact criteria document digest is empty".to_owned());
+    }
     let (os, arch) = match expected_platform {
         "macos-arm64" => ("macos", "aarch64"),
         "linux-x86_64" => ("linux", "x86_64"),
@@ -382,11 +388,18 @@ fn verify_receipt_v2(
     if receipt.provenance.criteria_sha256 != identity.criteria_sha256 {
         violations.push("runner started under a different criteria digest".to_owned());
     }
+    if receipt.provenance.criteria_document_sha256 != identity.criteria_document_sha256 {
+        violations.push("runner started under a different exact criteria document".to_owned());
+    }
     for (name, value) in [
         ("runner_path", &receipt.provenance.runner_path),
         ("runner_sha256", &receipt.provenance.runner_sha256),
         ("criteria_git_blob", &receipt.provenance.criteria_git_blob),
         ("criteria_commit", &receipt.provenance.criteria_commit),
+        (
+            "criteria_document_path",
+            &receipt.provenance.criteria_document_path,
+        ),
     ] {
         if value.trim().is_empty() {
             violations.push(format!("provenance field {name} is empty"));
@@ -405,6 +418,14 @@ fn verify_receipt_v2(
             &mut visited,
             verified_artifacts,
         )?;
+    }
+    let criteria_paths = roles.get("criteria_document");
+    if criteria_paths.is_none_or(|paths| paths.len() != 1) {
+        violations.push("receipt must bind exactly one criteria document".to_owned());
+    } else if let Some(path) = criteria_paths.and_then(|paths| paths.first())
+        && sha256_file(path)? != identity.criteria_document_sha256
+    {
+        violations.push("bound criteria document digest differs from run identity".to_owned());
     }
     for claim in required_claims(expected_kind, &identity.platform_os) {
         let Some(evidence) = receipt.claims.get(*claim) else {
