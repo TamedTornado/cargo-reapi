@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Child, Command, ExitCode, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -263,12 +263,7 @@ fn monitor_command(
             previous_heavy_cpu = heavy_cpu;
         } else if last_progress.elapsed() >= Duration::from_secs(stall_seconds) {
             infrastructure_stall = true;
-            let _ = Command::new("/bin/kill")
-                .args(["-TERM", &format!("-{root_pid}")])
-                .status();
-            let status = child
-                .wait()
-                .context("waiting for stalled command shutdown")?;
+            let status = terminate_process_group(&mut child, root_pid)?;
             exit_code = status.code().unwrap_or(1);
             break;
         }
@@ -333,6 +328,45 @@ fn monitor_command(
         );
     }
     Ok(())
+}
+
+fn terminate_process_group(child: &mut Child, root_pid: u32) -> Result<ExitStatus> {
+    let group = format!("-{root_pid}");
+    let term = Command::new("/bin/kill")
+        .args(["-TERM", "--", &group])
+        .status()
+        .context("sending SIGTERM to stalled process group")?;
+    if !term.success() {
+        child
+            .kill()
+            .context("terminating stalled command after process-group SIGTERM failed")?;
+        return child.wait().context("waiting for stalled command shutdown");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("polling stalled command shutdown")?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let kill = Command::new("/bin/kill")
+        .args(["-KILL", "--", &group])
+        .status()
+        .context("sending SIGKILL to stalled process group")?;
+    if !kill.success() {
+        child
+            .kill()
+            .context("killing stalled command after process-group SIGKILL failed")?;
+    }
+    child.wait().context("waiting for killed stalled command")
 }
 
 fn externally_observed_leases(

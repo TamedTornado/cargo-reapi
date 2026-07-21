@@ -7,7 +7,9 @@ fn cold_resource_receipt_runs_two_distinct_moria_gates_concurrently() {
     assert!(cold_work.contains("run_check_lane lane-a \"$lane_a\" 1"));
     assert!(cold_work.contains("run_check_lane lane-b \"$lane_b\" 2"));
     assert!(cold_work.contains("export CARGO_PROFILE_DEV_DEBUG=\"$debug\""));
-    assert!(cold_work.contains("mkdir -p \"$report_root/lane-a-rustc-trace\" \"$report_root/lane-b-rustc-trace\""));
+    assert!(cold_work.contains(
+        "mkdir -p \"$report_root/lane-a-rustc-trace\" \"$report_root/lane-b-rustc-trace\""
+    ));
     assert!(cold_work.contains("pid_a=$!"));
     assert!(cold_work.contains("pid_b=$!"));
     assert!(cold_work.contains("wait \"$pid_a\""));
