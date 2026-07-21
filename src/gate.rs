@@ -332,28 +332,7 @@ fn gate_key(
     let current_executable = std::env::current_exe()?.canonicalize()?;
     hash_field(&mut hasher, b"cargo-reapi-executable");
     hash_field(&mut hasher, &fs::read(&current_executable)?);
-    let kernel_release = Command::new("uname").arg("-r").output()?;
-    if !kernel_release.status.success() {
-        bail!("uname -r failed while keying the host runtime");
-    }
-    hash_field(&mut hasher, b"kernel-release");
-    hash_field(&mut hasher, &kernel_release.stdout);
-    #[cfg(target_os = "macos")]
-    {
-        let os_build = Command::new("/usr/bin/sw_vers").output()?;
-        if !os_build.status.success() {
-            bail!("sw_vers failed while keying the macOS runtime");
-        }
-        hash_field(&mut hasher, b"macos-runtime");
-        hash_field(&mut hasher, &os_build.stdout);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        hash_field(&mut hasher, b"linux-runtime");
-        hash_field(&mut hasher, &fs::read("/etc/os-release")?);
-    }
-    hash_tool_identity(&mut hasher, "cargo")?;
-    hash_tool_identity(&mut hasher, "rustc")?;
+    hash_host_tools(&mut hasher)?;
     hash_field(&mut hasher, b"sandbox-provider");
     hash_field(
         &mut hasher,
@@ -368,9 +347,48 @@ fn gate_key(
         declared_inputs,
     )?;
     hash_field(&mut hasher, &policy_identity);
+    hash_gate_environment(&mut hasher, workspace, target);
+
+    hash_tree(&mut hasher, workspace, "workspace", target, action_log)?;
+    hash_cargo_configuration(&mut hasher, workspace)?;
+    hash_external_path_dependencies(&mut hasher, cache, workspace, target, action_log)?;
+    hash_declared_inputs(&mut hasher, declared_inputs, workspace, target, action_log)?;
+    let state_key = format!("{:x}", hasher.finalize());
+    let mut exact = Sha256::new();
+    exact.update(b"cargo-reapi-exact-gate-v15\0");
+    hash_field(&mut exact, state_key.as_bytes());
+    for argument in cargo_args {
+        hash_field(&mut exact, argument.to_string_lossy().as_bytes());
+    }
+    Ok(format!("{:x}", exact.finalize()))
+}
+
+fn hash_host_tools(hasher: &mut Sha256) -> Result<()> {
+    let kernel_release = Command::new("uname").arg("-r").output()?;
+    if !kernel_release.status.success() {
+        bail!("uname -r failed while keying the host runtime");
+    }
+    hash_field(hasher, b"kernel-release");
+    hash_field(hasher, &kernel_release.stdout);
+    #[cfg(target_os = "macos")]
+    {
+        let os_build = Command::new("/usr/bin/sw_vers").output()?;
+        if !os_build.status.success() {
+            bail!("sw_vers failed while keying the macOS runtime");
+        }
+        hash_field(hasher, b"macos-runtime");
+        hash_field(hasher, &os_build.stdout);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        hash_field(hasher, b"linux-runtime");
+        hash_field(hasher, &fs::read("/etc/os-release")?);
+    }
+    hash_tool_identity(hasher, "cargo")?;
+    hash_tool_identity(hasher, "rustc")?;
     for tool in ["cc", "clang", "ld"] {
         if resolve_executable(tool).is_some() {
-            hash_tool_identity(&mut hasher, tool)?;
+            hash_tool_identity(hasher, tool)?;
         }
     }
     #[cfg(target_os = "macos")]
@@ -383,29 +401,38 @@ fn gate_key(
         if !output.status.success() {
             bail!("xcrun {} failed while keying the SDK", arguments.join(" "));
         }
-        hash_field(&mut hasher, &output.stdout);
+        hash_field(hasher, &output.stdout);
         if arguments == ["--find", "clang"] {
             let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
             hash_field(
-                &mut hasher,
+                hasher,
                 &fs::read(&path)
                     .with_context(|| format!("hashing SDK linker identity {}", path.display()))?,
             );
         }
     }
+    Ok(())
+}
+
+fn hash_gate_environment(hasher: &mut Sha256, workspace: &Path, target: &Path) {
     let mut gate_environment = std::env::vars_os()
         .filter(|(name, _)| is_gate_environment_key(&name.to_string_lossy()))
         .collect::<Vec<_>>();
     gate_environment.sort_by(|(left, _), (right, _)| left.cmp(right));
     for (name, value) in gate_environment {
-        hash_field(&mut hasher, name.to_string_lossy().as_bytes());
+        hash_field(hasher, name.to_string_lossy().as_bytes());
         let value = normalize_gate_text(&value.to_string_lossy(), workspace, target);
-        hash_field(&mut hasher, value.as_bytes());
+        hash_field(hasher, value.as_bytes());
     }
+}
 
-    hash_tree(&mut hasher, workspace, "workspace", target, action_log)?;
-    hash_cargo_configuration(&mut hasher, workspace)?;
-    hash_external_path_dependencies(&mut hasher, cache, workspace, target, action_log)?;
+fn hash_declared_inputs(
+    hasher: &mut Sha256,
+    declared_inputs: &[PathBuf],
+    workspace: &Path,
+    target: &Path,
+    action_log: &Path,
+) -> Result<()> {
     let mut declared_inputs = declared_inputs.to_vec();
     declared_inputs.sort();
     declared_inputs.dedup();
@@ -417,28 +444,21 @@ fn gate_key(
         };
         if input.is_dir() {
             hash_tree(
-                &mut hasher,
+                hasher,
                 &input,
                 &format!("declared-input:{}", input.display()),
                 target,
                 action_log,
             )?;
         } else if input.is_file() {
-            hash_field(&mut hasher, b"declared-input-file");
-            hash_field(&mut hasher, input.to_string_lossy().as_bytes());
-            hash_field(&mut hasher, &fs::read(&input)?);
+            hash_field(hasher, b"declared-input-file");
+            hash_field(hasher, input.to_string_lossy().as_bytes());
+            hash_field(hasher, &fs::read(&input)?);
         } else {
             bail!("declared input does not exist: {}", input.display());
         }
     }
-    let state_key = format!("{:x}", hasher.finalize());
-    let mut exact = Sha256::new();
-    exact.update(b"cargo-reapi-exact-gate-v15\0");
-    hash_field(&mut exact, state_key.as_bytes());
-    for argument in cargo_args {
-        hash_field(&mut exact, argument.to_string_lossy().as_bytes());
-    }
-    Ok(format!("{:x}", exact.finalize()))
+    Ok(())
 }
 
 fn hash_tree(
@@ -1088,10 +1108,10 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn resign(path: &Path, _resource_ledger: &Path) -> Result<()> {
+fn resign(path: &Path, resource_ledger: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let _lease = ResourceLease::acquire_snapshot_signing_at(_resource_ledger)?;
+        let _lease = ResourceLease::acquire_snapshot_signing_at(resource_ledger)?;
         let output = Command::new("/usr/bin/codesign")
             .args(["--force", "--sign", "-"])
             .arg(path)
@@ -1106,7 +1126,7 @@ fn resign(path: &Path, _resource_ledger: &Path) -> Result<()> {
         }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = path;
+    let _ = (path, resource_ledger);
     Ok(())
 }
 
@@ -1160,7 +1180,7 @@ fn clone_tree_with_preference(
     fs::create_dir_all(destination)?;
     if preference == ClonePreference::Portable {
         copy_tree_portable(source, destination)?;
-        record_clone_trace(CloneTraceEvent {
+        record_clone_trace(&CloneTraceEvent {
             schema_version: 1,
             at_unix_ms: unix_ms(),
             pid: std::process::id(),
@@ -1212,7 +1232,7 @@ fn clone_tree_with_preference(
         Err(error) => error.to_string(),
     };
     if attempt_succeeded {
-        record_clone_trace(CloneTraceEvent {
+        record_clone_trace(&CloneTraceEvent {
             schema_version: 1,
             at_unix_ms: unix_ms(),
             pid: std::process::id(),
@@ -1230,7 +1250,7 @@ fn clone_tree_with_preference(
         return Ok(CloneMethod::CopyOnWrite);
     }
     copy_tree_portable(source, destination)?;
-    record_clone_trace(CloneTraceEvent {
+    record_clone_trace(&CloneTraceEvent {
         schema_version: 1,
         at_unix_ms: unix_ms(),
         pid: std::process::id(),
@@ -1248,7 +1268,7 @@ fn clone_tree_with_preference(
     Ok(CloneMethod::PortableCopy)
 }
 
-fn record_clone_trace(event: CloneTraceEvent) -> Result<()> {
+fn record_clone_trace(event: &CloneTraceEvent) -> Result<()> {
     let Some(path) = std::env::var_os("CARGO_REAPI_CLONE_TRACE").map(PathBuf::from) else {
         return Ok(());
     };

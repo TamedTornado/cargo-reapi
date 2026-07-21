@@ -13,9 +13,10 @@ pub struct ResourceLease {
 
 impl ResourceLease {
     pub fn acquire(native_link: bool) -> Result<Self> {
-        let lease_root = std::env::var_os("CARGO_REAPI_RESOURCE_LEDGER")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("cargo-reapi-resource-ledger-v1"));
+        let lease_root = std::env::var_os("CARGO_REAPI_RESOURCE_LEDGER").map_or_else(
+            || std::env::temp_dir().join("cargo-reapi-resource-ledger-v1"),
+            std::path::PathBuf::from,
+        );
         Self::acquire_at(&lease_root, native_link)
     }
 

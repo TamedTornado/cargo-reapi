@@ -219,7 +219,7 @@ fn main() -> ExitCode {
 fn run() -> Result<i32> {
     let args: Vec<OsString> = env::args_os().collect();
     if env::var_os("CARGO_REAPI_RUSTC_QUERY_SHIM").is_some() {
-        return query::run_shim(args);
+        return query::run_shim(&args);
     }
     if env::var_os("CARGO_REAPI_LINKER_CAPTURE").is_some() {
         return run_linker_capture(args);
@@ -237,12 +237,17 @@ fn run() -> Result<i32> {
     let cli = Cli::parse_from(args);
     validate_cli(&cli)?;
 
+    run_cli(&cli)
+}
+
+fn run_cli(cli: &Cli) -> Result<i32> {
     let executable = env::current_exe().context("locating cargo-reapi executable")?;
     let workspace_root = env::current_dir().context("locating Cargo workspace root")?;
     let target_root = env::var_os("CARGO_TARGET_DIR")
         .map_or_else(|| workspace_root.join("target"), PathBuf::from);
     let action_log = cli
         .action_log
+        .clone()
         .unwrap_or_else(|| PathBuf::from("target/cargo-reapi/actions.jsonl"));
     let action_log_for_snapshot = action_log.clone();
     let cache_dir = cli.cache_dir.clone();
@@ -326,28 +331,7 @@ fn run() -> Result<i32> {
             )
             .env("CARGO_REAPI_CACHE_DIR", cache_dir);
     }
-    for (name, value) in [
-        (
-            "CARGO_REAPI_REWRAPPER",
-            cli.rewrapper.map(PathBuf::into_os_string),
-        ),
-        (
-            "CARGO_REAPI_REWRAPPER_CFG",
-            cli.rewrapper_cfg.map(PathBuf::into_os_string),
-        ),
-        (
-            "CARGO_REAPI_RECLIENT_STAGING_DIR",
-            cli.reclient_staging_dir.map(PathBuf::into_os_string),
-        ),
-        (
-            "CARGO_REAPI_RECLIENT_PLATFORM",
-            cli.reclient_platform.map(OsString::from),
-        ),
-    ] {
-        if let Some(value) = value {
-            cargo.env(name, value);
-        }
-    }
+    configure_reclient_environment(&mut cargo, cli);
     let status = cargo.status().context("starting Cargo")?;
     complete_gate_snapshot(
         status.success(),
@@ -355,6 +339,37 @@ fn run() -> Result<i32> {
         &action_log_for_snapshot,
     )?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn configure_reclient_environment(cargo: &mut Command, cli: &Cli) {
+    for (name, value) in [
+        (
+            "CARGO_REAPI_REWRAPPER",
+            cli.rewrapper
+                .as_ref()
+                .map(|path| path.as_os_str().to_owned()),
+        ),
+        (
+            "CARGO_REAPI_REWRAPPER_CFG",
+            cli.rewrapper_cfg
+                .as_ref()
+                .map(|path| path.as_os_str().to_owned()),
+        ),
+        (
+            "CARGO_REAPI_RECLIENT_STAGING_DIR",
+            cli.reclient_staging_dir
+                .as_ref()
+                .map(|path| path.as_os_str().to_owned()),
+        ),
+        (
+            "CARGO_REAPI_RECLIENT_PLATFORM",
+            cli.reclient_platform.as_ref().map(OsString::from),
+        ),
+    ] {
+        if let Some(value) = value {
+            cargo.env(name, value);
+        }
+    }
 }
 
 fn validate_cli(cli: &Cli) -> Result<()> {

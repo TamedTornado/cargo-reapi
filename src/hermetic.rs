@@ -326,6 +326,15 @@ fn sort_string_arrays(value: &mut serde_json::Value) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+struct PolicyPaths<'a> {
+    workspace: &'a Path,
+    target: &'a Path,
+    cache: &'a Path,
+    action_log: &'a Path,
+    temporary: &'a Path,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn build_policy(
     workspace: &Path,
     target: &Path,
@@ -335,26 +344,87 @@ fn build_policy(
     control_temporary: &Path,
     explicit_inputs: &[PathBuf],
 ) -> Result<SrtPolicy> {
-    let mut readable = package_roots(workspace, cache)?;
+    let paths = PolicyPaths {
+        workspace,
+        target,
+        cache,
+        action_log,
+        temporary,
+    };
+    let readable = readable_paths(&paths, explicit_inputs)?;
+    let writable = writable_paths(&paths)?;
+    Ok(SrtPolicy {
+        network: SrtNetworkPolicy {
+            allowed_domains: Vec::new(),
+            denied_domains: Vec::new(),
+            allow_local_binding: false,
+            // srt's network-deny mux uses a private Unix socket beneath its
+            // TMPDIR. No host or service socket is exposed to the build.
+            allow_unix_sockets: vec![control_temporary.to_string_lossy().into_owned()],
+            // Linux bubblewrap creates a private network namespace and the
+            // qualification container adds an independent no-network boundary.
+            #[cfg(target_os = "linux")]
+            allow_all_unix_sockets: true,
+            #[cfg(not(target_os = "linux"))]
+            allow_all_unix_sockets: false,
+        },
+        filesystem: SrtFilesystemPolicy {
+            deny_read: vec!["/".to_owned()],
+            allow_read: paths_to_strings(readable),
+            allow_write: paths_to_strings(writable),
+            deny_write: Vec::new(),
+        },
+        enable_weaker_nested_sandbox: false,
+        enable_weaker_network_isolation: false,
+        allow_apple_events: false,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn readable_paths(
+    paths: &PolicyPaths<'_>,
+    explicit_inputs: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>> {
+    let mut readable = package_roots(paths.workspace, paths.cache)?;
     #[cfg(target_os = "linux")]
     {
         // A root package contributes `workspace` through cargo metadata. Do
         // not let that broad read-only bind undo the target exclusion below.
         // Nested workspace packages that are not ancestors of target remain
         // independently readable.
-        remove_readonly_ancestors_of_writable_path(&mut readable, target);
-        readable.extend(workspace_inputs_excluding_target(workspace, target)?);
+        remove_readonly_ancestors_of_writable_path(&mut readable, paths.target);
+        readable.extend(workspace_inputs_excluding_target(
+            paths.workspace,
+            paths.target,
+        )?);
     }
     #[cfg(not(target_os = "linux"))]
-    readable.insert(workspace.to_path_buf());
+    readable.insert(paths.workspace.to_path_buf());
     readable.extend([
-        target.to_path_buf(),
-        cache.to_path_buf(),
-        action_log.to_path_buf(),
-        temporary.to_path_buf(),
+        paths.target.to_path_buf(),
+        paths.cache.to_path_buf(),
+        paths.action_log.to_path_buf(),
+        paths.temporary.to_path_buf(),
     ]);
-    readable.extend(cargo_configuration_files(workspace));
+    readable.extend(cargo_configuration_files(paths.workspace));
+    extend_system_readable(&mut readable);
+    extend_toolchain_readable(&mut readable, paths.workspace)?;
+    for input in explicit_inputs {
+        let input = if input.is_absolute() {
+            input.clone()
+        } else {
+            paths.workspace.join(input)
+        };
+        if !input.exists() {
+            bail!("declared input does not exist: {}", input.display());
+        }
+        readable.insert(canonical_or_absolute(&input)?);
+    }
+    Ok(readable)
+}
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn extend_system_readable(readable: &mut BTreeSet<PathBuf>) {
     for system_root in ["/System", "/usr", "/bin", "/sbin", "/dev"] {
         let path = PathBuf::from(system_root);
         if path.exists() {
@@ -390,7 +460,10 @@ fn build_policy(
             readable.insert(canonical.join("xcrun_db-*"));
         }
     }
+}
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn extend_toolchain_readable(readable: &mut BTreeSet<PathBuf>, workspace: &Path) -> Result<()> {
     if let Some(cargo_home) = cargo_home() {
         let cargo_home = canonical_or_absolute(&cargo_home)?;
         for relative in ["registry", "git", "config", "config.toml"] {
@@ -426,23 +499,16 @@ fn build_policy(
     if let Some(trace) = env::var_os("CARGO_REAPI_RUSTC_TRACE").map(PathBuf::from) {
         readable.insert(canonical_or_absolute(&trace)?);
     }
-    for input in explicit_inputs {
-        let input = if input.is_absolute() {
-            input.clone()
-        } else {
-            workspace.join(input)
-        };
-        if !input.exists() {
-            bail!("declared input does not exist: {}", input.display());
-        }
-        readable.insert(canonical_or_absolute(&input)?);
-    }
+    Ok(())
+}
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn writable_paths(paths: &PolicyPaths<'_>) -> Result<BTreeSet<PathBuf>> {
     let mut writable = BTreeSet::from([
-        target.to_path_buf(),
-        cache.to_path_buf(),
-        action_log.to_path_buf(),
-        temporary.to_path_buf(),
+        paths.target.to_path_buf(),
+        paths.cache.to_path_buf(),
+        paths.action_log.to_path_buf(),
+        paths.temporary.to_path_buf(),
     ]);
     #[cfg(target_os = "macos")]
     {
@@ -462,36 +528,7 @@ fn build_policy(
         writable.insert(cargo_home.join(".package-cache"));
         writable.insert(cargo_home.join(".package-cache-mutate"));
     }
-
-    Ok(SrtPolicy {
-        network: SrtNetworkPolicy {
-            allowed_domains: Vec::new(),
-            denied_domains: Vec::new(),
-            allow_local_binding: false,
-            // srt's network-deny mux uses a private Unix socket beneath its
-            // TMPDIR. No host or service socket is exposed to the build.
-            allow_unix_sockets: vec![control_temporary.to_string_lossy().into_owned()],
-            // Linux bubblewrap creates a private network namespace and the
-            // filesystem policy hides host service sockets. Avoid srt's
-            // second, capability-bearing user namespace: it cannot be nested
-            // after bubblewrap's mandatory `--cap-drop ALL` on stock kernels.
-            // The qualification container adds an independent `--network
-            // none` boundary and exposes no host Unix sockets.
-            #[cfg(target_os = "linux")]
-            allow_all_unix_sockets: true,
-            #[cfg(not(target_os = "linux"))]
-            allow_all_unix_sockets: false,
-        },
-        filesystem: SrtFilesystemPolicy {
-            deny_read: vec!["/".to_owned()],
-            allow_read: paths_to_strings(readable),
-            allow_write: paths_to_strings(writable),
-            deny_write: Vec::new(),
-        },
-        enable_weaker_nested_sandbox: false,
-        enable_weaker_network_isolation: false,
-        allow_apple_events: false,
-    })
+    Ok(writable)
 }
 
 #[cfg(target_os = "linux")]

@@ -462,6 +462,16 @@ struct PopulationMember {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(transparent)]
+struct ProofCheck(bool);
+
+impl From<bool> for ProofCheck {
+    fn from(value: bool) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct PopulationProof {
     schema_version: u32,
     contract_sha256: String,
@@ -469,15 +479,15 @@ pub struct PopulationProof {
     storage_profile: String,
     expected_minimum_members: usize,
     observed_members: usize,
-    all_started_before_any_completed: bool,
-    all_targets_empty_at_start: bool,
+    all_started_before_any_completed: ProofCheck,
+    all_targets_empty_at_start: ProofCheck,
     elapsed_ms: u128,
     deadline_ms: u128,
-    performance_reference_met: bool,
+    performance_reference_met: ProofCheck,
     performance_exceedance_ms: u128,
     member_action_proofs: Vec<ActionLogProof>,
     violations: Vec<String>,
-    passed: bool,
+    passed: ProofCheck,
 }
 
 #[derive(Debug, Serialize)]
@@ -702,14 +712,14 @@ impl PopulationProof {
             storage_profile: storage_profile.name().to_owned(),
             expected_minimum_members: expected,
             observed_members: evidence.members.len(),
-            all_started_before_any_completed: simultaneous,
-            all_targets_empty_at_start,
+            all_started_before_any_completed: simultaneous.into(),
+            all_targets_empty_at_start: all_targets_empty_at_start.into(),
             elapsed_ms,
             deadline_ms,
-            performance_reference_met,
+            performance_reference_met: performance_reference_met.into(),
             performance_exceedance_ms,
             member_action_proofs,
-            passed: violations.is_empty(),
+            passed: violations.is_empty().into(),
             violations,
         })
     }
@@ -724,7 +734,7 @@ impl PopulationProof {
             serde_json::to_vec_pretty(self).context("serializing population proof")?,
         )
         .with_context(|| format!("writing population proof {}", path.display()))?;
-        if !self.passed {
+        if !self.passed.0 {
             bail!(
                 "population evidence failed the embedded acceptance contract; report: {}",
                 path.display()
@@ -1115,8 +1125,8 @@ mod tests {
         .expect("write evidence");
         let proof = PopulationProof::verify(&evidence, PopulationKind::Five, StorageProfile::Ssd)
             .expect("proof");
-        assert!(!proof.passed);
-        assert!(!proof.all_started_before_any_completed);
+        assert!(!proof.passed.0);
+        assert!(!proof.all_started_before_any_completed.0);
         assert_eq!(proof.expected_minimum_members, 5);
     }
 
@@ -1162,13 +1172,13 @@ mod tests {
             StorageProfile::Rotational,
         )
         .expect("rotational proof");
-        assert!(ssd.passed);
+        assert!(ssd.passed.0);
         assert_eq!(ssd.deadline_ms, 60_000);
-        assert!(!ssd.performance_reference_met);
+        assert!(!ssd.performance_reference_met.0);
         assert_eq!(ssd.performance_exceedance_ms, 209_194);
-        assert!(rotational.passed);
+        assert!(rotational.passed.0);
         assert_eq!(rotational.deadline_ms, 300_000);
-        assert!(rotational.performance_reference_met);
+        assert!(rotational.performance_reference_met.0);
         let contract = AcceptanceContract::embedded().expect("contract");
         assert_eq!(
             population_deadline_ms(&contract, PopulationKind::Five, StorageProfile::Rotational)

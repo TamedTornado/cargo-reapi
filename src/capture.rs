@@ -95,6 +95,12 @@ pub struct PreparedOutput {
     pub actual_path: PathBuf,
 }
 
+struct PreparedPaths {
+    output_files: Vec<PathBuf>,
+    outputs: Vec<String>,
+    working_directory: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CaptureRoots {
     workspace: PathBuf,
@@ -121,28 +127,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         record_path_mappings(&roots.path_mappings())?;
     }
     let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots)?;
-    let output_files = invocation.output_files()?;
-    let normalized_outputs = output_files
-        .iter()
-        .map(|path| roots.normalize(path, &invocation.cwd))
-        .collect::<Result<Vec<_>, _>>();
-    let outputs = match normalized_outputs {
-        Ok(outputs) => outputs,
-        Err(error) => {
-            eligibility_reasons.push(error.to_string());
-            Vec::new()
-        }
-    };
-    if outputs.is_empty() {
-        eligibility_reasons.push("action has no declared outputs".to_owned());
-    }
-    let working_directory = match roots.normalize(&invocation.cwd, &invocation.cwd) {
-        Ok(path) => path,
-        Err(error) => {
-            eligibility_reasons.push(error.to_string());
-            display(&invocation.cwd)
-        }
-    };
+    let paths = prepare_paths(invocation, &roots, &mut eligibility_reasons)?;
     let toolchain = toolchain_identity(&invocation.compiler)?;
     let platform = PlatformIdentity {
         os: env::consts::OS,
@@ -168,7 +153,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
             os: platform.os,
             arch: platform.arch,
         },
-        working_directory: working_directory.clone(),
+        working_directory: paths.working_directory.clone(),
         arguments: arguments.clone(),
         environment: key_environment.clone(),
         inputs: inputs
@@ -179,7 +164,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
                 size_bytes: input.size_bytes,
             })
             .collect(),
-        outputs: outputs.clone(),
+        outputs: paths.outputs.clone(),
     };
     let key = action_key(&deterministic_action)?;
     let cache_eligibility = RemoteEligibility::from_reasons(eligibility_reasons.clone());
@@ -199,7 +184,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         platform,
         remote_eligibility: RemoteEligibility::from_reasons(eligibility_reasons),
         cache_eligibility,
-        working_directory,
+        working_directory: paths.working_directory,
         crate_name: invocation.crate_name().map(lossy),
         arguments,
         environment,
@@ -209,15 +194,46 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
             .out_dir()
             .as_deref()
             .map(|path| roots.normalize_text(&display(path))),
-        output_files: outputs
+        output_files: paths
+            .outputs
             .into_iter()
-            .zip(output_files)
+            .zip(paths.output_files)
             .map(|(logical_path, actual_path)| PreparedOutput {
                 logical_path,
                 actual_path: absolute(&actual_path, &invocation.cwd),
             })
             .collect(),
         path_mappings: roots.path_mappings(),
+    })
+}
+
+fn prepare_paths(
+    invocation: &RustcInvocation,
+    roots: &CaptureRoots,
+    eligibility_reasons: &mut Vec<String>,
+) -> Result<PreparedPaths> {
+    let output_files = invocation.output_files()?;
+    let outputs = output_files
+        .iter()
+        .map(|path| roots.normalize(path, &invocation.cwd))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| {
+            eligibility_reasons.push(error.to_string());
+            Vec::new()
+        });
+    if outputs.is_empty() {
+        eligibility_reasons.push("action has no declared outputs".to_owned());
+    }
+    let working_directory = roots
+        .normalize(&invocation.cwd, &invocation.cwd)
+        .unwrap_or_else(|error| {
+            eligibility_reasons.push(error.to_string());
+            display(&invocation.cwd)
+        });
+    Ok(PreparedPaths {
+        output_files,
+        outputs,
+        working_directory,
     })
 }
 

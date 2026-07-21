@@ -281,8 +281,7 @@ fn resolve_real_linker(invocation: &RustcInvocation) -> Result<PathBuf> {
 
 pub fn default_linker_for_sandbox() -> Result<PathBuf> {
     let candidate = std::env::var_os("RUSTC_LINKER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/usr/bin/cc"));
+        .map_or_else(|| PathBuf::from("/usr/bin/cc"), PathBuf::from);
     resolve_linker_candidate(&candidate)
 }
 

@@ -46,7 +46,7 @@ pub fn cargo_metadata_output(
         .context("running compiler-free Cargo metadata")
 }
 
-pub fn run_shim(arguments: Vec<OsString>) -> Result<i32> {
+pub fn run_shim(arguments: &[OsString]) -> Result<i32> {
     let compiler = PathBuf::from(
         env::var_os("CARGO_REAPI_RUSTC_QUERY_COMPILER")
             .context("query shim is missing its compiler")?,

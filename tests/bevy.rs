@@ -100,7 +100,12 @@ fn test_binary(root: &Path) -> std::path::PathBuf {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("runtime-") && !name.ends_with(".d"))
+                .is_some_and(|name| {
+                    name.starts_with("runtime-")
+                        && !Path::new(name)
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("d"))
+                })
         })
         .filter(|path| {
             #[cfg(unix)]
@@ -491,6 +496,72 @@ fn stop_os_compiler_observer(_observer: ()) -> PathBuf {
     PathBuf::new()
 }
 
+fn verify_restored_against_fresh(
+    consumer: &Path,
+    restored_behavior: &(String, String),
+    restored_test_list: &Output,
+    restored_test_behavior: &Output,
+    producer_test_list: &Output,
+) -> ((String, String), Output, Output) {
+    fs::remove_dir_all(consumer.join("target")).expect("remove restored target before control");
+    fresh_control(consumer);
+    let fresh_behavior = run_fixture(consumer);
+    let fresh_test = test_binary(consumer);
+    let fresh_test_list = run_test_binary(&fresh_test, &["--list"]);
+    let fresh_test_behavior = run_test_binary(&fresh_test, &["--nocapture"]);
+    assert_eq!(restored_behavior, &fresh_behavior);
+    assert_eq!(restored_test_list.status, fresh_test_list.status);
+    assert_eq!(restored_test_list.stdout, fresh_test_list.stdout);
+    assert_eq!(restored_test_list.stderr, fresh_test_list.stderr);
+    assert_eq!(restored_test_behavior.status, fresh_test_behavior.status);
+    assert_eq!(
+        normalized_test_stdout(&restored_test_behavior.stdout),
+        normalized_test_stdout(&fresh_test_behavior.stdout)
+    );
+    assert_eq!(restored_test_behavior.stderr, fresh_test_behavior.stderr);
+    assert_eq!(producer_test_list.stdout, fresh_test_list.stdout);
+    verify_signature(&consumer.join("target/debug/cargo-reapi-bevy-fixture"));
+    verify_signature(&fresh_test);
+    (fresh_behavior, fresh_test_list, fresh_test_behavior)
+}
+
+fn assert_consumer_snapshot_hits(logs: &[String], trace: &Path, consumer: &Path) {
+    for actions in logs {
+        let actions = actions
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("consumer action"))
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0]["execution"], "gate-snapshot-hit");
+    }
+    assert_eq!(observed_compiler_actions(trace, consumer), 0);
+}
+
+fn assert_relocated_behavior(
+    producer_behavior: &(String, String),
+    consumer_behavior: &(String, String),
+    consumer: &Path,
+) {
+    assert_eq!(producer_behavior.1, consumer_behavior.1);
+    let (embedded_path, answer) = consumer_behavior
+        .0
+        .trim()
+        .rsplit_once(':')
+        .expect("fixture output fields");
+    assert_eq!(answer, "42");
+    assert_eq!(
+        fs::canonicalize(embedded_path).expect("embedded consumer path"),
+        fs::canonicalize(consumer).expect("consumer path")
+    );
+    let producer_answer = producer_behavior
+        .0
+        .trim()
+        .rsplit_once(':')
+        .expect("producer output fields")
+        .1;
+    assert_eq!(producer_answer, answer);
+}
+
 #[test]
 #[ignore = "explicit pinned-Bevy acceptance proof"]
 fn bevy_linked_artifact_restores_after_producer_deletion() {
@@ -530,15 +601,7 @@ fn bevy_linked_artifact_restores_after_producer_deletion() {
     let (warm_elapsed, consumer_logs) =
         build_application_and_tests(&consumer, cache.path(), trace.path(), "consumer");
     let os_proof = stop_os_compiler_observer(os_observer);
-    for actions in &consumer_logs {
-        let actions = actions
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("consumer action"))
-            .collect::<Vec<_>>();
-        assert_eq!(actions.len(), 1, "{actions:?}");
-        assert_eq!(actions[0]["execution"], "gate-snapshot-hit");
-    }
-    assert_eq!(observed_compiler_actions(trace.path(), &consumer), 0);
+    assert_consumer_snapshot_hits(&consumer_logs, trace.path(), &consumer);
 
     let consumer_behavior = run_fixture(&consumer);
     let consumer_test = test_binary(&consumer);
@@ -546,46 +609,17 @@ fn bevy_linked_artifact_restores_after_producer_deletion() {
     let restored_test_behavior = run_test_binary(&consumer_test, &["--nocapture"]);
     assert!(restored_test_list.status.success());
     assert!(restored_test_behavior.status.success());
-    assert_eq!(producer_behavior.1, consumer_behavior.1);
-    let output = &consumer_behavior.0;
-    let (embedded_path, answer) = output
-        .trim()
-        .rsplit_once(':')
-        .expect("fixture output fields");
-    assert_eq!(answer, "42");
-    assert_eq!(
-        fs::canonicalize(embedded_path).expect("embedded consumer path"),
-        fs::canonicalize(&consumer).expect("consumer path")
-    );
-    let producer_answer = producer_behavior
-        .0
-        .trim()
-        .rsplit_once(':')
-        .expect("producer output fields")
-        .1;
-    assert_eq!(producer_answer, answer);
+    assert_relocated_behavior(&producer_behavior, &consumer_behavior, &consumer);
     verify_signature(&consumer.join("target/debug/cargo-reapi-bevy-fixture"));
     verify_signature(&consumer_test);
 
-    fs::remove_dir_all(consumer.join("target")).expect("remove restored target before control");
-    fresh_control(&consumer);
-    let fresh_behavior = run_fixture(&consumer);
-    let fresh_test = test_binary(&consumer);
-    let fresh_test_list = run_test_binary(&fresh_test, &["--list"]);
-    let fresh_test_behavior = run_test_binary(&fresh_test, &["--nocapture"]);
-    assert_eq!(consumer_behavior, fresh_behavior);
-    assert_eq!(restored_test_list.status, fresh_test_list.status);
-    assert_eq!(restored_test_list.stdout, fresh_test_list.stdout);
-    assert_eq!(restored_test_list.stderr, fresh_test_list.stderr);
-    assert_eq!(restored_test_behavior.status, fresh_test_behavior.status);
-    assert_eq!(
-        normalized_test_stdout(&restored_test_behavior.stdout),
-        normalized_test_stdout(&fresh_test_behavior.stdout)
+    let (fresh_behavior, fresh_test_list, fresh_test_behavior) = verify_restored_against_fresh(
+        &consumer,
+        &consumer_behavior,
+        &restored_test_list,
+        &restored_test_behavior,
+        &producer_test_list,
     );
-    assert_eq!(restored_test_behavior.stderr, fresh_test_behavior.stderr);
-    assert_eq!(producer_test_list.stdout, fresh_test_list.stdout);
-    verify_signature(&consumer.join("target/debug/cargo-reapi-bevy-fixture"));
-    verify_signature(&fresh_test);
 
     if let Some(report) = acceptance_report {
         if let Some(parent) = report.parent() {

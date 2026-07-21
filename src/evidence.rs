@@ -498,440 +498,483 @@ fn verify_receipt_semantics(
     roles: &BTreeMap<String, Vec<PathBuf>>,
     violations: &mut Vec<String>,
 ) -> Result<()> {
-    let read = |role: &str| -> Result<serde_json::Value> {
-        let path = roles
-            .get(role)
-            .and_then(|paths| paths.first())
-            .with_context(|| format!("semantic evidence role {role} is absent"))?;
-        serde_json::from_slice(&fs::read(path)?)
-            .with_context(|| format!("parsing semantic evidence {}", path.display()))
-    };
-    let require_pass = |role: &str, violations: &mut Vec<String>| -> Result<serde_json::Value> {
-        let report = read(role)?;
-        if report.get("passed").and_then(serde_json::Value::as_bool) != Some(true)
-            || report
-                .get("violations")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|items| !items.is_empty())
-        {
-            violations.push(format!("{role} does not report a clean pass"));
-        }
-        Ok(report)
-    };
     match kind {
-        "environment" => {
-            let report = require_pass("environment_report", violations)?;
-            let platform = require_pass("platform_environment", violations)?;
-            if report
-                .get("storage_profile")
-                .and_then(serde_json::Value::as_str)
-                != Some("ssd")
-            {
-                violations.push("environment is not the required SSD qualification".to_owned());
-            }
-            for field in ["sandbox_provider_identity_sha256", "rustc_verbose_version"] {
-                if report
-                    .get(field)
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(str::is_empty)
-                {
-                    violations.push(format!("environment field {field} is absent"));
-                }
-            }
-            for field in [
-                "sandbox_mechanism",
-                "process_observer",
-                "kernel",
-                "cargo",
-                "rustc",
-            ] {
-                if platform
-                    .get(field)
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(str::is_empty)
-                {
-                    violations.push(format!("platform environment field {field} is absent"));
-                }
-            }
-            if report
-                .get("platform_os")
-                .and_then(serde_json::Value::as_str)
-                == Some("linux")
-                && (!roles.contains_key("cache_filesystem")
-                    || !roles.contains_key("worktree_filesystem")
-                    || !roles.contains_key("container_image_inspect")
-                    || !roles.contains_key("qualification_container_inspect")
-                    || !roles.contains_key("host_userns_policy_before")
-                    || !roles.contains_key("host_userns_policy_during"))
-            {
-                violations
-                    .push("Linux environment lacks cache/worktree filesystem evidence".to_owned());
-            }
-            if report
-                .get("platform_os")
-                .and_then(serde_json::Value::as_str)
-                == Some("linux")
-            {
-                let during = roles
-                    .get("host_userns_policy_during")
-                    .and_then(|paths| paths.first())
-                    .map(fs::read_to_string)
-                    .transpose()?
-                    .unwrap_or_default();
-                if during.trim() != "0" {
-                    violations.push(
-                        "Linux nested user-namespace policy was not qualified in fail-closed mode"
-                            .to_owned(),
-                    );
-                }
-                let container = read("qualification_container_inspect")?;
-                let host_config = container
-                    .as_array()
-                    .and_then(|items| items.first())
-                    .and_then(|item| item.get("HostConfig"));
-                let security_options = host_config
-                    .and_then(|config| config.get("SecurityOpt"))
-                    .and_then(serde_json::Value::as_array);
-                if host_config
-                    .and_then(|config| config.get("NetworkMode"))
-                    .and_then(serde_json::Value::as_str)
-                    != Some("none")
-                    || host_config
-                        .and_then(|config| config.get("Privileged"))
-                        .and_then(serde_json::Value::as_bool)
-                        != Some(false)
-                    || host_config
-                        .and_then(|config| config.get("CapDrop"))
-                        .and_then(serde_json::Value::as_array)
-                        .is_none_or(|caps| caps.iter().all(|cap| cap.as_str() != Some("ALL")))
-                    || security_options.is_none_or(|options| {
-                        options.iter().all(|option| {
-                            option
-                                .as_str()
-                                .is_none_or(|value| !value.contains("no-new-privileges"))
-                        })
-                    })
-                {
-                    violations
-                        .push("Linux outer qualification container is not fail-closed".to_owned());
-                }
-            }
-        }
-        "adversarial" => {
-            let audit = require_pass("exact_mutation_os_audit", violations)?;
-            let expected = BTreeSet::from([
-                "adversarial_app".to_owned(),
-                "leaf".to_owned(),
-                "mid".to_owned(),
-            ]);
-            let set = json_string_set(&audit, "os_derived_crates");
-            if set != expected || json_string_set(&audit, "wrapper_derived_crates") != expected {
-                violations.push(format!(
-                    "exact mutation attribution is {set:?}, expected {expected:?}"
-                ));
-            }
-            if audit.get("expected").and_then(serde_json::Value::as_str) != Some("attribution")
-                || audit
-                    .get("attribution_sets_equal")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-                || audit
-                    .get("invalid_event_count")
-                    .and_then(serde_json::Value::as_u64)
-                    != Some(0)
-            {
-                violations
-                    .push("OS and wrapper mutation attribution did not agree cleanly".to_owned());
-            }
-            require_log_tests(
-                roles,
-                "adversarial_suite_log",
-                &[
-                    "poisoned_dependency_makes_the_restored_gate_say_no",
-                    "profile_environment_and_cargo_config_flags_all_invalidate",
-                    "path_dependency_outside_worktree_invalidates_snapshot",
-                    "declared_external_build_script_input_invalidates_snapshot",
-                    "proc_macro_environment_change_invalidates_compiler_action",
-                    "undeclared_external_build_script_read_fails_closed_without_publishing",
-                    "undeclared_proc_macro_filesystem_read_fails_closed",
-                    "deterministic_local_network_input_is_rejected_and_not_published",
-                ],
-                violations,
-            )?;
-        }
-        "bevy-integrity" => {
-            let report = require_pass("bevy_integrity_report", violations)?;
-            for field in ["application_parity", "test_parity", "consumer_paths_only"] {
-                if report.get(field).and_then(serde_json::Value::as_bool) != Some(true) {
-                    violations.push(format!("Bevy integrity field {field} is not true"));
-                }
-            }
-            if report
-                .pointer("/restored/warm_elapsed_ms")
-                .and_then(serde_json::Value::as_u64)
-                .is_none()
-                || report
-                    .pointer("/restored/wrapper_compile_events")
-                    .and_then(serde_json::Value::as_u64)
-                    != Some(0)
-                || report.get("restored").and_then(|v| v.get("application"))
-                    != report.get("fresh").and_then(|v| v.get("application"))
-                || report.get("restored").and_then(|v| v.get("test_list"))
-                    != report.get("fresh").and_then(|v| v.get("test_list"))
-                || report.get("restored").and_then(|v| v.get("test_behavior"))
-                    != report.get("fresh").and_then(|v| v.get("test_behavior"))
-            {
-                violations
-                    .push("restored Bevy outputs are not an exact fresh-control match".to_owned());
-            }
-            verify_zero_exec_audit(&require_pass("warm_os_audit", violations)?, violations);
-        }
-        "coalescing" => {
-            let audit = require_pass("coalescing_os_audit", violations)?;
-            let counts = audit
-                .get("coalescing_root_event_counts")
-                .and_then(serde_json::Value::as_object);
-            if counts.is_none_or(|counts| {
-                counts.len() != 2
-                    || counts
-                        .values()
-                        .filter(|v| v.as_u64().is_some_and(|n| n > 0))
-                        .count()
-                        != 1
-                    || counts.values().filter(|v| v.as_u64() == Some(0)).count() != 1
-            }) {
-                violations.push(
-                    "OS coalescing distribution is not one producer and one waiter".to_owned(),
-                );
-            }
-            let result = require_pass("coalescing_result", violations)?;
-            let members = result.get("members").and_then(serde_json::Value::as_array);
-            if members.is_none_or(|members| {
-                members.len() != 2
-                    || members
-                        .iter()
-                        .filter(|m| {
-                            m.get("coalesced").and_then(serde_json::Value::as_bool) == Some(true)
-                        })
-                        .count()
-                        != 1
-                    || members.iter().any(|m| {
-                        m.get("behavior_passed")
-                            .and_then(serde_json::Value::as_bool)
-                            != Some(true)
-                    })
-            }) {
-                violations.push(
-                    "coalescing result is not one successful waiter among two members".to_owned(),
-                );
-            }
-            require_log_tests(
-                roles,
-                "adversarial_suite_log",
-                &["failing_simultaneous_gates_all_fail_and_publish_nothing"],
-                violations,
-            )?;
-        }
-        "resources" => {
-            let report = require_pass("resource_report", violations)?;
-            if number(&report, "peak_aggregate_rss_bytes")
-                .is_none_or(|n| n > 15 * 1024 * 1024 * 1024)
-                || number(&report, "swap_growth_bytes").is_none_or(|n| n > 512 * 1024 * 1024)
-                || number(&report, "peak_simultaneous_progress_processes").is_none_or(|n| n < 2)
-                || number(&report, "observed_lease_owners").is_none_or(|n| n == 0)
-                || report
-                    .get("observed_action_identities")
-                    .and_then(serde_json::Value::as_array)
-                    .is_none_or(|items| items.len() < 2)
-                || report
-                    .get("infrastructure_stall")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(false)
-            {
-                violations.push(
-                    "resource report violates fixed RSS, swap, overlap, or no-stall bounds"
-                        .to_owned(),
-                );
-            }
-            let stall = read("stall_report")?;
-            if number(&stall, "stall_seconds") != Some(300)
-                || stall
-                    .get("infrastructure_stall")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-                || number(&stall, "exit_code") == Some(0)
-            {
-                violations
-                    .push("live 300-second stall was not terminated as infrastructure".to_owned());
-            }
-        }
+        "environment" => verify_environment(roles, violations)?,
+        "adversarial" => verify_adversarial(roles, violations)?,
+        "bevy-integrity" => verify_bevy(roles, violations)?,
+        "coalescing" => verify_coalescing(roles, violations)?,
+        "resources" => verify_resources(roles, violations)?,
         "portable-copy-isolated" => require_log_tests(
             roles,
             "portable_copy_test_log",
             &["gate::tests::portable_snapshot_copy_is_a_complete_isolated_fallback"],
             violations,
         )?,
-        "macos-clone" => {
-            let traces = roles
-                .get("clone_selection_trace")
-                .context("clone trace absent")?;
-            let mut selected = false;
-            for line in fs::read_to_string(&traces[0])?.lines() {
-                let event: serde_json::Value = serde_json::from_str(line)?;
-                selected |= event
-                    .get("selected_method")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("copy-on-write")
-                    && event
-                        .get("attempt_succeeded")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    && event
-                        .get("source_location")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("src/gate.rs:clone_tree_with_preference");
-            }
-            if !selected {
-                violations.push("APFS clone selection branch was not observed".to_owned());
-            }
-        }
-        "linux-copy-mechanism" => {
-            let report = require_pass("linux_copy_report", violations)?;
-            if report
-                .get("filesystem_type")
-                .and_then(serde_json::Value::as_str)
-                .is_none()
-                || report
-                    .get("selected_method")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none()
-                || report
-                    .get("mechanism_proven")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-            {
-                violations.push("Linux copy mechanism is not proven".to_owned());
-            }
-        }
+        "macos-clone" => verify_macos_clone(roles, violations)?,
+        "linux-copy-mechanism" => verify_linux_copy(roles, violations)?,
         "moria-single" | "moria-five" | "moria-stress" => {
-            let proof = require_pass("population_proof", violations)?;
-            let expected_members = match kind {
-                "moria-single" => 1,
-                "moria-five" => 5,
-                _ => 10,
-            };
-            if number(&proof, "observed_members") != Some(expected_members)
-                || proof
-                    .get("all_started_before_any_completed")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-                || proof
-                    .get("all_targets_empty_at_start")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-                || proof
-                    .get("member_action_proofs")
-                    .and_then(serde_json::Value::as_array)
-                    .is_none_or(|members| {
-                        members
-                            .iter()
-                            .any(|m| number(m, "cacheable_physical_actions") != Some(0))
-                    })
-            {
-                violations.push(format!("{kind} population semantics failed"));
-            }
-            verify_zero_exec_audit(
-                &require_pass("population_os_audit", violations)?,
-                violations,
-            );
-            if number(measurements, "members") != Some(expected_members)
-                || number(measurements, "physical_cacheable_actions") != Some(0)
-                || number(measurements, "elapsed_ms") != number(&proof, "elapsed_ms")
-                || number(measurements, "deadline_ms") != number(&proof, "deadline_ms")
-                || measurements
-                    .get("performance_reference_met")
-                    .and_then(serde_json::Value::as_bool)
-                    != proof
-                        .get("performance_reference_met")
-                        .and_then(serde_json::Value::as_bool)
-            {
-                violations.push(format!(
-                    "{kind} receipt measurements disagree with raw proof"
-                ));
-            }
+            verify_moria(kind, measurements, roles, violations)?;
         }
-        "bro-five" => {
-            let producer = require_pass("bro_producer", violations)?;
-            let retirement = require_pass("producer_retirement", violations)?;
-            let producer_audit = require_pass("producer_os_audit", violations)?;
-            if producer
-                .get("target_empty_at_start")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-                || number(&producer, "exit_code") != Some(0)
-                || retirement
-                    .get("producer_deleted")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-                || retirement
-                    .get("producer")
-                    .and_then(serde_json::Value::as_str)
-                    != producer.get("worktree").and_then(serde_json::Value::as_str)
-            {
-                violations.push(
-                    "Bro exact-environment producer or retirement evidence is invalid".to_owned(),
-                );
-            }
-            if producer_audit
-                .get("expected")
-                .and_then(serde_json::Value::as_str)
-                != Some("nonzero")
-                || number(&producer_audit, "selected_event_count").is_none_or(|count| count == 0)
-                || number(&producer_audit, "invalid_event_count") != Some(0)
-            {
-                violations.push("Bro producer lacks clean nonzero OS build evidence".to_owned());
-            }
-            let proof = require_pass("bro_proof", violations)?;
-            let population = require_pass("bro_population_proof", violations)?;
-            if number(&proof, "observed_members").is_none_or(|n| n < 5)
-                || proof
-                    .get("all_started_before_any_completed")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-                || number(&proof, "elapsed_ms").is_none()
-                || number(&proof, "deadline_ms").is_none()
-                || proof
-                    .get("members")
-                    .and_then(serde_json::Value::as_array)
-                    .is_none_or(|members| {
-                        members.len() < 5
-                            || members.iter().any(|member| {
-                                member.get("passed").and_then(serde_json::Value::as_bool)
-                                    != Some(true)
-                                    || member
-                                        .get("target_empty_at_start")
-                                        .and_then(serde_json::Value::as_bool)
-                                        != Some(true)
-                            })
-                    })
-                || population
-                    .get("member_action_proofs")
-                    .and_then(serde_json::Value::as_array)
-                    .is_none_or(|members| {
-                        members
-                            .iter()
-                            .any(|member| number(member, "cacheable_physical_actions") != Some(0))
-                    })
-            {
-                violations
-                    .push("Bro did not prove five simultaneous jobs within deadline".to_owned());
-            }
-            verify_zero_exec_audit(&require_pass("bro_os_audit", violations)?, violations);
-        }
+        "bro-five" => verify_bro(roles, violations)?,
         _ => violations.push(format!(
             "no semantic verifier exists for receipt kind {kind}"
         )),
     }
+    Ok(())
+}
+
+fn read_role(roles: &BTreeMap<String, Vec<PathBuf>>, role: &str) -> Result<serde_json::Value> {
+    let path = roles
+        .get(role)
+        .and_then(|paths| paths.first())
+        .with_context(|| format!("semantic evidence role {role} is absent"))?;
+    serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("parsing semantic evidence {}", path.display()))
+}
+
+fn require_pass(
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    role: &str,
+    violations: &mut Vec<String>,
+) -> Result<serde_json::Value> {
+    let report = read_role(roles, role)?;
+    if report.get("passed").and_then(serde_json::Value::as_bool) != Some(true)
+        || report
+            .get("violations")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    {
+        violations.push(format!("{role} does not report a clean pass"));
+    }
+    Ok(report)
+}
+
+fn verify_environment(
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    violations: &mut Vec<String>,
+) -> Result<()> {
+    let report = require_pass(roles, "environment_report", violations)?;
+    let platform = require_pass(roles, "platform_environment", violations)?;
+    if report
+        .get("storage_profile")
+        .and_then(serde_json::Value::as_str)
+        != Some("ssd")
+    {
+        violations.push("environment is not the required SSD qualification".to_owned());
+    }
+    for field in ["sandbox_provider_identity_sha256", "rustc_verbose_version"] {
+        if report
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            violations.push(format!("environment field {field} is absent"));
+        }
+    }
+    for field in [
+        "sandbox_mechanism",
+        "process_observer",
+        "kernel",
+        "cargo",
+        "rustc",
+    ] {
+        if platform
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            violations.push(format!("platform environment field {field} is absent"));
+        }
+    }
+    if report
+        .get("platform_os")
+        .and_then(serde_json::Value::as_str)
+        == Some("linux")
+    {
+        verify_linux_environment(roles, violations)?;
+    }
+    Ok(())
+}
+
+fn verify_linux_environment(
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    violations: &mut Vec<String>,
+) -> Result<()> {
+    for role in [
+        "cache_filesystem",
+        "worktree_filesystem",
+        "container_image_inspect",
+        "qualification_container_inspect",
+        "host_userns_policy_before",
+        "host_userns_policy_during",
+    ] {
+        if !roles.contains_key(role) {
+            violations.push(format!("Linux environment lacks {role} evidence"));
+        }
+    }
+    let during = roles
+        .get("host_userns_policy_during")
+        .and_then(|p| p.first())
+        .map(fs::read_to_string)
+        .transpose()?
+        .unwrap_or_default();
+    if during.trim() != "0" {
+        violations.push(
+            "Linux nested user-namespace policy was not qualified in fail-closed mode".to_owned(),
+        );
+    }
+    let container = read_role(roles, "qualification_container_inspect")?;
+    let host = container
+        .as_array()
+        .and_then(|v| v.first())
+        .and_then(|v| v.get("HostConfig"));
+    let security = host
+        .and_then(|v| v.get("SecurityOpt"))
+        .and_then(serde_json::Value::as_array);
+    let invalid = host
+        .and_then(|v| v.get("NetworkMode"))
+        .and_then(serde_json::Value::as_str)
+        != Some("none")
+        || host
+            .and_then(|v| v.get("Privileged"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || host
+            .and_then(|v| v.get("CapDrop"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|caps| caps.iter().all(|cap| cap.as_str() != Some("ALL")))
+        || security.is_none_or(|options| {
+            options.iter().all(|option| {
+                option
+                    .as_str()
+                    .is_none_or(|value| !value.contains("no-new-privileges"))
+            })
+        });
+    if invalid {
+        violations.push("Linux outer qualification container is not fail-closed".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_adversarial(
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    violations: &mut Vec<String>,
+) -> Result<()> {
+    let audit = require_pass(roles, "exact_mutation_os_audit", violations)?;
+    let expected = BTreeSet::from([
+        "adversarial_app".to_owned(),
+        "leaf".to_owned(),
+        "mid".to_owned(),
+    ]);
+    let set = json_string_set(&audit, "os_derived_crates");
+    if set != expected || json_string_set(&audit, "wrapper_derived_crates") != expected {
+        violations.push(format!(
+            "exact mutation attribution is {set:?}, expected {expected:?}"
+        ));
+    }
+    if audit.get("expected").and_then(serde_json::Value::as_str) != Some("attribution")
+        || audit
+            .get("attribution_sets_equal")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || audit
+            .get("invalid_event_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+    {
+        violations.push("OS and wrapper mutation attribution did not agree cleanly".to_owned());
+    }
+    require_log_tests(
+        roles,
+        "adversarial_suite_log",
+        &[
+            "poisoned_dependency_makes_the_restored_gate_say_no",
+            "profile_environment_and_cargo_config_flags_all_invalidate",
+            "path_dependency_outside_worktree_invalidates_snapshot",
+            "declared_external_build_script_input_invalidates_snapshot",
+            "proc_macro_environment_change_invalidates_compiler_action",
+            "undeclared_external_build_script_read_fails_closed_without_publishing",
+            "undeclared_proc_macro_filesystem_read_fails_closed",
+            "deterministic_local_network_input_is_rejected_and_not_published",
+        ],
+        violations,
+    )
+}
+
+fn verify_bevy(roles: &BTreeMap<String, Vec<PathBuf>>, violations: &mut Vec<String>) -> Result<()> {
+    let report = require_pass(roles, "bevy_integrity_report", violations)?;
+    for field in ["application_parity", "test_parity", "consumer_paths_only"] {
+        if report.get(field).and_then(serde_json::Value::as_bool) != Some(true) {
+            violations.push(format!("Bevy integrity field {field} is not true"));
+        }
+    }
+    if report
+        .pointer("/restored/warm_elapsed_ms")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+        || report
+            .pointer("/restored/wrapper_compile_events")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || report.get("restored").and_then(|v| v.get("application"))
+            != report.get("fresh").and_then(|v| v.get("application"))
+        || report.get("restored").and_then(|v| v.get("test_list"))
+            != report.get("fresh").and_then(|v| v.get("test_list"))
+        || report.get("restored").and_then(|v| v.get("test_behavior"))
+            != report.get("fresh").and_then(|v| v.get("test_behavior"))
+    {
+        violations.push("restored Bevy outputs are not an exact fresh-control match".to_owned());
+    }
+    let audit = require_pass(roles, "warm_os_audit", violations)?;
+    verify_zero_exec_audit(&audit, violations);
+    Ok(())
+}
+
+fn verify_coalescing(
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    violations: &mut Vec<String>,
+) -> Result<()> {
+    let audit = require_pass(roles, "coalescing_os_audit", violations)?;
+    let counts = audit
+        .get("coalescing_root_event_counts")
+        .and_then(serde_json::Value::as_object);
+    if counts.is_none_or(|counts| {
+        counts.len() != 2
+            || counts
+                .values()
+                .filter(|v| v.as_u64().is_some_and(|n| n > 0))
+                .count()
+                != 1
+            || counts.values().filter(|v| v.as_u64() == Some(0)).count() != 1
+    }) {
+        violations.push("OS coalescing distribution is not one producer and one waiter".to_owned());
+    }
+    let result = require_pass(roles, "coalescing_result", violations)?;
+    let members = result.get("members").and_then(serde_json::Value::as_array);
+    if members.is_none_or(|members| {
+        members.len() != 2
+            || members
+                .iter()
+                .filter(|m| m.get("coalesced").and_then(serde_json::Value::as_bool) == Some(true))
+                .count()
+                != 1
+            || members.iter().any(|m| {
+                m.get("behavior_passed")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            })
+    }) {
+        violations
+            .push("coalescing result is not one successful waiter among two members".to_owned());
+    }
+    require_log_tests(
+        roles,
+        "adversarial_suite_log",
+        &["failing_simultaneous_gates_all_fail_and_publish_nothing"],
+        violations,
+    )
+}
+
+fn verify_resources(
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    violations: &mut Vec<String>,
+) -> Result<()> {
+    let report = require_pass(roles, "resource_report", violations)?;
+    if number(&report, "peak_aggregate_rss_bytes").is_none_or(|n| n > 15 * 1024 * 1024 * 1024)
+        || number(&report, "swap_growth_bytes").is_none_or(|n| n > 512 * 1024 * 1024)
+        || number(&report, "peak_simultaneous_progress_processes").is_none_or(|n| n < 2)
+        || number(&report, "observed_lease_owners").is_none_or(|n| n == 0)
+        || report
+            .get("observed_action_identities")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|v| v.len() < 2)
+        || report
+            .get("infrastructure_stall")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
+        violations.push(
+            "resource report violates fixed RSS, swap, overlap, or no-stall bounds".to_owned(),
+        );
+    }
+    let stall = read_role(roles, "stall_report")?;
+    if number(&stall, "stall_seconds") != Some(300)
+        || stall
+            .get("infrastructure_stall")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || number(&stall, "exit_code") == Some(0)
+    {
+        violations.push("live 300-second stall was not terminated as infrastructure".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_macos_clone(
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    violations: &mut Vec<String>,
+) -> Result<()> {
+    let traces = roles
+        .get("clone_selection_trace")
+        .context("clone trace absent")?;
+    let mut selected = false;
+    for line in fs::read_to_string(&traces[0])?.lines() {
+        let event: serde_json::Value = serde_json::from_str(line)?;
+        selected |= event
+            .get("selected_method")
+            .and_then(serde_json::Value::as_str)
+            == Some("copy-on-write")
+            && event
+                .get("attempt_succeeded")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && event
+                .get("source_location")
+                .and_then(serde_json::Value::as_str)
+                == Some("src/gate.rs:clone_tree_with_preference");
+    }
+    if !selected {
+        violations.push("APFS clone selection branch was not observed".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_linux_copy(
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    violations: &mut Vec<String>,
+) -> Result<()> {
+    let report = require_pass(roles, "linux_copy_report", violations)?;
+    if report
+        .get("filesystem_type")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+        || report
+            .get("selected_method")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        || report
+            .get("mechanism_proven")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        violations.push("Linux copy mechanism is not proven".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_moria(
+    kind: &str,
+    measurements: &serde_json::Value,
+    roles: &BTreeMap<String, Vec<PathBuf>>,
+    violations: &mut Vec<String>,
+) -> Result<()> {
+    let proof = require_pass(roles, "population_proof", violations)?;
+    let expected_members = match kind {
+        "moria-single" => 1,
+        "moria-five" => 5,
+        _ => 10,
+    };
+    if number(&proof, "observed_members") != Some(expected_members)
+        || proof
+            .get("all_started_before_any_completed")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || proof
+            .get("all_targets_empty_at_start")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || proof
+            .get("member_action_proofs")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|members| {
+                members
+                    .iter()
+                    .any(|m| number(m, "cacheable_physical_actions") != Some(0))
+            })
+    {
+        violations.push(format!("{kind} population semantics failed"));
+    }
+    let audit = require_pass(roles, "population_os_audit", violations)?;
+    verify_zero_exec_audit(&audit, violations);
+    if number(measurements, "members") != Some(expected_members)
+        || number(measurements, "physical_cacheable_actions") != Some(0)
+        || number(measurements, "elapsed_ms") != number(&proof, "elapsed_ms")
+        || number(measurements, "deadline_ms") != number(&proof, "deadline_ms")
+        || measurements
+            .get("performance_reference_met")
+            .and_then(serde_json::Value::as_bool)
+            != proof
+                .get("performance_reference_met")
+                .and_then(serde_json::Value::as_bool)
+    {
+        violations.push(format!(
+            "{kind} receipt measurements disagree with raw proof"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_bro(roles: &BTreeMap<String, Vec<PathBuf>>, violations: &mut Vec<String>) -> Result<()> {
+    let producer = require_pass(roles, "bro_producer", violations)?;
+    let retirement = require_pass(roles, "producer_retirement", violations)?;
+    let audit = require_pass(roles, "producer_os_audit", violations)?;
+    if producer
+        .get("target_empty_at_start")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        || number(&producer, "exit_code") != Some(0)
+        || retirement
+            .get("producer_deleted")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || retirement
+            .get("producer")
+            .and_then(serde_json::Value::as_str)
+            != producer.get("worktree").and_then(serde_json::Value::as_str)
+    {
+        violations
+            .push("Bro exact-environment producer or retirement evidence is invalid".to_owned());
+    }
+    if audit.get("expected").and_then(serde_json::Value::as_str) != Some("nonzero")
+        || number(&audit, "selected_event_count").is_none_or(|count| count == 0)
+        || number(&audit, "invalid_event_count") != Some(0)
+    {
+        violations.push("Bro producer lacks clean nonzero OS build evidence".to_owned());
+    }
+    let proof = require_pass(roles, "bro_proof", violations)?;
+    let population = require_pass(roles, "bro_population_proof", violations)?;
+    if number(&proof, "observed_members").is_none_or(|n| n < 5)
+        || proof
+            .get("all_started_before_any_completed")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || number(&proof, "elapsed_ms").is_none()
+        || number(&proof, "deadline_ms").is_none()
+        || proof
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|members| {
+                members.len() < 5
+                    || members.iter().any(|m| {
+                        m.get("passed").and_then(serde_json::Value::as_bool) != Some(true)
+                            || m.get("target_empty_at_start")
+                                .and_then(serde_json::Value::as_bool)
+                                != Some(true)
+                    })
+            })
+        || population
+            .get("member_action_proofs")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|members| {
+                members
+                    .iter()
+                    .any(|m| number(m, "cacheable_physical_actions") != Some(0))
+            })
+    {
+        violations.push("Bro did not prove five simultaneous jobs within deadline".to_owned());
+    }
+    let os_audit = require_pass(roles, "bro_os_audit", violations)?;
+    verify_zero_exec_audit(&os_audit, violations);
     Ok(())
 }
 

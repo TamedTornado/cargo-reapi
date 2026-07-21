@@ -218,7 +218,7 @@ fn restored_logical_digest_for_target(
 }
 
 fn receipt_path(target: &Path, actual_path: &Path) -> Option<PathBuf> {
-    if !actual_path.starts_with(&target) {
+    if !actual_path.starts_with(target) {
         return None;
     }
     let key = format!(

@@ -89,8 +89,15 @@ struct ExecAuditReport {
     passed: bool,
 }
 
+struct AuditDerivations {
+    os_crates: BTreeSet<String>,
+    wrapper_crates: BTreeSet<String>,
+    attribution_sets_equal: bool,
+    coalescing_root_event_counts: BTreeMap<String, usize>,
+}
+
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    match run(&Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("cargo-reapi-exec-auditor: {error:#}");
@@ -99,7 +106,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: &Cli) -> Result<()> {
     let root = cli.evidence_root.canonicalize()?;
     let events = existing_under(&root, &cli.events)?;
     let stderr = existing_under(&root, &cli.observer_stderr)?;
@@ -138,65 +145,12 @@ fn run(cli: Cli) -> Result<()> {
         value => violations.push(format!("unknown selection expectation {value}")),
     }
 
-    let os_derived_crates = if selection.expected == "attribution" {
-        derive_os_crates(
-            &selected,
-            selection.attribution_root.as_deref(),
-            &mut violations,
-        )
-    } else {
-        BTreeSet::new()
-    };
-    let wrapper_derived_crates = if selection.expected == "attribution" {
-        let trace = cli
-            .wrapper_trace
-            .as_deref()
-            .context("attribution requires --wrapper-trace")?;
-        derive_wrapper_crates(trace, selection.attribution_root.as_deref())?
-    } else {
-        BTreeSet::new()
-    };
-    let attribution_sets_equal = os_derived_crates == wrapper_derived_crates;
-    if selection.expected == "attribution" {
-        if os_derived_crates != selection.expected_crates {
-            violations.push(format!(
-                "OS-derived rebuild set is {os_derived_crates:?}; expected {:?}",
-                selection.expected_crates
-            ));
-        }
-        if !attribution_sets_equal {
-            violations.push(format!(
-                "OS-derived rebuild set {os_derived_crates:?} disagrees with wrapper set {wrapper_derived_crates:?}"
-            ));
-        }
-    }
-    let coalescing_root_event_counts = if selection.expected == "coalescing" {
-        let counts = selection
-            .coalescing_roots
-            .iter()
-            .map(|root| {
-                (
-                    root.display().to_string(),
-                    selected
-                        .iter()
-                        .filter(|event| is_physical_cacheable_action(event))
-                        .filter(|event| event_belongs_to_root(event, root))
-                        .count(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        if counts.len() != 2
-            || counts.values().filter(|count| **count > 0).count() != 1
-            || counts.values().filter(|count| **count == 0).count() != 1
-        {
-            violations.push(format!(
-                "coalescing OS event distribution is {counts:?}; expected one producer and one waiter"
-            ));
-        }
-        counts
-    } else {
-        BTreeMap::new()
-    };
+    let derivations = derive_audit(
+        &selection,
+        &selected,
+        cli.wrapper_trace.as_deref(),
+        &mut violations,
+    )?;
 
     let normalized_path = existing_under(&root, &cli.normalized_events)?;
     let mut evidence_refs = vec![
@@ -221,10 +175,10 @@ fn run(cli: Cli) -> Result<()> {
         total_event_count,
         selected_event_count: selected.len(),
         invalid_event_count,
-        os_derived_crates,
-        wrapper_derived_crates,
-        attribution_sets_equal,
-        coalescing_root_event_counts,
+        os_derived_crates: derivations.os_crates,
+        wrapper_derived_crates: derivations.wrapper_crates,
+        attribution_sets_equal: derivations.attribution_sets_equal,
+        coalescing_root_event_counts: derivations.coalescing_root_event_counts,
         evidence_refs,
         passed: violations.is_empty(),
         violations,
@@ -234,6 +188,77 @@ fn run(cli: Cli) -> Result<()> {
         bail!("exec evidence failed; report: {}", cli.report.display());
     }
     Ok(())
+}
+
+fn derive_audit(
+    selection: &SelectionConfig,
+    selected: &[NormalizedExec],
+    wrapper_trace: Option<&Path>,
+    violations: &mut Vec<String>,
+) -> Result<AuditDerivations> {
+    let os_crates = if selection.expected == "attribution" {
+        derive_os_crates(selected, selection.attribution_root.as_deref(), violations)
+    } else {
+        BTreeSet::new()
+    };
+    let wrapper_crates = if selection.expected == "attribution" {
+        let trace = wrapper_trace.context("attribution requires --wrapper-trace")?;
+        derive_wrapper_crates(trace, selection.attribution_root.as_deref())?
+    } else {
+        BTreeSet::new()
+    };
+    let attribution_sets_equal = os_crates == wrapper_crates;
+    if selection.expected == "attribution" {
+        if os_crates != selection.expected_crates {
+            violations.push(format!(
+                "OS-derived rebuild set is {os_crates:?}; expected {:?}",
+                selection.expected_crates
+            ));
+        }
+        if !attribution_sets_equal {
+            violations.push(format!(
+                "OS-derived rebuild set {os_crates:?} disagrees with wrapper set {wrapper_crates:?}"
+            ));
+        }
+    }
+    let coalescing_root_event_counts = derive_coalescing_counts(selection, selected, violations);
+    Ok(AuditDerivations {
+        os_crates,
+        wrapper_crates,
+        attribution_sets_equal,
+        coalescing_root_event_counts,
+    })
+}
+
+fn derive_coalescing_counts(
+    selection: &SelectionConfig,
+    selected: &[NormalizedExec],
+    violations: &mut Vec<String>,
+) -> BTreeMap<String, usize> {
+    if selection.expected != "coalescing" {
+        return BTreeMap::new();
+    }
+    let counts = selection
+        .coalescing_roots
+        .iter()
+        .map(|root| {
+            let count = selected
+                .iter()
+                .filter(|event| is_physical_cacheable_action(event))
+                .filter(|event| event_belongs_to_root(event, root))
+                .count();
+            (root.display().to_string(), count)
+        })
+        .collect::<BTreeMap<_, _>>();
+    if counts.len() != 2
+        || counts.values().filter(|count| **count > 0).count() != 1
+        || counts.values().filter(|count| **count == 0).count() != 1
+    {
+        violations.push(format!(
+            "coalescing OS event distribution is {counts:?}; expected one producer and one waiter"
+        ));
+    }
+    counts
 }
 
 fn verify_selected_executables(selection: &SelectionConfig) -> Result<()> {

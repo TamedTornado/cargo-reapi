@@ -108,6 +108,26 @@ struct ResourceReport {
     passed: bool,
 }
 
+struct MonitorOutcome {
+    exit_code: i32,
+    peak_aggregate_rss_bytes: u64,
+    peak_simultaneous_progress_processes: usize,
+    infrastructure_stall: bool,
+    observed_lease_pids: BTreeSet<u32>,
+    observed_action_identities: BTreeSet<String>,
+    samples: Vec<ResourceSample>,
+}
+
+struct MonitorReportContext<'a> {
+    report: &'a Path,
+    command: &'a [String],
+    ledger_root: &'a Path,
+    stall_seconds: u64,
+    started_at_unix_ms: u128,
+    swap_start_bytes: u64,
+    root_pid: u32,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -223,6 +243,25 @@ fn monitor_command(
         .spawn()
         .with_context(|| format!("starting monitored command {program}"))?;
     let root_pid = child.id();
+    let outcome = monitor_child(&mut child, root_pid, stall_seconds, ledger_root)?;
+    let context = MonitorReportContext {
+        report,
+        command,
+        ledger_root,
+        stall_seconds,
+        started_at_unix_ms,
+        swap_start_bytes,
+        root_pid,
+    };
+    write_monitor_report(&context, outcome)
+}
+
+fn monitor_child(
+    child: &mut Child,
+    root_pid: u32,
+    stall_seconds: u64,
+    ledger_root: &Path,
+) -> Result<MonitorOutcome> {
     let mut samples = Vec::new();
     let mut peak_aggregate_rss_bytes = 0;
     let mut peak_simultaneous_progress_processes = 0;
@@ -246,9 +285,12 @@ fn monitor_command(
             .collect::<BTreeSet<_>>();
         let lease_ownership = externally_observed_leases(ledger_root, &descendant_pids)?;
         observed_lease_pids.extend(lease_ownership.keys().copied());
-        observed_action_identities.extend(descendants.iter().filter_map(|process| {
-            is_progress_process(&process.command).then(|| process.command.clone())
-        }));
+        observed_action_identities.extend(
+            descendants
+                .iter()
+                .filter(|process| is_progress_process(&process.command))
+                .map(|process| process.command.clone()),
+        );
         let aggregate_rss_bytes = descendants.iter().map(|process| process.rss_bytes).sum();
         peak_aggregate_rss_bytes = peak_aggregate_rss_bytes.max(aggregate_rss_bytes);
         let heavy_cpu = descendants
@@ -263,7 +305,7 @@ fn monitor_command(
             previous_heavy_cpu = heavy_cpu;
         } else if last_progress.elapsed() >= Duration::from_secs(stall_seconds) {
             infrastructure_stall = true;
-            let status = terminate_process_group(&mut child, root_pid)?;
+            let status = terminate_process_group(child, root_pid)?;
             exit_code = status.code().unwrap_or(1);
             break;
         }
@@ -277,12 +319,25 @@ fn monitor_command(
         thread::sleep(Duration::from_millis(250));
     }
 
+    Ok(MonitorOutcome {
+        exit_code,
+        peak_aggregate_rss_bytes,
+        peak_simultaneous_progress_processes,
+        infrastructure_stall,
+        observed_lease_pids,
+        observed_action_identities,
+        samples,
+    })
+}
+
+fn write_monitor_report(context: &MonitorReportContext<'_>, outcome: MonitorOutcome) -> Result<()> {
     let swap_end_bytes = swap_bytes()?;
-    let swap_growth_bytes = swap_end_bytes.saturating_sub(swap_start_bytes);
+    let swap_growth_bytes = swap_end_bytes.saturating_sub(context.swap_start_bytes);
     let mut violations = Vec::new();
-    if peak_aggregate_rss_bytes > MAXIMUM_RSS_BYTES {
+    if outcome.peak_aggregate_rss_bytes > MAXIMUM_RSS_BYTES {
         violations.push(format!(
-            "peak process-tree RSS {peak_aggregate_rss_bytes} exceeds {MAXIMUM_RSS_BYTES}"
+            "peak process-tree RSS {} exceeds {MAXIMUM_RSS_BYTES}",
+            outcome.peak_aggregate_rss_bytes
         ));
     }
     if swap_growth_bytes > MAXIMUM_SWAP_GROWTH_BYTES {
@@ -290,41 +345,41 @@ fn monitor_command(
             "swap growth {swap_growth_bytes} exceeds {MAXIMUM_SWAP_GROWTH_BYTES}"
         ));
     }
-    if infrastructure_stall {
+    if outcome.infrastructure_stall {
         violations
             .push("compiler/linker progress stalled; classified as infrastructure".to_owned());
     }
-    if exit_code != 0 {
-        violations.push(format!("monitored command exited {exit_code}"));
+    if outcome.exit_code != 0 {
+        violations.push(format!("monitored command exited {}", outcome.exit_code));
     }
     let proof = ResourceReport {
         schema_version: 1,
-        root_pid,
-        command: command.to_vec(),
-        started_at_unix_ms,
+        root_pid: context.root_pid,
+        command: context.command.to_vec(),
+        started_at_unix_ms: context.started_at_unix_ms,
         completed_at_unix_ms: unix_ms(),
-        exit_code,
-        peak_aggregate_rss_bytes,
-        peak_simultaneous_progress_processes,
+        exit_code: outcome.exit_code,
+        peak_aggregate_rss_bytes: outcome.peak_aggregate_rss_bytes,
+        peak_simultaneous_progress_processes: outcome.peak_simultaneous_progress_processes,
         maximum_rss_bytes: MAXIMUM_RSS_BYTES,
-        swap_start_bytes,
+        swap_start_bytes: context.swap_start_bytes,
         swap_end_bytes,
         swap_growth_bytes,
         maximum_swap_growth_bytes: MAXIMUM_SWAP_GROWTH_BYTES,
-        stall_seconds,
-        infrastructure_stall,
-        ledger_root: ledger_root.to_path_buf(),
-        observed_lease_owners: observed_lease_pids.len(),
-        observed_action_identities,
-        samples,
+        stall_seconds: context.stall_seconds,
+        infrastructure_stall: outcome.infrastructure_stall,
+        ledger_root: context.ledger_root.to_path_buf(),
+        observed_lease_owners: outcome.observed_lease_pids.len(),
+        observed_action_identities: outcome.observed_action_identities,
+        samples: outcome.samples,
         passed: violations.is_empty(),
         violations,
     };
-    write_report(report, &proof)?;
+    write_report(context.report, &proof)?;
     if !proof.passed {
         bail!(
             "monitored command failed resource acceptance; report: {}",
-            report.display()
+            context.report.display()
         );
     }
     Ok(())
@@ -431,13 +486,13 @@ fn process_table() -> Result<Vec<ProcessSample>> {
         .filter_map(|line| {
             let mut rest = line.trim_start();
             let pid = take_field(&mut rest)?.parse().ok()?;
-            let ppid = take_field(&mut rest)?.parse().ok()?;
+            let parent_pid = take_field(&mut rest)?.parse().ok()?;
             let cpu_percent = take_field(&mut rest)?.parse().ok()?;
             let rss_kib = take_field(&mut rest)?.parse::<u64>().ok()?;
             let cpu_time = take_field(&mut rest)?.to_owned();
             Some(ProcessSample {
                 pid,
-                ppid,
+                ppid: parent_pid,
                 cpu_percent,
                 rss_bytes: rss_kib.saturating_mul(1024),
                 cpu_time,
@@ -526,10 +581,33 @@ fn swap_bytes() -> Result<u64> {
     let used_mib = fields
         .get(used_index + 2)
         .context("vm.swapusage used value is incomplete")?
-        .trim_end_matches('M')
-        .parse::<f64>()
-        .context("parsing used swap MiB")?;
-    Ok((used_mib * 1024.0 * 1024.0) as u64)
+        .trim_end_matches('M');
+    parse_mib_bytes(used_mib)
+}
+
+fn parse_mib_bytes(value: &str) -> Result<u64> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let whole_bytes = whole
+        .parse::<u64>()
+        .context("parsing whole used swap MiB")?
+        .checked_mul(1024 * 1024)
+        .context("used swap MiB exceeds u64")?;
+    if fraction.is_empty() {
+        return Ok(whole_bytes);
+    }
+    let numerator = fraction
+        .parse::<u64>()
+        .context("parsing fractional used swap MiB")?;
+    let denominator = (0..fraction.len()).try_fold(1_u64, |scale, _| {
+        scale.checked_mul(10).context("swap precision exceeds u64")
+    })?;
+    let fractional_bytes = numerator
+        .checked_mul(1024 * 1024)
+        .context("fractional used swap MiB exceeds u64")?
+        / denominator;
+    whole_bytes
+        .checked_add(fractional_bytes)
+        .context("used swap bytes exceeds u64")
 }
 
 fn write_report<T: Serialize>(path: &Path, report: &T) -> Result<()> {

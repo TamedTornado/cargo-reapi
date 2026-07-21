@@ -5,7 +5,7 @@ use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Barrier};
 
 use serde_json::Value;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -531,6 +531,207 @@ fn write_flag_fixture(root: &Path) {
     .expect("flag source");
 }
 
+struct FlagExpectation<'a> {
+    root: &'a Path,
+    cache: &'a Path,
+    trace: &'a Path,
+    log: &'a Path,
+    cargo_args: &'a [&'a str],
+    environment: &'a [(&'a str, &'a str)],
+    binary: PathBuf,
+    stdout: &'a str,
+    require_observed_compile: bool,
+}
+
+fn assert_flag_invalidation(expectation: FlagExpectation<'_>) {
+    assert!(
+        run_snapshot_gate_with_environment(
+            expectation.root,
+            expectation.cache,
+            expectation.log,
+            expectation.cargo_args,
+            expectation.environment,
+            Some(expectation.trace),
+        )
+        .success()
+    );
+    if expectation.require_observed_compile {
+        assert!(
+            observed_crates(expectation.trace, expectation.root)
+                .iter()
+                .any(|name| name == "flag_fixture")
+        );
+    }
+    let output = Command::new(expectation.binary)
+        .output()
+        .expect("run invalidated flag fixture");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        expectation.stdout
+    );
+}
+
+fn run_config_flag_cases(roots: &TempDir, cache: &TempDir, trace: &TempDir) {
+    let config_consumer = roots.path().join("config-consumer");
+    write_flag_fixture(&config_consumer);
+    fs::create_dir_all(config_consumer.join(".cargo")).expect("cargo config directory");
+    fs::write(
+        config_consumer.join(".cargo/config.toml"),
+        "[build]\nrustflags=['--cfg', 'reapi_variant']\n",
+    )
+    .expect("cargo config");
+    assert_flag_invalidation(FlagExpectation {
+        root: &config_consumer,
+        cache: cache.path(),
+        trace: trace.path(),
+        log: &roots.path().join("config.jsonl"),
+        cargo_args: &["build"],
+        environment: &[],
+        binary: config_consumer.join("target/debug/flag-fixture"),
+        stdout: "43:true",
+        require_observed_compile: true,
+    });
+}
+
+fn run_environment_flag_cases(roots: &TempDir, cache: &TempDir, trace: &TempDir) {
+    let environment_consumer = roots.path().join("environment-consumer");
+    write_flag_fixture(&environment_consumer);
+    assert_flag_invalidation(FlagExpectation {
+        root: &environment_consumer,
+        cache: cache.path(),
+        trace: trace.path(),
+        log: &roots.path().join("environment.jsonl"),
+        cargo_args: &["build"],
+        environment: &[("RUSTFLAGS", "--cfg reapi_variant")],
+        binary: environment_consumer.join("target/debug/flag-fixture"),
+        stdout: "43:true",
+        require_observed_compile: true,
+    });
+
+    let encoded_consumer = roots.path().join("encoded-consumer");
+    write_flag_fixture(&encoded_consumer);
+    assert_flag_invalidation(FlagExpectation {
+        root: &encoded_consumer,
+        cache: cache.path(),
+        trace: trace.path(),
+        log: &roots.path().join("encoded.jsonl"),
+        cargo_args: &["build"],
+        environment: &[("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}reapi_variant")],
+        binary: encoded_consumer.join("target/debug/flag-fixture"),
+        stdout: "43:true",
+        require_observed_compile: false,
+    });
+}
+
+fn run_ancestor_and_cargo_home_flag_cases(roots: &TempDir, cache: &TempDir, trace: &TempDir) {
+    let ancestor_root = roots.path().join("ancestor");
+    let ancestor_consumer = ancestor_root.join("consumer");
+    write_flag_fixture(&ancestor_consumer);
+    fs::create_dir_all(ancestor_root.join(".cargo")).expect("ancestor config directory");
+    fs::write(
+        ancestor_root.join(".cargo/config.toml"),
+        "[build]\nrustflags=['--cfg', 'reapi_variant']\n",
+    )
+    .expect("ancestor cargo config");
+    assert_flag_invalidation(FlagExpectation {
+        root: &ancestor_consumer,
+        cache: cache.path(),
+        trace: trace.path(),
+        log: &roots.path().join("ancestor.jsonl"),
+        cargo_args: &["build"],
+        environment: &[],
+        binary: ancestor_consumer.join("target/debug/flag-fixture"),
+        stdout: "43:true",
+        require_observed_compile: false,
+    });
+
+    let cargo_home = roots.path().join("cargo-home");
+    fs::create_dir_all(&cargo_home).expect("custom cargo home");
+    fs::write(
+        cargo_home.join("config.toml"),
+        "[build]\nrustflags=['--cfg', 'reapi_variant']\n",
+    )
+    .expect("cargo home config");
+    let cargo_home_text = cargo_home.to_string_lossy().to_string();
+    let cargo_home_consumer = roots.path().join("cargo-home-consumer");
+    write_flag_fixture(&cargo_home_consumer);
+    assert_flag_invalidation(FlagExpectation {
+        root: &cargo_home_consumer,
+        cache: cache.path(),
+        trace: trace.path(),
+        log: &roots.path().join("cargo-home.jsonl"),
+        cargo_args: &["build"],
+        environment: &[("CARGO_HOME", cargo_home_text.as_str())],
+        binary: cargo_home_consumer.join("target/debug/flag-fixture"),
+        stdout: "43:true",
+        require_observed_compile: false,
+    });
+}
+
+fn run_profile_and_feature_flag_cases(roots: &TempDir, cache: &TempDir, trace: &TempDir) {
+    let profile_consumer = roots.path().join("profile-consumer");
+    write_flag_fixture(&profile_consumer);
+    fs::write(
+        profile_consumer.join("Cargo.toml"),
+        "[package]\nname='flag-fixture'\nversion='0.0.0'\nedition='2024'\n[features]\nvariant=[]\n[profile.dev]\ndebug-assertions=false\n",
+    )
+    .expect("profile manifest");
+    assert_flag_invalidation(FlagExpectation {
+        root: &profile_consumer,
+        cache: cache.path(),
+        trace: trace.path(),
+        log: &roots.path().join("profile.jsonl"),
+        cargo_args: &["build"],
+        environment: &[],
+        binary: profile_consumer.join("target/debug/flag-fixture"),
+        stdout: "42:false",
+        require_observed_compile: true,
+    });
+
+    let feature_consumer = roots.path().join("feature-consumer");
+    write_flag_fixture(&feature_consumer);
+    assert_flag_invalidation(FlagExpectation {
+        root: &feature_consumer,
+        cache: cache.path(),
+        trace: trace.path(),
+        log: &roots.path().join("feature.jsonl"),
+        cargo_args: &["build", "--features", "variant"],
+        environment: &[],
+        binary: feature_consumer.join("target/debug/flag-fixture"),
+        stdout: "43:true",
+        require_observed_compile: false,
+    });
+}
+
+fn run_target_flag_case(roots: &TempDir, cache: &TempDir, trace: &TempDir) {
+    let host = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .expect("query host target");
+    let host = String::from_utf8(host.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap()
+        .to_owned();
+    let target_consumer = roots.path().join("target-consumer");
+    write_flag_fixture(&target_consumer);
+    assert_flag_invalidation(FlagExpectation {
+        root: &target_consumer,
+        cache: cache.path(),
+        trace: trace.path(),
+        log: &roots.path().join("target.jsonl"),
+        cargo_args: &["build", "--target", &host],
+        environment: &[],
+        binary: target_consumer
+            .join("target")
+            .join(&host)
+            .join("debug/flag-fixture"),
+        stdout: "42:true",
+        require_observed_compile: false,
+    });
+}
+
 #[test]
 fn profile_environment_and_cargo_config_flags_all_invalidate() {
     let roots = tempdir().expect("flag roots");
@@ -549,202 +750,11 @@ fn profile_environment_and_cargo_config_flags_all_invalidate() {
         )
         .success()
     );
-
-    let config_consumer = roots.path().join("config-consumer");
-    write_flag_fixture(&config_consumer);
-    fs::create_dir_all(config_consumer.join(".cargo")).expect("cargo config directory");
-    fs::write(
-        config_consumer.join(".cargo/config.toml"),
-        "[build]\nrustflags=['--cfg', 'reapi_variant']\n",
-    )
-    .expect("cargo config");
-    assert!(
-        run_snapshot_gate_with_environment(
-            &config_consumer,
-            cache.path(),
-            &roots.path().join("config.jsonl"),
-            &["build"],
-            &[],
-            Some(trace.path()),
-        )
-        .success()
-    );
-    assert!(
-        observed_crates(trace.path(), &config_consumer)
-            .iter()
-            .any(|name| name == "flag_fixture")
-    );
-    let output = Command::new(config_consumer.join("target/debug/flag-fixture"))
-        .output()
-        .expect("run config binary");
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "43:true");
-
-    let environment_consumer = roots.path().join("environment-consumer");
-    write_flag_fixture(&environment_consumer);
-    assert!(
-        run_snapshot_gate_with_environment(
-            &environment_consumer,
-            cache.path(),
-            &roots.path().join("environment.jsonl"),
-            &["build"],
-            &[("RUSTFLAGS", "--cfg reapi_variant")],
-            Some(trace.path()),
-        )
-        .success()
-    );
-    assert!(
-        observed_crates(trace.path(), &environment_consumer)
-            .iter()
-            .any(|name| name == "flag_fixture")
-    );
-
-    let encoded_consumer = roots.path().join("encoded-consumer");
-    write_flag_fixture(&encoded_consumer);
-    assert!(
-        run_snapshot_gate_with_environment(
-            &encoded_consumer,
-            cache.path(),
-            &roots.path().join("encoded.jsonl"),
-            &["build"],
-            &[("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}reapi_variant")],
-            Some(trace.path()),
-        )
-        .success()
-    );
-    let output = Command::new(encoded_consumer.join("target/debug/flag-fixture"))
-        .output()
-        .expect("run encoded-flags binary");
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "43:true");
-
-    let ancestor_root = roots.path().join("ancestor");
-    let ancestor_consumer = ancestor_root.join("consumer");
-    write_flag_fixture(&ancestor_consumer);
-    fs::create_dir_all(ancestor_root.join(".cargo")).expect("ancestor config directory");
-    fs::write(
-        ancestor_root.join(".cargo/config.toml"),
-        "[build]\nrustflags=['--cfg', 'reapi_variant']\n",
-    )
-    .expect("ancestor cargo config");
-    assert!(
-        run_snapshot_gate_with_environment(
-            &ancestor_consumer,
-            cache.path(),
-            &roots.path().join("ancestor.jsonl"),
-            &["build"],
-            &[],
-            Some(trace.path()),
-        )
-        .success()
-    );
-    let output = Command::new(ancestor_consumer.join("target/debug/flag-fixture"))
-        .output()
-        .expect("run ancestor-config binary");
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "43:true");
-
-    let cargo_home = roots.path().join("cargo-home");
-    fs::create_dir_all(&cargo_home).expect("custom cargo home");
-    fs::write(
-        cargo_home.join("config.toml"),
-        "[build]\nrustflags=['--cfg', 'reapi_variant']\n",
-    )
-    .expect("cargo home config");
-    let cargo_home_text = cargo_home.to_string_lossy().to_string();
-    let cargo_home_consumer = roots.path().join("cargo-home-consumer");
-    write_flag_fixture(&cargo_home_consumer);
-    assert!(
-        run_snapshot_gate_with_environment(
-            &cargo_home_consumer,
-            cache.path(),
-            &roots.path().join("cargo-home.jsonl"),
-            &["build"],
-            &[("CARGO_HOME", cargo_home_text.as_str())],
-            Some(trace.path()),
-        )
-        .success()
-    );
-    let output = Command::new(cargo_home_consumer.join("target/debug/flag-fixture"))
-        .output()
-        .expect("run cargo-home-config binary");
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "43:true");
-
-    let profile_consumer = roots.path().join("profile-consumer");
-    write_flag_fixture(&profile_consumer);
-    fs::write(
-        profile_consumer.join("Cargo.toml"),
-        "[package]\nname='flag-fixture'\nversion='0.0.0'\nedition='2024'\n[features]\nvariant=[]\n[profile.dev]\ndebug-assertions=false\n",
-    )
-    .expect("profile manifest");
-    assert!(
-        run_snapshot_gate_with_environment(
-            &profile_consumer,
-            cache.path(),
-            &roots.path().join("profile.jsonl"),
-            &["build"],
-            &[],
-            Some(trace.path()),
-        )
-        .success()
-    );
-    assert!(
-        observed_crates(trace.path(), &profile_consumer)
-            .iter()
-            .any(|name| name == "flag_fixture")
-    );
-    let output = Command::new(profile_consumer.join("target/debug/flag-fixture"))
-        .output()
-        .expect("run profile binary");
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "42:false");
-
-    let feature_consumer = roots.path().join("feature-consumer");
-    write_flag_fixture(&feature_consumer);
-    assert!(
-        run_snapshot_gate_with_environment(
-            &feature_consumer,
-            cache.path(),
-            &roots.path().join("feature.jsonl"),
-            &["build", "--features", "variant"],
-            &[],
-            Some(trace.path()),
-        )
-        .success()
-    );
-    let output = Command::new(feature_consumer.join("target/debug/flag-fixture"))
-        .output()
-        .expect("run feature binary");
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "43:true");
-
-    let host = Command::new("rustc")
-        .arg("-vV")
-        .output()
-        .expect("query host target");
-    let host = String::from_utf8(host.stdout)
-        .unwrap()
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .unwrap()
-        .to_owned();
-    let target_consumer = roots.path().join("target-consumer");
-    write_flag_fixture(&target_consumer);
-    assert!(
-        run_snapshot_gate_with_environment(
-            &target_consumer,
-            cache.path(),
-            &roots.path().join("target.jsonl"),
-            &["build", "--target", &host],
-            &[],
-            Some(trace.path()),
-        )
-        .success()
-    );
-    let output = Command::new(
-        target_consumer
-            .join("target")
-            .join(&host)
-            .join("debug/flag-fixture"),
-    )
-    .output()
-    .expect("run explicit-target binary");
-    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "42:true");
+    run_config_flag_cases(&roots, &cache, &trace);
+    run_environment_flag_cases(&roots, &cache, &trace);
+    run_ancestor_and_cargo_home_flag_cases(&roots, &cache, &trace);
+    run_profile_and_feature_flag_cases(&roots, &cache, &trace);
+    run_target_flag_case(&roots, &cache, &trace);
 }
 
 fn write_build_script_fixture(root: &Path) {
