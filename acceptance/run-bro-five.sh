@@ -56,7 +56,7 @@ run_bro() {
   pnpm --dir "$bro_root" --filter @bro/pm prove:moria:cargo-reapi -- \
     --repo "$moria_root" --cache-dir "$cache_dir" --driver "$driver" --observer "$observer" \
     --auditor "$exec_auditor" --report-dir "$report_root" --storage-profile "$storage_profile" \
-    --contract-sha256 "$contract_sha256" "$@"
+    --contract-sha256 "$contract_sha256" --real-rustc "$real_rustc" "$@"
 }
 
 selection_config "$report_root/producer-selection.json" nonzero
@@ -78,7 +78,7 @@ else
     pnpm --dir "$bro_root" --filter @bro/pm prove:moria:cargo-reapi -- \
       --repo "$moria_root" --cache-dir "$cache_dir" --driver "$driver" --observer "$observer" \
       --auditor "$exec_auditor" --report-dir "$report_root" --storage-profile "$storage_profile" \
-      --contract-sha256 "$contract_sha256" \
+      --contract-sha256 "$contract_sha256" --real-rustc "$real_rustc" \
       --producer-only true \
       >"$report_root/bro-producer-cli.stdout" 2>"$report_root/bro-producer-cli.stderr" || status=$?
   : >"$report_root/producer-observer.stderr"
@@ -112,7 +112,7 @@ else
     pnpm --dir "$bro_root" --filter @bro/pm prove:moria:cargo-reapi -- \
       --repo "$moria_root" --cache-dir "$cache_dir" --driver "$driver" --observer "$observer" \
       --auditor "$exec_auditor" --report-dir "$report_root" --storage-profile "$storage_profile" \
-      --contract-sha256 "$contract_sha256" \
+      --contract-sha256 "$contract_sha256" --real-rustc "$real_rustc" \
       --consumers-only true --producer-retirement "$producer_retirement" \
       >"$report_root/bro-cli.stdout" 2>"$report_root/bro-cli.stderr" || status=$?
   : >"$report_root/consumers-observer.stderr"
