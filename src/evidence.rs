@@ -122,12 +122,6 @@ pub struct PlatformResult {
     pub violations: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NestedEvidence {
-    #[serde(default)]
-    evidence_refs: Vec<EvidenceRef>,
-}
-
 impl AggregateProofV2 {
     pub fn verify(root: &Path) -> Result<Self> {
         let root = root
@@ -478,10 +472,19 @@ fn verify_evidence(
         .extension()
         .is_some_and(|extension| extension == "json")
     {
-        let nested: NestedEvidence = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("parsing nested evidence {}", path.display()))?;
-        for child in &nested.evidence_refs {
-            verify_evidence(root, child, roles, visiting, visited, verified_artifacts)?;
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("parsing JSON evidence {}", path.display()))?;
+        if let Some(children) = value
+            .as_object()
+            .and_then(|object| object.get("evidence_refs"))
+        {
+            let children: Vec<EvidenceRef> = serde_json::from_value(children.clone())
+                .with_context(|| {
+                    format!("parsing nested evidence references in {}", path.display())
+                })?;
+            for child in &children {
+                verify_evidence(root, child, roles, visiting, visited, verified_artifacts)?;
+            }
         }
     }
     visiting.remove(&path);
@@ -1142,6 +1145,7 @@ fn required_claims(kind: &str, platform_os: &str) -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1206,9 +1210,9 @@ mod tests {
         verify_evidence(
             root.path(),
             &reference,
-            &mut Default::default(),
-            &mut Default::default(),
-            &mut Default::default(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
             &mut 0,
         )
         .expect("valid graph");
@@ -1217,9 +1221,68 @@ mod tests {
             verify_evidence(
                 root.path(),
                 &reference,
-                &mut Default::default(),
-                &mut Default::default(),
-                &mut Default::default(),
+                &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &mut 0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn json_evidence_without_reference_field_is_a_hashed_leaf() {
+        let root = tempdir().expect("root");
+        for (name, value) in [
+            (
+                "docker-inspect.json",
+                serde_json::json!([{"Id":"sha256:abc","Config":{}}]),
+            ),
+            ("environment.json", serde_json::json!({"passed":true})),
+            ("scalar.json", serde_json::json!(42)),
+        ] {
+            let path = root.path().join(name);
+            fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("evidence");
+            let reference = EvidenceRef {
+                role: "raw_json".to_owned(),
+                path: PathBuf::from(name),
+                sha256: sha256_file(&path).expect("digest"),
+            };
+            let mut verified = 0;
+            verify_evidence(
+                root.path(),
+                &reference,
+                &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &mut verified,
+            )
+            .expect("JSON leaf");
+            assert_eq!(verified, 1);
+        }
+    }
+
+    #[test]
+    fn explicit_malformed_nested_evidence_field_fails_closed() {
+        let root = tempdir().expect("root");
+        let report = root.path().join("report.json");
+        fs::write(
+            &report,
+            serde_json::to_vec(&serde_json::json!({"evidence_refs":"not-an-array"})).expect("json"),
+        )
+        .expect("report");
+        let reference = EvidenceRef {
+            role: "auditor_report".to_owned(),
+            path: PathBuf::from("report.json"),
+            sha256: sha256_file(&report).expect("digest"),
+        };
+        assert!(
+            verify_evidence(
+                root.path(),
+                &reference,
+                &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
                 &mut 0,
             )
             .is_err()
