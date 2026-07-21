@@ -4,8 +4,8 @@ fn cold_resource_receipt_runs_two_distinct_moria_gates_concurrently() {
     let receipt = include_str!("../acceptance/run-resources.sh");
     let platform = include_str!("../acceptance/run-platform-qualification.sh");
 
-    assert!(cold_work.contains("cargo_reapi_resource_lane_a"));
-    assert!(cold_work.contains("cargo_reapi_resource_lane_b"));
+    assert!(cold_work.contains("CARGO_PROFILE_DEV_DEBUG=1"));
+    assert!(cold_work.contains("CARGO_PROFILE_DEV_DEBUG=2"));
     assert!(cold_work.contains("pid_a=$!"));
     assert!(cold_work.contains("pid_b=$!"));
     assert!(cold_work.contains("wait \"$pid_a\""));

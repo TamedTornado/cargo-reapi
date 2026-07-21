@@ -34,13 +34,13 @@ git -C "$moria_root" archive --format=tar HEAD | tar -xf - -C "$lane_a"
 git -C "$moria_root" archive --format=tar HEAD | tar -xf - -C "$lane_b"
 
 CARGO_REAPI_RUSTC_TRACE=$report_root/lane-a-rustc-trace \
-RUSTFLAGS="--cfg cargo_reapi_resource_lane_a" \
+CARGO_PROFILE_DEV_DEBUG=1 \
   "$gate_runner" lane-a "$lane_a" "$driver" "$cache_dir" \
     "$report_root/lane-a-actions.jsonl" "$report_root/lane-a-member.json" \
     "$report_root/lane-a-output.log" "$observer" "$real_rustc" &
 pid_a=$!
 CARGO_REAPI_RUSTC_TRACE=$report_root/lane-b-rustc-trace \
-RUSTFLAGS="--cfg cargo_reapi_resource_lane_b" \
+CARGO_PROFILE_DEV_DEBUG=2 \
   "$gate_runner" lane-b "$lane_b" "$driver" "$cache_dir" \
     "$report_root/lane-b-actions.jsonl" "$report_root/lane-b-member.json" \
     "$report_root/lane-b-output.log" "$observer" "$real_rustc" &
