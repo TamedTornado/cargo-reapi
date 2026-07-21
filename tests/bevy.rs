@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+#[cfg(target_os = "macos")]
+use std::process::{Child, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
@@ -489,10 +491,15 @@ fn stop_os_compiler_observer(mut observer: OsCompilerObserver) -> PathBuf {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn start_os_compiler_observer(_root: &Path) {}
+struct OsCompilerObserver;
 
 #[cfg(not(target_os = "macos"))]
-fn stop_os_compiler_observer(_observer: ()) -> PathBuf {
+fn start_os_compiler_observer(_root: &Path) -> OsCompilerObserver {
+    OsCompilerObserver
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stop_os_compiler_observer(_observer: OsCompilerObserver) -> PathBuf {
     PathBuf::new()
 }
 

@@ -785,6 +785,8 @@ fn relocate_executables(
     mappings: &BTreeMap<PathBuf, PathBuf>,
     resource_ledger: &Path,
 ) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = resource_ledger;
     let mut by_path: BTreeMap<&Path, Vec<&ExecutableRelocation>> = BTreeMap::new();
     let mut relocated_slots = BTreeSet::new();
     for relocation in relocations {
@@ -840,6 +842,7 @@ fn relocate_executables(
                 .set_modified(modified),
         )?;
         drop(file);
+        #[cfg(target_os = "macos")]
         resign(&path, resource_ledger)?;
     }
     Ok(())
@@ -900,8 +903,8 @@ fn build_relocation_index(
             && raw_needles
                 .iter()
                 .any(|needle| contains_bytes(&bytes, needle.as_bytes()));
-        let contains_runtime_slot = executable
-            && executable_runtime_contains(entry.path(), &bytes, &slot_needles).unwrap_or(true);
+        let contains_runtime_slot =
+            executable && executable_runtime_contains(entry.path(), &bytes, &slot_needles);
         if contains_raw {
             files.push(entry.path().strip_prefix(target_root)?.to_path_buf());
         }
@@ -943,32 +946,41 @@ fn find_all_offsets(haystack: &[u8], needle: &[u8]) -> Vec<u64> {
     offsets
 }
 
-fn executable_runtime_contains(path: &Path, bytes: &[u8], needles: &[String]) -> Result<bool> {
+fn executable_runtime_contains(path: &Path, bytes: &[u8], needles: &[String]) -> bool {
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("/usr/bin/otool")
-            .arg("-l")
-            .arg(path)
-            .output()
-            .with_context(|| format!("reading Mach-O sections from {}", path.display()))?;
-        if !output.status.success() {
-            bail!("otool could not inspect {}", path.display());
-        }
-        let text = String::from_utf8(output.stdout).context("otool returned non-UTF-8 output")?;
-        let ranges = macho_runtime_ranges(&text, bytes.len());
-        Ok(ranges.into_iter().any(|(start, end)| {
-            needles
-                .iter()
-                .any(|needle| contains_bytes(&bytes[start..end], needle.as_bytes()))
-        }))
+        executable_runtime_contains_macos(path, bytes, needles).unwrap_or(true)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = path;
-        Ok(needles
+        needles
             .iter()
-            .any(|needle| contains_bytes(bytes, needle.as_bytes())))
+            .any(|needle| contains_bytes(bytes, needle.as_bytes()))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn executable_runtime_contains_macos(
+    path: &Path,
+    bytes: &[u8],
+    needles: &[String],
+) -> Result<bool> {
+    let output = Command::new("/usr/bin/otool")
+        .arg("-l")
+        .arg(path)
+        .output()
+        .with_context(|| format!("reading Mach-O sections from {}", path.display()))?;
+    if !output.status.success() {
+        bail!("otool could not inspect {}", path.display());
+    }
+    let text = String::from_utf8(output.stdout).context("otool returned non-UTF-8 output")?;
+    let ranges = macho_runtime_ranges(&text, bytes.len());
+    Ok(ranges.into_iter().any(|(start, end)| {
+        needles
+            .iter()
+            .any(|needle| contains_bytes(&bytes[start..end], needle.as_bytes()))
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -1108,25 +1120,21 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+#[cfg(target_os = "macos")]
 fn resign(path: &Path, resource_ledger: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let _lease = ResourceLease::acquire_snapshot_signing_at(resource_ledger)?;
-        let output = Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(path)
-            .output()
-            .with_context(|| format!("re-signing restored executable {}", path.display()))?;
-        if !output.status.success() {
-            bail!(
-                "codesign failed for restored executable {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+    let _lease = ResourceLease::acquire_snapshot_signing_at(resource_ledger)?;
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("re-signing restored executable {}", path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "codesign failed for restored executable {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = (path, resource_ledger);
     Ok(())
 }
 
