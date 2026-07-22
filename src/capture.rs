@@ -711,5 +711,8 @@ mod tests {
         assert!(is_keyed_environment("MY_PROC_MACRO_INPUT"));
         assert!(!is_keyed_environment("CLAUDE_CODE_HOST_HTTP_PROXY_PORT"));
         assert!(!is_keyed_environment("CLAUDE_CODE_HOST_SOCKS_PROXY_PORT"));
+        assert!(!is_keyed_environment("CODEX_THREAD_ID"));
+        assert!(!is_keyed_environment("HOSTNAME"));
+        assert!(!is_keyed_environment("SHLVL"));
     }
 }

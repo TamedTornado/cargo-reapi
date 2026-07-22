@@ -8,9 +8,12 @@ use anyhow::{Context, Result, bail};
 
 use crate::relocation::execution_slot;
 
-pub const NON_SEMANTIC_COMPILER_ENVIRONMENT: [&str; 2] = [
+pub const NON_SEMANTIC_COMPILER_ENVIRONMENT: [&str; 5] = [
     "CLAUDE_CODE_HOST_HTTP_PROXY_PORT",
     "CLAUDE_CODE_HOST_SOCKS_PROXY_PORT",
+    "CODEX_THREAD_ID",
+    "HOSTNAME",
+    "SHLVL",
 ];
 
 #[derive(Debug)]

@@ -27,7 +27,7 @@ use crate::cache::{CacheOptions, LinkerCaptureRecord, execute_cached};
 use crate::capture::{CaptureOptions, capture_invocation};
 use crate::gate::GateSnapshot;
 use crate::hermetic::SnapshotPolicy;
-use crate::invocation::RustcInvocation;
+use crate::invocation::{NON_SEMANTIC_COMPILER_ENVIRONMENT, RustcInvocation};
 use crate::maintenance::{GcOptions, cache_stats, collect_garbage};
 use crate::reclient::{ReclientOptions, execute_reapi, validate_platform_template};
 use crate::resource::ResourceCapacity;
@@ -437,13 +437,15 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         )?
     };
     let mut cargo = hermetic.command;
+    cargo.args(&cli.cargo_args);
+    // Agent and container runtimes synthesize per-invocation plumbing. Letting
+    // it reach build scripts would make otherwise identical worktrees
+    // semantically different; omitting it from a key without scrubbing it
+    // would be unsound.
+    for name in NON_SEMANTIC_COMPILER_ENVIRONMENT {
+        cargo.env_remove(name);
+    }
     cargo
-        .args(&cli.cargo_args)
-        // Container runtimes synthesize a per-container HOSTNAME. Letting it
-        // reach build scripts would make otherwise identical worktrees
-        // semantically different; omitting it from a key without scrubbing it
-        // would be unsound.
-        .env_remove("HOSTNAME")
         .env("RUSTC_WRAPPER", executable)
         .env(
             "CARGO_REAPI_BACKEND",
