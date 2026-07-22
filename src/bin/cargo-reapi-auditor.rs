@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 const MAXIMUM_RSS_BYTES: u64 = 15 * 1024 * 1024 * 1024;
 const MAXIMUM_SWAP_GROWTH_BYTES: u64 = 512 * 1024 * 1024;
@@ -64,7 +65,7 @@ struct EslogReport {
     passed: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 struct ProcessSample {
     pid: u32,
     ppid: u32,
@@ -75,11 +76,22 @@ struct ProcessSample {
 }
 
 #[derive(Debug, Serialize)]
+struct RetainedProcessSample {
+    pid: u32,
+    ppid: u32,
+    cpu_percent: f32,
+    rss_bytes: u64,
+    cpu_time: String,
+    command: String,
+    command_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ResourceSample {
     at_unix_ms: u128,
     aggregate_rss_bytes: u64,
     swap_bytes: u64,
-    processes: Vec<ProcessSample>,
+    processes: Vec<RetainedProcessSample>,
     lease_ownership: BTreeMap<u32, Vec<PathBuf>>,
 }
 
@@ -313,7 +325,7 @@ fn monitor_child(
             at_unix_ms: unix_ms(),
             aggregate_rss_bytes,
             swap_bytes: swap_bytes()?,
-            processes: descendants,
+            processes: descendants.iter().map(retain_process_sample).collect(),
             lease_ownership,
         });
         thread::sleep(Duration::from_millis(250));
@@ -328,6 +340,19 @@ fn monitor_child(
         observed_action_identities,
         samples,
     })
+}
+
+fn retain_process_sample(process: &ProcessSample) -> RetainedProcessSample {
+    const MAX_COMMAND_CHARS: usize = 1_024;
+    RetainedProcessSample {
+        pid: process.pid,
+        ppid: process.ppid,
+        cpu_percent: process.cpu_percent,
+        rss_bytes: process.rss_bytes,
+        cpu_time: process.cpu_time.clone(),
+        command: process.command.chars().take(MAX_COMMAND_CHARS).collect(),
+        command_sha256: format!("{:x}", Sha256::digest(process.command.as_bytes())),
+    }
 }
 
 fn write_monitor_report(context: &MonitorReportContext<'_>, outcome: MonitorOutcome) -> Result<()> {
@@ -629,6 +654,28 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_samples_bound_commands_and_hash_the_full_value() {
+        let command = format!(
+            "/usr/bin/bwrap {}",
+            "--ro-bind /source /target ".repeat(1_000)
+        );
+        let process = ProcessSample {
+            pid: 7,
+            ppid: 1,
+            cpu_percent: 25.0,
+            rss_bytes: 42,
+            cpu_time: "00:01".to_owned(),
+            command: command.clone(),
+        };
+        let retained = retain_process_sample(&process);
+        assert_eq!(retained.command.chars().count(), 1_024);
+        assert_eq!(
+            retained.command_sha256,
+            format!("{:x}", Sha256::digest(command.as_bytes()))
+        );
+    }
 
     #[test]
     fn eslog_counts_only_selected_exec_targets() {
