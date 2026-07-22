@@ -20,8 +20,7 @@ impl ResourceCapacity {
     pub fn from_env() -> Result<Self> {
         let contract = AcceptanceContract::embedded()?;
         let host_cpu = host_logical_cpus().unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map_or(contract.minimum_logical_cpus, usize::from)
+            std::thread::available_parallelism().map_or(contract.minimum_logical_cpus, usize::from)
         });
         let default_cpu = host_cpu.min(contract.minimum_logical_cpus);
         let default_memory = usize::try_from(contract.maximum_build_rss_gib)

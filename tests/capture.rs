@@ -996,6 +996,87 @@ fn main() {
     .expect("network fixture app");
 }
 
+#[cfg(target_os = "linux")]
+fn write_native_cpp_build_script_fixture(root: &Path) {
+    fs::create_dir_all(root.join("src")).expect("native fixture source");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='native-cpp-fixture'\nversion='0.0.0'\nedition='2024'\nbuild='build.rs'\n",
+    )
+    .expect("native fixture manifest");
+    fs::write(
+        root.join("native.cpp"),
+        "extern \"C\" int native_answer() { return 42; }\n",
+    )
+    .expect("native C++ source");
+    fs::write(
+        root.join("build.rs"),
+        r#"use std::{env, path::PathBuf, process::Command};
+
+fn checked(command: &mut Command, tool: &str) {
+    let status = command.status().unwrap_or_else(|error| panic!("failed to execute {tool}: {error}"));
+    assert!(status.success(), "{tool} failed with {status}");
+}
+
+fn main() {
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let object = out.join("native.o");
+    let archive = out.join("libnative_fixture.a");
+    checked(Command::new("c++").args(["-c", "native.cpp", "-o"]).arg(&object), "c++");
+    checked(Command::new("ar").arg("rcs").arg(&archive).arg(&object), "ar");
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=native_fixture");
+    println!("cargo:rerun-if-changed=native.cpp");
+}
+"#,
+    )
+    .expect("native build script");
+    fs::write(
+        root.join("src/main.rs"),
+        r#"unsafe extern "C" { fn native_answer() -> i32; }
+fn main() {
+    let answer = unsafe { native_answer() };
+    assert_eq!(answer, 42);
+    println!("{answer}");
+}
+"#,
+    )
+    .expect("native fixture app");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn strict_snapshot_build_script_can_execute_native_cpp_toolchain() {
+    let workspace = tempdir().expect("native fixture");
+    let cache = tempdir().expect("native fixture cache");
+    write_native_cpp_build_script_fixture(workspace.path());
+
+    let host_cpp = Command::new("c++")
+        .arg("--version")
+        .status()
+        .expect("the Linux qualification host must provide c++");
+    assert!(host_cpp.success(), "the host c++ toolchain is broken");
+
+    let status = run_snapshot_gate_with_environment(
+        workspace.path(),
+        cache.path(),
+        &workspace.path().join("target/actions.jsonl"),
+        &["build"],
+        &[],
+        None,
+    );
+    assert!(
+        status.success(),
+        "strict snapshot hid the host native C++ toolchain from build.rs"
+    );
+
+    let output = Command::new(workspace.path().join("target/debug/native-cpp-fixture"))
+        .output()
+        .expect("execute native fixture");
+    assert!(output.status.success(), "restored native fixture failed");
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "42");
+}
+
 #[test]
 fn deterministic_local_network_input_is_rejected_and_not_published() {
     let roots = tempdir().expect("network roots");

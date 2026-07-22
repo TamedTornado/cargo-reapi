@@ -431,6 +431,17 @@ fn extend_system_readable(readable: &mut BTreeSet<PathBuf>) {
             readable.insert(path);
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        // Debian-family tool frontends such as /usr/bin/c++ commonly resolve
+        // through /etc/alternatives before reaching their executable in /usr.
+        // Permit only that read-only symlink directory; the resolved tool and
+        // its libraries remain covered by the separately declared /usr root.
+        let alternatives = PathBuf::from("/etc/alternatives");
+        if alternatives.exists() {
+            readable.insert(alternatives);
+        }
+    }
     #[cfg(target_os = "macos")]
     for system_input in [
         "/Library/Developer",
