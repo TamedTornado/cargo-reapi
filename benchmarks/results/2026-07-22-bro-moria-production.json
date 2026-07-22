@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-07-22",
+  "platform": "linux-x86_64-xfs",
+  "cargo_reapi_revision": "d09e14eb0c57b9241f82aa8e97afd0ec1e542478",
+  "bro_revision": "235c6b553c323572a5f02154a139345a75817d2d",
+  "moria_revision": "e466da505d1c28880f8f86151b12ba6ad1ec0823",
+  "contract_sha256": "c833908214b7de8a7c593fee7799de7d1fbe5088b411b6d00fca7aa4ef4da500",
+  "producer": {
+    "duration_ms": 3125608,
+    "peak_rss_bytes": 6372159488,
+    "swap_growth_bytes": 144199680,
+    "infrastructure_stall": false,
+    "observed_lease_owners": 763,
+    "observed_action_identities": 638,
+    "passed": true
+  },
+  "warm_five": {
+    "elapsed_ms": 24695,
+    "deadline_ms": 120000,
+    "observed_members": 5,
+    "all_started_before_any_completed": true,
+    "member_duration_ms": [24695, 24660, 24632, 24673, 24645],
+    "target_empty_at_start": [true, true, true, true, true],
+    "gate_snapshot_hits_per_member": [3, 3, 3, 3, 3],
+    "cacheable_physical_actions_per_member": [0, 0, 0, 0, 0],
+    "externally_observed_compiler_actions_per_member": [0, 0, 0, 0, 0],
+    "peak_rss_bytes": 879132672,
+    "swap_growth_bytes": 0,
+    "infrastructure_stall": false,
+    "passed": true
+  }
+}

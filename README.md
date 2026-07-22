@@ -42,6 +42,8 @@ binary proof, real Moria one/five/ten rotational qualification, Bro's five-job
 qualification, reproduction commands, explicit SSD status, and the latest
 [macOS APFS current-schema qualification](benchmarks/results/2026-07-21-macos-apfs.md)
 and [Linux XFS current-schema qualification](benchmarks/results/2026-07-21-linux-xfs-schema-v3.md).
+The production Bro/Moria dogfood result is recorded in
+[the 2026-07-22 Linux/XFS run](benchmarks/results/2026-07-22-bro-moria-production.md).
 Rotational results are not presented as SSD acceptance, platform qualification
 is not presented as a combined cross-platform aggregate, and the README does
 not treat a warm clock as a substitute for adversarial correctness or OS-level
