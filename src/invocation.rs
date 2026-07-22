@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -106,16 +106,8 @@ impl RustcInvocation {
         fs::create_dir_all(&trace_root).with_context(|| {
             format!("creating compiler trace directory {}", trace_root.display())
         })?;
-        let record = trace_root.join(format!(
-            "rustc-observation.{}.{}",
-            std::process::id(),
-            crate_name.as_deref().unwrap_or("control")
-        ));
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&record)
-            .with_context(|| format!("creating compiler observation {}", record.display()))?;
+        let mut output =
+            create_observation_file(&trace_root, crate_name.as_deref().unwrap_or("control"))?;
         writeln!(output, "kind={kind}")?;
         writeln!(
             output,
@@ -241,6 +233,34 @@ impl RustcInvocation {
         outputs.dedup();
         Ok(outputs)
     }
+}
+
+fn create_observation_file(trace_root: &Path, crate_name: &str) -> Result<File> {
+    for sequence in 0..u32::MAX {
+        let record = trace_root.join(format!(
+            "rustc-observation.{}.{}.{}",
+            std::process::id(),
+            crate_name,
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&record)
+        {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("creating compiler observation {}", record.display())
+                });
+            }
+        }
+    }
+    bail!(
+        "compiler observation namespace exhausted in {}",
+        trace_root.display()
+    )
 }
 
 fn remove_non_semantic_compiler_environment(command: &mut Command) {
@@ -428,6 +448,17 @@ mod tests {
         ]
         .map(OsString::from);
         assert!(RustcInvocation::looks_like_wrapper(&args));
+    }
+
+    #[test]
+    fn compiler_observations_survive_pid_reuse_in_nested_namespaces() {
+        let trace = tempfile::tempdir().expect("compiler trace");
+        drop(create_observation_file(trace.path(), "control").expect("first observation"));
+        drop(create_observation_file(trace.path(), "control").expect("second observation"));
+        assert_eq!(
+            fs::read_dir(trace.path()).expect("trace directory").count(),
+            2
+        );
     }
 
     #[test]
