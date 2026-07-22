@@ -1,4 +1,6 @@
 use std::ffi::{OsStr, OsString};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -39,6 +41,7 @@ impl RustcInvocation {
     }
 
     pub fn execute(&self) -> Result<i32> {
+        self.record_physical_compiler_observation()?;
         let mut command = Command::new(&self.compiler);
         command.args(&self.args);
         apply_relocation_environment(&mut command)?;
@@ -55,6 +58,7 @@ impl RustcInvocation {
         capture_path: &Path,
         real_linker: &Path,
     ) -> Result<i32> {
+        self.record_physical_compiler_observation()?;
         let mut arguments = self.args.clone();
         arguments.push(OsString::from("-C"));
         arguments.push(OsString::from(format!(
@@ -73,6 +77,53 @@ impl RustcInvocation {
                 format!("executing {} with linker capture", self.compiler.display())
             })?;
         Ok(status.code().unwrap_or(1))
+    }
+
+    /// Record only compiler processes that cargo-reapi is actually about to
+    /// execute. Cache hits never reach this method, so this trace cannot turn
+    /// a restored action into a false physical-compiler observation.
+    fn record_physical_compiler_observation(&self) -> Result<()> {
+        let Some(trace_root) = std::env::var_os("CARGO_REAPI_RUSTC_TRACE").map(PathBuf::from)
+        else {
+            return Ok(());
+        };
+        let mut kind = "compile";
+        let mut crate_name = None;
+        let mut arguments = self.args.iter();
+        while let Some(argument) = arguments.next() {
+            if argument == "--crate-name" {
+                crate_name = arguments
+                    .next()
+                    .map(|value| value.to_string_lossy().into_owned());
+            }
+            if argument == "--print" || argument.to_string_lossy().starts_with("--print=") {
+                kind = "query";
+            }
+        }
+        if crate_name.is_none() {
+            kind = "query";
+        }
+        fs::create_dir_all(&trace_root).with_context(|| {
+            format!("creating compiler trace directory {}", trace_root.display())
+        })?;
+        let record = trace_root.join(format!(
+            "rustc-observation.{}.{}",
+            std::process::id(),
+            crate_name.as_deref().unwrap_or("control")
+        ));
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&record)
+            .with_context(|| format!("creating compiler observation {}", record.display()))?;
+        writeln!(output, "kind={kind}")?;
+        writeln!(
+            output,
+            "crate_name={}",
+            crate_name.as_deref().unwrap_or("control")
+        )?;
+        writeln!(output, "cwd={}", self.cwd.display())?;
+        Ok(())
     }
 
     pub fn configured_linker(&self) -> Option<PathBuf> {

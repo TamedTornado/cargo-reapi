@@ -209,11 +209,8 @@ fn run_snapshot_gate_with_inputs(
         let real_rustc =
             PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc");
         command
-            .env(
-                "RUSTC",
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("acceptance/rustc-observer/rustc"),
-            )
-            .env("CARGO_REAPI_REAL_RUSTC", real_rustc)
+            .env("RUSTC", &real_rustc)
+            .env("CARGO_REAPI_REAL_RUSTC", &real_rustc)
             .env("CARGO_REAPI_RUSTC_TRACE", trace);
     }
     command.status().expect("run whole-gate snapshot build")
@@ -1503,6 +1500,29 @@ fn check_clippy_and_test_publish_three_exact_gate_snapshots() {
     assert_eq!(
         objects, 3,
         "each logical Cargo command needs an exact snapshot"
+    );
+}
+
+#[test]
+fn clippy_preserves_its_nested_wrapper_chain_while_tracing_physical_compilers() {
+    let root = tempdir().expect("clippy fixture");
+    let cache = tempdir().expect("clippy cache");
+    let trace = tempdir().expect("compiler trace");
+    write_fixture(root.path(), false);
+    let status = run_snapshot_gate_with_environment(
+        root.path(),
+        cache.path(),
+        &root.path().join("actions.jsonl"),
+        &["clippy", "--all-targets", "--", "-D", "warnings"],
+        &[],
+        Some(trace.path()),
+    );
+    assert!(status.success(), "cargo clippy failed through cargo-reapi");
+    assert!(
+        observed_crates(trace.path(), root.path())
+            .iter()
+            .any(|name| name == "capture_fixture"),
+        "the physical compiler trace omitted the fixture crate"
     );
 }
 
