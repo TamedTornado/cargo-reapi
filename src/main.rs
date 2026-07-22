@@ -439,6 +439,11 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     let mut cargo = hermetic.command;
     cargo
         .args(&cli.cargo_args)
+        // Container runtimes synthesize a per-container HOSTNAME. Letting it
+        // reach build scripts would make otherwise identical worktrees
+        // semantically different; omitting it from a key without scrubbing it
+        // would be unsound.
+        .env_remove("HOSTNAME")
         .env("RUSTC_WRAPPER", executable)
         .env(
             "CARGO_REAPI_BACKEND",

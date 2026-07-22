@@ -524,7 +524,8 @@ fn hash_tree(
 fn is_gate_environment_key(name: &str) -> bool {
     !matches!(
         name,
-        "CARGO_REAPI_ACTION_LOG"
+        "HOSTNAME"
+            | "CARGO_REAPI_ACTION_LOG"
             | "CARGO_REAPI_BACKEND"
             | "CARGO_REAPI_CACHE_DIR"
             | "CARGO_REAPI_CLONE_TRACE"
@@ -1597,5 +1598,6 @@ mod tests {
         }
         assert!(!is_gate_environment_key("CARGO_TARGET_DIR"));
         assert!(!is_gate_environment_key("CARGO_REAPI_ACTION_LOG"));
+        assert!(!is_gate_environment_key("HOSTNAME"));
     }
 }

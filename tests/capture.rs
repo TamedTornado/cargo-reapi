@@ -1479,6 +1479,54 @@ fn whole_gate_snapshot_restores_cargo_state_after_producer_deletion() {
 }
 
 #[test]
+fn whole_gate_snapshot_restores_across_container_hostnames() {
+    let roots = tempdir().expect("hostname worktrees");
+    let cache = tempdir().expect("hostname cache");
+    let producer = roots.path().join("producer");
+    let consumer = roots.path().join("consumer");
+    write_fixture(&producer, false);
+    write_fixture(&consumer, false);
+    let producer_trace = roots.path().join("producer-trace");
+    let consumer_trace = roots.path().join("consumer-trace");
+    let producer_actions = roots.path().join("producer-actions.jsonl");
+    let consumer_actions = roots.path().join("consumer-actions.jsonl");
+
+    assert!(
+        run_snapshot_gate_with_environment(
+            &producer,
+            cache.path(),
+            &producer_actions,
+            &["check", "--all-targets"],
+            &[("HOSTNAME", "cold-container")],
+            Some(&producer_trace),
+        )
+        .success()
+    );
+    assert!(
+        run_snapshot_gate_with_environment(
+            &consumer,
+            cache.path(),
+            &consumer_actions,
+            &["check", "--all-targets"],
+            &[("HOSTNAME", "warm-container")],
+            Some(&consumer_trace),
+        )
+        .success()
+    );
+
+    let actions = read_actions(&consumer_actions);
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["execution"], "gate-snapshot-hit");
+    assert_eq!(
+        fs::read_dir(&consumer_trace)
+            .expect("consumer compiler trace")
+            .count(),
+        0,
+        "cross-container restore executed a physical compiler"
+    );
+}
+
+#[test]
 fn check_clippy_and_test_publish_three_exact_gate_snapshots() {
     let root = tempdir().expect("gate fixture");
     let cache = tempdir().expect("gate cache");
@@ -1550,6 +1598,33 @@ fn cargo_driver_captures_real_rustc_actions_without_credentials() {
             .as_object()
             .is_some_and(|environment| !environment.contains_key("CARGO_REGISTRY_TOKEN"))
     }));
+}
+
+#[test]
+fn cargo_driver_scrubs_container_hostname_from_builds() {
+    let fixture = tempdir().expect("hostname fixture");
+    write_fixture(fixture.path(), false);
+    fs::write(
+        fixture.path().join("src/lib.rs"),
+        concat!(
+            "pub const BUILD_HOSTNAME: Option<&str> = option_env!(\"HOSTNAME\");\n",
+            "#[test]\n",
+            "fn hostname_is_not_a_build_input() { assert!(BUILD_HOSTNAME.is_none()); }\n",
+        ),
+    )
+    .expect("hostname fixture source");
+    let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(fixture.path())
+        .env("HOSTNAME", "volatile-container-id")
+        .args(["--backend", "capture", "--action-log"])
+        .arg(fixture.path().join("actions.jsonl"))
+        .args(["--", "test"])
+        .status()
+        .expect("run hostname fixture");
+    assert!(
+        status.success(),
+        "Cargo build observed the container hostname"
+    );
 }
 
 #[test]
