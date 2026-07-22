@@ -378,7 +378,8 @@ fn write_monitor_report(context: &MonitorReportContext<'_>, outcome: MonitorOutc
     write_report(context.report, &proof)?;
     if !proof.passed {
         bail!(
-            "monitored command failed resource acceptance; report: {}",
+            "monitored command failed resource acceptance: {}; report: {}",
+            proof.violations.join("; "),
             context.report.display()
         );
     }
