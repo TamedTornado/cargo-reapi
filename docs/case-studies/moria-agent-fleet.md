@@ -123,6 +123,13 @@ CARGO_REAPI_ACTION_LOG=/tmp/bro-cargo-target/cargo-reapi/actions.jsonl
 compiler children and keys: the per-session thread ID, container hostname, and
 shell nesting level. Arbitrary project environment and `PATH` remain keyed.
 
+The defect records confirm that all four integration failures went in the safe
+direction: environment and ephemeral-session differences caused extra misses,
+the target-root disagreement made actions ineligible, and the
+`/etc/alternatives` gap failed the build loudly. None produced a stale artifact
+or false cache hit; availability failed, never correctness, as intended by the
+fail-closed design.
+
 After the repair, an operator sampled the still-growing action log from a fresh
 Moria agent test. At 18:42:18 UTC, its complete execution histogram contained
 68 compiler-wrapper records:
@@ -142,11 +149,13 @@ not become a full rebuild.
 At 18:42:32 UTC, while the same build was still running, a separate line count
 observed 74 records. The six records appended between those observations were
 eligible, because the second observation still found only the original six
-ineligible probes, but their execution outcomes were not re-histogrammed. The
-74-record observation is retained here, but the earlier 68-record histogram
-must not be presented as a partition of it. The raw operational log was
-subsequently disposed under the project's evidence-retention policy, so the
-final six outcomes are not reconstructable and are not guessed.
+ineligible probes, but their execution outcomes were not re-histogrammed.
+**The 74-record observation is UNRECONCILED.** It is retained here, but the
+earlier 68-record histogram must not be presented as a partition of it. The raw
+operational log was subsequently disposed under the project's evidence-
+retention policy, and a final recovery search of the original Docker volume,
+the migrated action-log volumes, and the operator transcript did not recover
+those six outcomes. They are not guessed.
 
 Every record with declared outputs was cache eligible. None of the removed
 runtime-plumbing fields appeared in the keyed environment.

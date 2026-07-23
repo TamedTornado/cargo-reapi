@@ -38,6 +38,30 @@ Every consumer began with an empty target and recorded exactly three
 - zero externally observed compiler actions;
 - no resource violation or infrastructure stall.
 
+## Later live agent action sample
+
+This separate field observation was taken after the production qualification,
+while a fresh agent build was still appending to its action log. At 18:42:18
+UTC, a complete histogram covered 68 records:
+
+| Execution | Records |
+| --- | ---: |
+| `cache-hit` | 31 |
+| `coalesced-hit` | 10 |
+| `local-cache-miss` | 21 |
+| `local-ineligible` capability probes | 6 |
+| **Histogram total** | **68** |
+
+Thus 41 of 62 cacheable actions reused outputs and 21 executed physically.
+At 18:42:32 UTC, a separate line count observed 74 records and still found only
+six ineligible records. The six newly appended eligible records were never
+re-histogrammed, and the disposable raw log no longer exists.
+
+**Status: UNRECONCILED.** The 74-record observation is retained, but the
+68-record histogram is not represented as its partition and the final six
+execution outcomes are unknown. The machine-readable record carries the same
+two observations and status.
+
 ## Evidence boundary and reproduction
 
 Bro is our private agentic coding harness. Its orchestration-specific runner is

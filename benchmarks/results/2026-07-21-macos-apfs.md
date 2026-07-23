@@ -18,9 +18,12 @@ Exact criteria document SHA-256:
 
 The current-schema macOS platform batch passed all 11 required receipts. The
 independent recursive verifier rehashed 152 retained evidence artifacts and
-reported every macOS receipt PASS with no macOS violations. Publication-grade
-multi-platform aggregate acceptance remains pending until a matching
-current-schema Linux batch exists.
+reported every macOS receipt PASS with no macOS violations. At the time of this
+platform run, multi-platform aggregation was pending a matching Linux batch. A
+matching Linux platform batch later passed independently, but a combined
+aggregate was not achieved because this disposable macOS raw evidence tree had
+already been deleted; the later enclosing verifier therefore reported macOS
+`UNMET`. This platform PASS is not presented as a combined aggregate PASS.
 
 ## Complete receipt matrix
 

@@ -29,5 +29,23 @@
     "swap_growth_bytes": 0,
     "infrastructure_stall": false,
     "passed": true
+  },
+  "later_live_agent_action_sample": {
+    "status": "UNRECONCILED",
+    "execution_histogram_observed_at": "2026-07-22T18:42:18Z",
+    "execution_histogram_record_count": 68,
+    "execution_histogram": {
+      "cache-hit": 31,
+      "coalesced-hit": 10,
+      "local-cache-miss": 21,
+      "local-ineligible": 6
+    },
+    "cacheable_action_count": 62,
+    "reused_action_count": 41,
+    "later_line_count_observed_at": "2026-07-22T18:42:32Z",
+    "later_line_count": 74,
+    "later_ineligible_count": 6,
+    "new_eligible_records_without_retained_execution_outcomes": 6,
+    "explanation": "The action log was still growing. The execution histogram was not rerun after six eligible records were appended, and the disposable raw log no longer exists. The final six outcomes are unknown and are not guessed."
   }
 }

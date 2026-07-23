@@ -22,12 +22,23 @@ artifacts from a shared local cache. It also includes a reclient adapter for
 eligible Remote Execution API (REAPI) actions; validation against a live
 production REAPI service remains a separate milestone.
 
-Reuse happens at two nested granularities. An exact whole-gate snapshot can
-restore complete Cargo state before Cargo runs; when that key misses, Cargo runs
-normally and the per-action cache can still restore or coalesce unchanged
-compiler and linker actions. The
+`cargo-reapi` uses two nested reuse paths. An exact whole-gate hit restores the
+complete Cargo target state and skips Cargo entirely. When the gate differs,
+Cargo remains the planner and runs inside the strict sandbox, while individual
+compiler and linker actions reuse verified cached outputs or coalesce identical
+concurrent misses. Only invalidated actions execute physically, and a successful
+result becomes a new whole-gate snapshot. The adversarial mutation qualification
+proves this by rebuilding exactly the changed leaf and its dependants while
+restoring unrelated work. The
 [Moria agent-fleet case study](docs/case-studies/moria-agent-fleet.md#two-reuse-layers)
 documents both paths and a live partial-match sample.
+
+On an exact hit, the user sees no Cargo compilation stream and the JSONL action
+log records `gate-snapshot-hit` or `coalesced-gate-hit`. On a replan, Cargo emits
+its normal output and the action log records each `cache-hit`, `coalesced-hit`,
+or physical miss. The CLI does not yet print a human-readable end-of-gate
+“N actions reused” summary; that presentation improvement is listed under
+[known limitations and roadmap](#known-limitations-and-roadmap).
 
 The current-schema macOS/arm64 APFS and Linux/x86_64 XFS platform batches each
 passed all 11 required qualification receipts. Independent recursive
@@ -97,11 +108,32 @@ production REAPI service. Unsupported effects fail closed in strict mode. The
 [coverage document](acceptance/COVERAGE.md#deliberate-limits) gives the exact
 boundary so “exhaustive” is not used as an unbounded compatibility claim.
 
+## Known limitations and roadmap
+
+Cache growth currently requires operator-configured size/free-space thresholds,
+and large-cache GC progress reporting is minimal: it does not yet expose
+lock-wait, scan, eviction, and blob-sweep phase telemetry. The CLI also lacks a
+human-readable end-of-gate reuse summary; the JSONL action log is currently the
+authoritative distinction between whole-gate hits, per-action reuse, coalesced
+waiters, and physical misses.
+
 ## Current status
 
-The capture and deterministic-action milestones work: Cargo runs normally, every compiler action still executes locally, and a JSON Lines action log records the compiler command, Cargo environment, package inputs, explicit `--extern` artifacts, output directory, and content digests. Actions also carry a cross-worktree-stable key derived from normalized paths, input content, compiler identity, platform, arguments, environment, and outputs.
+In capture mode, Cargo runs normally, every compiler action executes locally,
+and a JSON Lines action log records the compiler command, Cargo environment,
+package inputs, explicit `--extern` artifacts, output directory, and content
+digests. Cache mode additionally restores verified actions and whole gates as
+described above. Actions carry a cross-worktree-stable key derived from
+normalized paths, input content, compiler identity, platform, arguments,
+environment, and outputs.
 
-Remote eligibility is fail-closed and auditable. Metadata-only compiler actions with fully mapped inputs and outputs can be marked eligible. Link actions are explicitly ineligible until native libraries, linker binaries, response files, generated linker arguments, and platform SDK inputs are completely represented. Identical real Cargo fixtures in different worktrees must produce the same action key in the integration suite.
+Remote REAPI eligibility is fail-closed and auditable. Metadata-only compiler
+actions with fully mapped inputs and outputs can be marked eligible. Link
+actions remain remotely ineligible until native libraries, linker binaries,
+response files, generated linker arguments, and platform SDK inputs are
+completely represented. The local shared cache does support verified linked
+outputs. Identical real Cargo fixtures in different worktrees must produce the
+same action key in the integration suite.
 
 The local shared-cache backend implements content-addressed output blobs, per-action cross-process locks, atomic publication, digest verification, fixed-width cross-worktree relocation, macOS re-signing, and output materialization into independent worktrees. Native link discovery keys linker binaries, response files, native libraries, and platform SDK inputs. Concurrent identical actions execute once; distinct cold actions lease CPU and memory from one shared physical-action ledger. Cache hits never acquire a heavy-action lease and logical Cargo gates are never admission-capped.
 
