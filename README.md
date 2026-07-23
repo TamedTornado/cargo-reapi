@@ -22,6 +22,13 @@ artifacts from a shared local cache. It also includes a reclient adapter for
 eligible Remote Execution API (REAPI) actions; validation against a live
 production REAPI service remains a separate milestone.
 
+Reuse happens at two nested granularities. An exact whole-gate snapshot can
+restore complete Cargo state before Cargo runs; when that key misses, Cargo runs
+normally and the per-action cache can still restore or coalesce unchanged
+compiler and linker actions. The
+[Moria agent-fleet case study](docs/case-studies/moria-agent-fleet.md#two-reuse-layers)
+documents both paths and a live partial-match sample.
+
 The current-schema macOS/arm64 APFS and Linux/x86_64 XFS platform batches each
 passed all 11 required qualification receipts. Independent recursive
 verification rehashed 152 macOS artifacts and 192 Linux artifacts and reported

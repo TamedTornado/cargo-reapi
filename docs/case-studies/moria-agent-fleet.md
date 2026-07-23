@@ -61,6 +61,25 @@ relocated Bevy binaries, concurrent miss coalescing, undeclared reads, network
 denial, and recursive evidence verification. A fast warm clock alone is not
 treated as proof.
 
+## Two reuse layers
+
+`cargo-reapi` has two nested reuse layers:
+
+1. An exact whole-gate snapshot can restore the complete Cargo target state
+   before Cargo runs. This is the fast path exercised by the one/five/ten clean
+   Moria populations above.
+2. If the whole-gate key does not match, Cargo plans the gate normally and the
+   compiler wrapper applies the action cache to each `rustc` or linker action.
+   Unchanged actions can still be restored or coalesced while changed actions
+   execute and publish new outputs.
+
+The second layer is what makes partial matches useful. It is not inferred only
+from production telemetry: the public
+[exact-mutation acceptance](../../acceptance/COVERAGE.md) changes a leaf crate
+and requires OS-observed execution of exactly the leaf and its transitive
+dependants, while an unrelated crate must remain uncompiled. Wrapper attribution
+must match the OS-derived set.
+
 ## What happened under live load
 
 ### A real Bevy miss executed once
@@ -104,8 +123,9 @@ CARGO_REAPI_ACTION_LOG=/tmp/bro-cargo-target/cargo-reapi/actions.jsonl
 compiler children and keys: the per-session thread ID, container hostname, and
 shell nesting level. Arbitrary project environment and `PATH` remain keyed.
 
-After the repair, a retained action log from a fresh Moria agent test contained
-74 compiler-wrapper records:
+After the repair, an operator sampled the still-growing action log from a fresh
+Moria agent test. At 18:42:18 UTC, its complete execution histogram contained
+68 compiler-wrapper records:
 
 | Result | Records |
 | --- | ---: |
@@ -113,6 +133,20 @@ After the repair, a retained action log from a fresh Moria agent test contained
 | Coalesced hits | 10 |
 | Producer misses | 21 |
 | Non-cacheable compiler capability probes | 6 |
+
+The internally complete snapshot therefore contained 62 cacheable actions:
+41 (66.1%) reused existing or concurrently produced outputs and 21 executed as
+producers. This is the production partial-match result: a whole-gate miss did
+not become a full rebuild.
+
+At 18:42:32 UTC, while the same build was still running, a separate line count
+observed 74 records. The six records appended between those observations were
+eligible, because the second observation still found only the original six
+ineligible probes, but their execution outcomes were not re-histogrammed. The
+74-record observation is retained here, but the earlier 68-record histogram
+must not be presented as a partition of it. The raw operational log was
+subsequently disposed under the project's evidence-retention policy, so the
+final six outcomes are not reconstructable and are not guessed.
 
 Every record with declared outputs was cache eligible. None of the removed
 runtime-plumbing fields appeared in the keyed environment.
