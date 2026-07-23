@@ -198,10 +198,6 @@ The engagement shape is measurable:
 5. size physical-action admission from real host memory and CPU;
 6. dogfood under production load and retain honest pass statistics.
 
-That is the consulting story behind this repository: not merely installing a
-cache, but making parallel Rust delivery faster without weakening Cargo's
-correctness boundary.
-
-If this resembles your Rust, CI, or agent-fleet workload, Tamed Tornado offers
-focused build/resource diagnostics and agentic-pipeline assessments. See
-[tamedtornado.com](https://tamedtornado.com/) to start a conversation.
+The operational result is not merely a cache installation. It is a measured
+way to make parallel Rust delivery faster without weakening Cargo's correctness
+boundary.

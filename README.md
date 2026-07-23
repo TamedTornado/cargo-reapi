@@ -223,6 +223,3 @@ See [docs/architecture.md](docs/architecture.md) for the implementation boundary
 ## Project policy
 
 This is infrastructure built first for the Moria/Bro workload and shared in public as-is. Issues with reproducible action captures are welcome, but publication does not promise compatibility with every Cargo project, hosted workers, or support response times. Correctness and fail-closed behavior take priority over backend coverage.
-
-For consulting on Rust build contention, multi-worktree caching, or agentic
-delivery infrastructure, see [Tamed Tornado](https://tamedtornado.com/).
