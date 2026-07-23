@@ -115,6 +115,7 @@ fn execute_cached_regular(
     prepared: &PreparedInvocation,
 ) -> Result<i32> {
     let (lock, coalesced) = lock_action(cache_options, &prepared.action_key)?;
+    hold_test_producer_lock(coalesced)?;
 
     let result = finish_cached_execution(
         invocation,
@@ -154,6 +155,21 @@ fn lock_action(options: &CacheOptions, action_key: &str) -> Result<(File, bool)>
     };
 
     Ok((lock, coalesced))
+}
+
+fn hold_test_producer_lock(coalesced: bool) -> Result<()> {
+    if coalesced || std::env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_none() {
+        return Ok(());
+    }
+    let Some(milliseconds) = std::env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_HOLD_LOCK_MS") else {
+        return Ok(());
+    };
+    let milliseconds = milliseconds
+        .to_string_lossy()
+        .parse::<u64>()
+        .context("parsing CARGO_REAPI_ACTION_CACHE_TEST_HOLD_LOCK_MS")?;
+    std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    Ok(())
 }
 
 fn finish_cached_execution(

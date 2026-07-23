@@ -1913,6 +1913,9 @@ fn concurrent_identical_actions_execute_once_and_coalesce_on_the_lock() {
 
     let (mut first_command, first_log) = cache_command(first.path(), cache.path());
     let (mut second_command, second_log) = cache_command(second.path(), cache.path());
+    for command in [&mut first_command, &mut second_command] {
+        command.env("CARGO_REAPI_ACTION_CACHE_TEST_HOLD_LOCK_MS", "1500");
+    }
     let mut first_child = first_command
         .spawn()
         .expect("start first cached Cargo action");
