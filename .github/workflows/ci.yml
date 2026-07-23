@@ -22,5 +22,20 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
+      - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --bin cargo-reapi
+      - run: cargo test --all-targets
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo check --all-targets --locked
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked

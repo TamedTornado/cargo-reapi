@@ -6,6 +6,9 @@ was built for massively parallel Rust agent pipelines, where many clean
 worktrees otherwise repeat the same expensive checks, tests, compiler actions,
 and links.
 
+`cargo-reapi` is an independent project and is not affiliated with or endorsed
+by the Rust Project or Rust Foundation.
+
 We are currently dogfooding it in our private agentic coding harness against
 [Moria](https://github.com/TamedTornado/moria), a real Rust/Bevy voxel-world
 substrate. Five simultaneous clean Moria consumers completed their full warm
@@ -179,7 +182,7 @@ every snapshot key. `CARGO_REAPI_SRT` may point to an exact pinned installation
 for development and CI; it is not a version bypass.
 
 ```sh
-cargo install cargo-reapi
+cargo install cargo-reapi --locked
 cargo reapi --backend capture -- test
 cargo reapi --backend cache --cache-dir /shared/cargo-reapi-cache -- check
 cargo reapi doctor --cache-dir /shared/cargo-reapi-cache --json
@@ -200,6 +203,9 @@ cargo reapi --backend reapi \
   --reclient-platform 'OSFamily={os},Arch={arch},toolchain_sha256={toolchain_sha256}' \
   -- check
 ```
+
+The installation provides the `cargo-reapi` Cargo subcommand and the
+`cargo-reapi-auditor` and `cargo-reapi-exec-auditor` verification tools.
 
 To install an unreleased checkout instead, run `cargo install --path .` from
 the repository root.
