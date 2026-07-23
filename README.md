@@ -56,6 +56,9 @@ committed acceptance machinery and the
 reproducible validation surface. Only concise benchmark statistics and pass
 matrices are committed—never raw OS events, receipt trees, caches, restored
 binaries, or aggregate evidence directories.
+The [2026-07-23 launch preflight](docs/launch-preflight-2026-07-23.md) records
+the file-by-file cold-reader audit, clean-checkout reproduction, and the
+explicitly unreconciled six-record production evidence gap.
 
 The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a
 second maintained build graph. That is a poor fit for arbitrary Cargo projects
@@ -153,7 +156,10 @@ Peak aggregate build-process RSS was 3.50 GB on macOS and 9.32 GB on Linux with
 no swap growth; deliberate no-progress runs were terminated and classified as
 infrastructure rather than agent feedback.
 
-The public name is currently collision-free: a crates.io exact-name search returned no `cargo-reapi` package, and the only GitHub repository returned for the name was this project (checked 2026-07-18). That is not a crates.io reservation; publication must repeat the check.
+The public name is currently collision-free: a crates.io exact-name search
+returned no `cargo-reapi` package, and the only GitHub repository returned for
+the name was this project (checked 2026-07-23). That is not a crates.io
+reservation; publication must repeat the check immediately before publishing.
 
 ## Usage
 
