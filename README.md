@@ -6,6 +6,15 @@ was built for massively parallel Rust agent pipelines, where many clean
 worktrees otherwise repeat the same expensive checks, tests, compiler actions,
 and links.
 
+We are currently dogfooding it in our private agentic coding harness against
+[Moria](https://github.com/TamedTornado/moria), a real Rust/Bevy voxel-world
+substrate. Five simultaneous clean Moria consumers completed their full warm
+quality gates in 24.695 seconds with zero OS-observed compiler/linker work. In
+the live harness, five worktrees reaching the same cold `bevy_pbr` action
+produced one physical compiler action and four coalesced waiters. The
+[agent-fleet case study](docs/case-studies/moria-agent-fleet.md) includes the
+measurements, integration failures, repairs, and limits.
+
 Cargo remains the build planner and source of truth. `cargo-reapi` observes the
 exact commands Cargo schedules through `RUSTC_WRAPPER`, captures and verifies
 their inputs and outputs, coalesces identical concurrent work, and restores
@@ -44,6 +53,11 @@ qualification, reproduction commands, explicit SSD status, and the latest
 and [Linux XFS current-schema qualification](benchmarks/results/2026-07-21-linux-xfs-schema-v3.md).
 The production Bro/Moria dogfood result is recorded in
 [the 2026-07-22 Linux/XFS run](benchmarks/results/2026-07-22-bro-moria-production.md).
+Bro is our private agentic coding harness, so its production record is a
+documented field result rather than a public reproduction of the orchestration
+layer. The public Moria runner and acceptance suite reproduce and independently
+observe the underlying cache, invalidation, coalescing, sandbox, and
+linked-binary behavior.
 Rotational results are not presented as SSD acceptance, platform qualification
 is not presented as a combined cross-platform aggregate, and the README does
 not treat a warm clock as a substitute for adversarial correctness or OS-level
@@ -209,3 +223,6 @@ See [docs/architecture.md](docs/architecture.md) for the implementation boundary
 ## Project policy
 
 This is infrastructure built first for the Moria/Bro workload and shared in public as-is. Issues with reproducible action captures are welcome, but publication does not promise compatibility with every Cargo project, hosted workers, or support response times. Correctness and fail-closed behavior take priority over backend coverage.
+
+For consulting on Rust build contention, multi-worktree caching, or agentic
+delivery infrastructure, see [Tamed Tornado](https://tamedtornado.com/).

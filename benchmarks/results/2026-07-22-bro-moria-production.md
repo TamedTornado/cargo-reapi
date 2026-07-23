@@ -38,19 +38,38 @@ Every consumer began with an empty target and recorded exactly three
 - zero externally observed compiler actions;
 - no resource violation or infrastructure stall.
 
-## Reproduction
+## Evidence boundary and reproduction
 
-Bro's runner is
-[`cargo-reapi-moria-proof.ts`](https://github.com/TamedTornado/Bro/blob/235c6b553c323572a5f02154a139345a75817d2d/packages/pm/src/benchmarks/cargo-reapi-moria-proof.ts).
-Run it once with `--producer-only true`, retain its generated
-`bro-producer-retirement.json`, then run it from a fresh container with
-`--consumers-only true --producer-retirement PATH`. Both invocations must use
-the same Moria revision, cache, acceptance-contract digest, storage profile,
-and real Rust compiler. Wrap each invocation with `cargo-reapi-auditor run`
-against the cache's `resource-ledger-v1` directory.
+Bro is our private agentic coding harness. Its orchestration-specific runner is
+therefore not a public reproduction surface. This record retains the measured
+statistics, pinned Bro revision, acceptance-contract digest, and public Moria
+and cargo-reapi revisions from that production run.
+
+The public cargo-reapi runner exercises the same cache mechanics without Bro:
+
+```sh
+sudo -v
+target/release/cargo-reapi-auditor run \
+  --report /path/to/proof-report/resource-proof.json -- \
+  acceptance/run-moria-local.sh \
+  /path/to/Moria \
+  /shared/cargo-reapi-cache \
+  /path/to/proof-report \
+  ssd
+```
+
+It cold-seeds one producer, retires that producer path, and launches complete
+Moria gates in simultaneous clean consumers. The full procedure, external OS
+observation, adversarial suite, and evidence disposal rules are documented in
+[`../../acceptance/REPRODUCING.md`](../../acceptance/REPRODUCING.md).
 
 The consumer command itself creates exactly five worktrees and rejects the run
 unless all five overlap, finish within the fixed SSD reference, pass the full
 gate, and report zero internal and externally observed compiler work. Raw proof
 packages are reproducible generated artifacts and were deleted after these
 statistics were extracted.
+
+For continuing field results—including one-producer/four-waiter behavior on a
+real Bevy action, live cache-eligibility defects, repairs, and production
+resource samples—see the
+[Moria agent-fleet dogfood case study](../../docs/case-studies/moria-agent-fleet.md).
