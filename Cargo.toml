@@ -2,10 +2,26 @@
 name = "cargo-reapi"
 version = "0.1.0"
 edition = "2024"
+default-run = "cargo-reapi"
 license = "MIT OR Apache-2.0"
 description = "Cargo-authoritative Rust action capture and REAPI execution"
+readme = "README.md"
+homepage = "https://github.com/TamedTornado/cargo-reapi"
 repository = "https://github.com/TamedTornado/cargo-reapi"
+keywords = ["cargo", "build-cache", "remote-execution", "reapi", "rustc"]
+categories = [
+    "caching",
+    "command-line-utilities",
+    "development-tools::build-utils",
+    "development-tools::cargo-plugins",
+]
 rust-version = "1.88"
+exclude = [
+    "/.dockerignore",
+    "/.github/**",
+    "/.gitignore",
+    "/AGENTS.md",
+]
 
 [dependencies]
 anyhow = "1.0"

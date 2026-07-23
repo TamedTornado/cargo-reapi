@@ -59,6 +59,7 @@ impl From<SnapshotPolicyArg> for SnapshotPolicy {
 #[command(
     name = "cargo reapi",
     bin_name = "cargo reapi",
+    version,
     trailing_var_arg = true
 )]
 struct Cli {
@@ -775,6 +776,25 @@ fn strip_cargo_subcommand_name(mut args: Vec<OsString>) -> Vec<OsString> {
         args.remove(1);
     }
     args
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::{Parser, error::ErrorKind};
+
+    use super::Cli;
+
+    #[test]
+    fn version_identifies_cargo_reapi_instead_of_delegating_to_cargo() {
+        let error = Cli::try_parse_from(["cargo-reapi", "--version"])
+            .expect_err("--version exits through clap");
+
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!("cargo reapi {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -179,7 +179,7 @@ every snapshot key. `CARGO_REAPI_SRT` may point to an exact pinned installation
 for development and CI; it is not a version bypass.
 
 ```sh
-cargo install --path .
+cargo install cargo-reapi
 cargo reapi --backend capture -- test
 cargo reapi --backend cache --cache-dir /shared/cargo-reapi-cache -- check
 cargo reapi doctor --cache-dir /shared/cargo-reapi-cache --json
@@ -200,6 +200,9 @@ cargo reapi --backend reapi \
   --reclient-platform 'OSFamily={os},Arch={arch},toolchain_sha256={toolchain_sha256}' \
   -- check
 ```
+
+To install an unreleased checkout instead, run `cargo install --path .` from
+the repository root.
 
 Long-lived runtimes may configure the backend and cache once, then use the ordinary
 driver form `cargo-reapi check`, `cargo-reapi clippy ...`, or `cargo-reapi test`.
