@@ -221,6 +221,28 @@ consumer. The complete audited surface and remaining remote-execution boundary
 are recorded in the
 [compiler environment relocation audit](../compiler-environment-relocation.md).
 
+### Nested target leakage needed a product diagnostic
+
+The Linux verification initially inherited the outer harness's
+`CARGO_TARGET_DIR` into nested fixture builds. That made otherwise independent
+workspaces share the target containing the running cargo-reapi test binary.
+The resulting read-only action-log errors and `Text file busy` failures did not
+identify the configuration mistake.
+
+cargo-reapi now rejects the unsafe topology before starting Cargo when its own
+resolved executable is inside the active target root. The error identifies
+inherited `CARGO_TARGET_DIR` as the likely cause and tells the operator to
+remove it from the child or use a separate external target. This is deliberately
+not a ban on shared external targets: a separate regression proves an installed
+cargo-reapi can still drive an explicitly configured external
+`CARGO_TARGET_DIR`. Nested test launchers also clear the parent target unless
+the test is specifically exercising that contract.
+
+After removing the leaked parent variable, the production Linux integration
+binary completed 32 tests with zero failures and three intentional ignores in
+222.23 seconds. The failed contaminated invocation is not counted as product
+evidence.
+
 ## Resource behavior
 
 At one measured five-session production point:

@@ -4,6 +4,12 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+- Relocate all known-root paths in the compiler environment, including dynamic
+  `CARGO_BIN_EXE_*`, config-relative, and build-script-emitted values.
+- Fail fast with an actionable diagnostic when an inherited
+  `CARGO_TARGET_DIR` would make cargo-reapi manage the target containing its
+  own running executable, while preserving intentional external targets.
+
 ## [0.1.0] - 2026-07-23
 
 Initial public release.

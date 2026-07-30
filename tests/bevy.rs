@@ -43,6 +43,7 @@ fn cached_cargo(
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     let status = command
         .current_dir(root)
+        .env_remove("CARGO_TARGET_DIR")
         .env(
             "RUSTC",
             Path::new(env!("CARGO_MANIFEST_DIR")).join("acceptance/rustc-observer/rustc"),
@@ -371,6 +372,7 @@ fn fresh_control(root: &Path) {
     ] {
         let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
             .current_dir(root)
+            .env_remove("CARGO_TARGET_DIR")
             .env("CARGO_NET_OFFLINE", "true")
             .args(["--backend", "local", "--snapshot-policy", "off", "--"])
             .args(arguments)

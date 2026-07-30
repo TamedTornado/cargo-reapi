@@ -201,6 +201,7 @@ fn cache_command(root: &Path, cache_dir: &Path) -> (Command, PathBuf) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
+        .env_remove("CARGO_TARGET_DIR")
         .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .args(["--backend", "cache", "--action-log"])
         .arg(&action_log)
@@ -255,6 +256,7 @@ fn run_snapshot_gate_with_inputs(
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
+        .env_remove("CARGO_TARGET_DIR")
         .args(["--backend", "cache", "--action-log"])
         .arg(action_log)
         .arg("--cache-dir")
@@ -1884,6 +1886,7 @@ fn cargo_driver_scrubs_container_hostname_from_builds() {
     .expect("hostname fixture source");
     let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(fixture.path())
+        .env_remove("CARGO_TARGET_DIR")
         .env("HOSTNAME", "volatile-container-id")
         .args(["--backend", "capture", "--action-log"])
         .arg(fixture.path().join("actions.jsonl"))
@@ -1894,6 +1897,58 @@ fn cargo_driver_scrubs_container_hostname_from_builds() {
         status.success(),
         "Cargo build observed the container hostname"
     );
+}
+
+#[test]
+fn inherited_target_containing_driver_fails_with_actionable_diagnostic() {
+    let fixture = tempdir().expect("fixture directory");
+    write_fixture(fixture.path(), false);
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .canonicalize()
+        .expect("canonical cargo-reapi test executable");
+    let target_root = executable
+        .parent()
+        .and_then(Path::parent)
+        .expect("cargo-reapi executable below target root");
+    let output = Command::new(&executable)
+        .current_dir(fixture.path())
+        .env("CARGO_TARGET_DIR", target_root)
+        .args(["--backend", "capture", "--action-log"])
+        .arg(fixture.path().join("actions.jsonl"))
+        .args(["--", "check"])
+        .output()
+        .expect("run cargo-reapi with leaked target");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("CARGO_TARGET_DIR leaked"), "{stderr}");
+    assert!(stderr.contains("Unset CARGO_TARGET_DIR"), "{stderr}");
+}
+
+#[test]
+fn explicit_external_cargo_target_dir_remains_supported() {
+    let fixture = tempdir().expect("fixture directory");
+    let external_target = tempdir().expect("external Cargo target directory");
+    write_fixture(fixture.path(), false);
+    let action_log = fixture.path().join("actions.jsonl");
+    let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(fixture.path())
+        .env("CARGO_TARGET_DIR", external_target.path())
+        .args([
+            "--backend",
+            "capture",
+            "--snapshot-policy",
+            "off",
+            "--action-log",
+        ])
+        .arg(&action_log)
+        .args(["--", "check"])
+        .status()
+        .expect("run cargo-reapi with intentional external target");
+
+    assert!(status.success());
+    assert!(external_target.path().join("debug").is_dir());
+    assert!(!read_actions(&action_log).is_empty());
 }
 
 #[test]
@@ -2306,6 +2361,7 @@ fn reapi_backend_stages_explicit_inputs_and_materializes_fake_rewrapper_outputs(
     let action_log = fixture.path().join("target/cargo-reapi/actions.jsonl");
     let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(fixture.path())
+        .env_remove("CARGO_TARGET_DIR")
         .args(["--backend", "reapi", "--action-log"])
         .arg(&action_log)
         .arg("--rewrapper")
@@ -2359,6 +2415,7 @@ fn reapi_backend_never_sends_link_actions_to_rewrapper() {
     let action_log = fixture.path().join("target/cargo-reapi/actions.jsonl");
     let status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(fixture.path())
+        .env_remove("CARGO_TARGET_DIR")
         .args(["--backend", "reapi", "--action-log"])
         .arg(&action_log)
         .arg("--rewrapper")

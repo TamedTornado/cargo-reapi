@@ -17,7 +17,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
@@ -381,10 +381,7 @@ fn run_doctor(mut args: Vec<OsString>) -> Result<i32> {
 }
 
 fn run_cli(cli: &Cli) -> Result<i32> {
-    let executable = env::current_exe().context("locating cargo-reapi executable")?;
-    let workspace_root = env::current_dir().context("locating Cargo workspace root")?;
-    let target_root = env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace_root.join("target"), PathBuf::from);
+    let (executable, workspace_root, target_root) = resolve_driver_context()?;
     let action_log = cli
         .action_log
         .clone()
@@ -486,6 +483,59 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         &action_log_for_snapshot,
     )?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn resolve_driver_context() -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let executable = env::current_exe()
+        .context("locating cargo-reapi executable")?
+        .canonicalize()
+        .context("resolving cargo-reapi executable")?;
+    let workspace_root = env::current_dir().context("locating Cargo workspace root")?;
+    let target_root = resolve_target_root(&workspace_root)?;
+    validate_driver_paths(&executable, &target_root)?;
+    Ok((executable, workspace_root, target_root))
+}
+
+fn resolve_target_root(workspace_root: &Path) -> Result<PathBuf> {
+    resolve_target_root_from(
+        workspace_root,
+        env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+    )
+}
+
+fn resolve_target_root_from(workspace_root: &Path, configured: Option<PathBuf>) -> Result<PathBuf> {
+    let target_root = configured.map_or_else(
+        || workspace_root.join("target"),
+        |path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace_root.join(path)
+            }
+        },
+    );
+    if target_root.exists() {
+        target_root
+            .canonicalize()
+            .with_context(|| format!("resolving Cargo target directory {}", target_root.display()))
+    } else {
+        Ok(target_root)
+    }
+}
+
+fn validate_driver_paths(executable: &Path, target_root: &Path) -> Result<()> {
+    if executable.starts_with(target_root) {
+        bail!(
+            "cargo-reapi executable {} is inside the active Cargo target directory {}. \
+             This usually means CARGO_TARGET_DIR leaked from a parent Cargo invocation into a \
+             nested cargo-reapi build. Unset CARGO_TARGET_DIR for the child build or select a \
+             separate external target directory; cargo-reapi will not manage a target that \
+             contains its own running executable",
+            executable.display(),
+            target_root.display()
+        );
+    }
+    Ok(())
 }
 
 fn configure_reclient_environment(cargo: &mut Command, cli: &Cli) {
@@ -780,9 +830,11 @@ fn strip_cargo_subcommand_name(mut args: Vec<OsString>) -> Vec<OsString> {
 
 #[cfg(test)]
 mod cli_tests {
+    use std::path::Path;
+
     use clap::{Parser, error::ErrorKind};
 
-    use super::Cli;
+    use super::{Cli, resolve_target_root_from, validate_driver_paths};
 
     #[test]
     fn version_identifies_cargo_reapi_instead_of_delegating_to_cargo() {
@@ -794,6 +846,39 @@ mod cli_tests {
             error.to_string(),
             format!("cargo reapi {}\n", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn rejects_driver_executable_inside_managed_target_with_leak_diagnostic() {
+        let error = validate_driver_paths(
+            Path::new("/workspace/target/debug/cargo-reapi"),
+            Path::new("/workspace/target"),
+        )
+        .expect_err("driver inside managed target must fail closed");
+        let message = error.to_string();
+
+        assert!(message.contains("CARGO_TARGET_DIR leaked"), "{message}");
+        assert!(message.contains("/workspace/target"), "{message}");
+    }
+
+    #[test]
+    fn permits_installed_driver_with_external_managed_target() {
+        validate_driver_paths(
+            Path::new("/usr/local/bin/cargo-reapi"),
+            Path::new("/build/cargo-target"),
+        )
+        .expect("installed driver may manage an external target");
+    }
+
+    #[test]
+    fn resolves_relative_target_directory_against_workspace() {
+        let resolved = resolve_target_root_from(
+            Path::new("/workspace/project"),
+            Some("shared-target".into()),
+        )
+        .expect("resolve relative target");
+
+        assert_eq!(resolved, Path::new("/workspace/project/shared-target"));
     }
 }
 
