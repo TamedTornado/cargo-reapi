@@ -4,6 +4,10 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-30
+
+- Provision locked Cargo sources before entering strict offline snapshots, while
+  keeping build scripts, proc macros, and compiler actions network-denied.
 - Relocate all known-root paths in the compiler environment, including dynamic
   `CARGO_BIN_EXE_*`, config-relative, and build-script-emitted values.
 - Fail fast with an actionable diagnostic when an inherited
@@ -32,5 +36,6 @@ Initial public release.
 Known limitations and the precise qualified boundary are documented in the
 [README](README.md#known-limitations-and-roadmap).
 
-[Unreleased]: https://github.com/TamedTornado/cargo-reapi/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/TamedTornado/cargo-reapi/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/TamedTornado/cargo-reapi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TamedTornado/cargo-reapi/releases/tag/v0.1.0

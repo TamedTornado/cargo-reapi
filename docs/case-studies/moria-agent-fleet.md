@@ -243,6 +243,26 @@ binary completed 32 tests with zero failures and three intentional ignores in
 222.23 seconds. The failed contaminated invocation is not counted as product
 evidence.
 
+The follow-up verification of committed repair `2125e67` rebuilt the test
+binaries from a clean source archive inside Bro's production build worker.
+Its Linux results were:
+
+- 69 cargo-reapi core tests passed;
+- 3 receipt-auditor and 4 exec-auditor tests passed;
+- 34 integration tests passed, 3 dedicated acceptance tests were intentionally
+  ignored, and no test failed, in 224.27 seconds;
+- the resource-harness and stall-auditor tests passed; and
+- the four Bevy tests remained intentionally delegated to their phased
+  acceptance runner.
+
+The same deployed binary then reran Moria issue 404's real quality gate. Six
+cacheable Moria actions restored from the shared action cache: `moria` twice,
+`public_boundary`, `moria_qualify` twice, and `qualifier_scaffold`. There were
+zero cacheable misses. The remaining rustc records were successful
+non-cacheable control probes. The gate completed successfully before the run
+was stopped again, so no downstream product work is included in this
+infrastructure result.
+
 ## Resource behavior
 
 At one measured five-session production point:
