@@ -47,7 +47,7 @@ impl RustcInvocation {
         self.record_physical_compiler_observation()?;
         let mut command = Command::new(&self.compiler);
         command.args(&self.args);
-        apply_relocation_environment(&mut command)?;
+        apply_relocation_environment(&mut command, &self.compiler)?;
         remove_non_semantic_compiler_environment(&mut command);
         let status = command
             .status()
@@ -70,7 +70,7 @@ impl RustcInvocation {
         )));
         let mut command = Command::new(&self.compiler);
         command.args(arguments);
-        apply_relocation_environment(&mut command)?;
+        apply_relocation_environment(&mut command, &self.compiler)?;
         remove_non_semantic_compiler_environment(&mut command);
         let status = command
             .env("CARGO_REAPI_LINKER_CAPTURE", capture_path)
@@ -297,7 +297,7 @@ fn is_cargo_driver_command(value: &OsStr) -> bool {
     )
 }
 
-fn apply_relocation_environment(command: &mut Command) -> Result<()> {
+fn apply_relocation_environment(command: &mut Command, compiler: &Path) -> Result<()> {
     let mut roots = Vec::new();
     for name in [
         "CARGO_MANIFEST_DIR",
@@ -308,24 +308,57 @@ fn apply_relocation_environment(command: &mut Command) -> Result<()> {
             roots.push(PathBuf::from(path));
         }
     }
-    roots.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-
-    for name in ["CARGO_MANIFEST_DIR", "CARGO_MANIFEST_PATH", "OUT_DIR"] {
-        let Some(value) = std::env::var_os(name) else {
-            continue;
-        };
-        if let Some(relocated) = relocated_environment_path(&value, &roots)? {
-            command.env(name, relocated);
-        }
+    if let Some(toolchain) = compiler.parent().and_then(Path::parent) {
+        roots.push(toolchain.to_path_buf());
     }
-    for (name, value) in
-        std::env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("CARGO_BIN_EXE_"))
-    {
-        if let Some(relocated) = relocated_environment_path(&value, &roots)? {
+    roots.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    roots.dedup();
+
+    for (name, value) in std::env::vars_os() {
+        if let Some(relocated) = relocated_environment_value(&value, &roots)? {
             command.env(name, relocated);
         }
     }
     Ok(())
+}
+
+fn relocated_environment_value(value: &OsStr, roots: &[PathBuf]) -> Result<Option<OsString>> {
+    let Some(value) = value.to_str() else {
+        return relocated_environment_path(value, roots);
+    };
+    let mut matches = Vec::new();
+    for root in roots {
+        if let Some(root) = root.to_str() {
+            matches.push((root, execution_slot(root)?));
+        }
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    let mut changed = false;
+    while !remaining.is_empty() {
+        let Some((offset, root, slot)) = matches
+            .iter()
+            .filter_map(|(root, slot)| remaining.find(root).map(|offset| (offset, *root, slot)))
+            .min_by(
+                |(left_offset, left_root, _), (right_offset, right_root, _)| {
+                    left_offset
+                        .cmp(right_offset)
+                        .then_with(|| right_root.len().cmp(&left_root.len()))
+                },
+            )
+        else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..offset]);
+        output.push_str(slot);
+        remaining = &remaining[offset + root.len()..];
+        if let Some(without_separator) = remaining.strip_prefix('/') {
+            remaining = without_separator;
+        }
+        changed = true;
+    }
+    Ok(changed.then(|| OsString::from(output)))
 }
 
 fn relocated_environment_path(value: &OsStr, roots: &[PathBuf]) -> Result<Option<OsString>> {
@@ -457,13 +490,29 @@ mod tests {
     fn relocates_cargo_binary_paths_into_the_target_slot() {
         let target = PathBuf::from("/workspace/target");
         let actual = OsStr::new("/workspace/target/debug/tool");
-        let relocated = relocated_environment_path(actual, std::slice::from_ref(&target))
+        let relocated = relocated_environment_value(actual, std::slice::from_ref(&target))
             .expect("relocate binary path");
         let expected = format!(
             "{}debug/tool",
             execution_slot(target.to_str().unwrap()).unwrap()
         );
         assert_eq!(relocated, Some(OsString::from(expected)));
+    }
+
+    #[test]
+    fn relocates_paths_inside_arbitrary_environment_values_without_cascading_roots() {
+        let package = PathBuf::from("/workspace/crate");
+        let workspace = PathBuf::from("/workspace");
+        let actual = OsStr::new("input=/workspace/crate/data;workspace=/workspace");
+        let relocated = relocated_environment_value(actual, &[package.clone(), workspace.clone()])
+            .expect("relocate composite value")
+            .expect("value contains relocatable roots");
+        let expected = format!(
+            "input={}data;workspace={}",
+            execution_slot(package.to_str().unwrap()).unwrap(),
+            execution_slot(workspace.to_str().unwrap()).unwrap(),
+        );
+        assert_eq!(relocated, OsString::from(expected));
     }
 
     #[test]

@@ -199,6 +199,28 @@ from compiler/build-script execution: Cargo may provision the resolved source
 graph before strict execution, while the transition itself remains
 network-denied.
 
+### Integration-test companion binaries exposed incomplete environment relocation
+
+A later Moria quality gate restored the `moria_qualify` binary action from the
+shared cache, then every integration test that used
+`env!("CARGO_BIN_EXE_moria-qualify")` failed to launch it. The restored test
+binary contained the deleted producer worktree's absolute companion path.
+This was a cargo-reapi defect, not project feedback: the action key normalized
+Cargo's environment across worktrees, but compiler execution relocated only a
+fixed inventory of path variables and omitted Cargo's dynamically named
+`CARGO_BIN_EXE_<name>` values.
+
+The repair removes that name inventory. Every compiler environment value is now
+scanned for declared package, workspace, target, and toolchain roots before
+rustc embeds it. This also covers customer-defined config-relative `[env]`
+values and arbitrary paths emitted through `cargo::rustc-env`.
+The cross-worktree regression uses different-length producer and consumer
+paths, deletes the producer, requires an action-cache hit, launches the restored
+companion binary, and proves both custom path sources resolve inside the
+consumer. The complete audited surface and remaining remote-execution boundary
+are recorded in the
+[compiler environment relocation audit](../compiler-environment-relocation.md).
+
 ## Resource behavior
 
 At one measured five-session production point:

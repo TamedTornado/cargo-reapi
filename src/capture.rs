@@ -610,16 +610,20 @@ fn is_keyed_environment(name: &str) -> bool {
 
 fn is_compiler_environment(name: &str) -> bool {
     name.starts_with("CARGO_CFG_")
+        || name.starts_with("CARGO_BIN_EXE_")
         || name.starts_with("CARGO_FEATURE_")
         || name.starts_with("CARGO_PKG_")
         || name.starts_with("CARGO_TARGET_")
         || matches!(
             name,
-            "CARGO_CRATE_NAME"
+            "CARGO"
+                | "CARGO_BIN_NAME"
+                | "CARGO_CRATE_NAME"
                 | "CARGO_ENCODED_RUSTFLAGS"
                 | "CARGO_MANIFEST_DIR"
                 | "CARGO_MANIFEST_PATH"
                 | "CARGO_PRIMARY_PACKAGE"
+                | "CARGO_TARGET_TMPDIR"
                 | "DEBUG"
                 | "HOST"
                 | "NUM_JOBS"
@@ -695,6 +699,9 @@ mod tests {
         assert!(is_compiler_environment(
             "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"
         ));
+        assert!(is_compiler_environment("CARGO_BIN_EXE_companion"));
+        assert!(is_compiler_environment("CARGO_TARGET_TMPDIR"));
+        assert!(is_compiler_environment("CARGO"));
         assert!(is_compiler_environment("OUT_DIR"));
     }
 

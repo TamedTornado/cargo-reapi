@@ -62,6 +62,9 @@ binaries, or aggregate evidence directories.
 The [2026-07-23 launch preflight](docs/launch-preflight-2026-07-23.md) records
 the file-by-file cold-reader audit, clean-checkout reproduction, and the
 explicitly unreconciled six-record production evidence gap.
+The [compiler-environment relocation audit](docs/compiler-environment-relocation.md)
+enumerates Cargo's built-in and customer-defined path-bearing variables and the
+cross-worktree regression that now covers them.
 
 The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a
 second maintained build graph. That is a poor fit for arbitrary Cargo projects

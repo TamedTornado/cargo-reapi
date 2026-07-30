@@ -90,22 +90,47 @@ fn write_library_app_fixture(root: &Path) {
 }
 
 fn write_companion_binary_fixture(root: &Path) {
+    fs::create_dir_all(root.join(".cargo")).expect("Cargo config directory");
     fs::create_dir_all(root.join("src/bin")).expect("binary source directory");
     fs::create_dir_all(root.join("tests")).expect("integration test directory");
+    fs::create_dir_all(root.join("fixture-input")).expect("config-relative input directory");
+    fs::write(
+        root.join(".cargo/config.toml"),
+        "[env]\nCOMPANION_DATA = { value = \"fixture-input\", relative = true, force = true }\n",
+    )
+    .expect("Cargo config");
     fs::write(
         root.join("Cargo.toml"),
-        "[package]\nname='companion-fixture'\nversion='0.0.0'\nedition='2024'\n",
+        "[package]\nname='companion-fixture'\nversion='0.0.0'\nedition='2024'\nbuild='build.rs'\n",
     )
     .expect("fixture manifest");
     fs::write(
+        root.join("build.rs"),
+        concat!(
+            "fn main() {\n",
+            "    let manifest = std::env::var(\"CARGO_MANIFEST_DIR\").unwrap();\n",
+            "    println!(\"cargo::rustc-env=BUILD_SCRIPT_DATA={manifest}/fixture-input\");\n",
+            "    println!(\"cargo::rerun-if-changed=build.rs\");\n",
+            "}\n",
+        ),
+    )
+    .expect("build script");
+    fs::write(
         root.join("src/bin/companion.rs"),
-        "fn main() { println!(\"companion-ok\"); }\n",
+        concat!(
+            "fn main() {\n",
+            "    println!(\"companion-ok\");\n",
+            "    println!(\"{}\", env!(\"COMPANION_DATA\"));\n",
+            "    println!(\"{}\", env!(\"BUILD_SCRIPT_DATA\"));\n",
+            "}\n",
+        ),
     )
     .expect("companion source");
     fs::write(
         root.join("tests/spawns_companion.rs"),
         concat!(
             "use std::process::Command;\n",
+            "use std::path::PathBuf;\n",
             "#[test]\n",
             "fn integration_test_can_spawn_its_cargo_binary() {\n",
             "    let companion = env!(\"CARGO_BIN_EXE_companion\");\n",
@@ -113,7 +138,17 @@ fn write_companion_binary_fixture(root: &Path) {
             "        .output()\n",
             "        .unwrap_or_else(|error| panic!(\"companion binary {companion} should exist: {error}\"));\n",
             "    assert!(output.status.success());\n",
-            "    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), \"companion-ok\");\n",
+            "    let stdout = String::from_utf8(output.stdout).expect(\"companion stdout\");\n",
+            "    let mut lines = stdout.lines();\n",
+            "    assert_eq!(lines.next(), Some(\"companion-ok\"));\n",
+            "    let actual = PathBuf::from(lines.next().expect(\"config-relative path\"))\n",
+            "        .canonicalize().expect(\"restored config-relative path exists\");\n",
+            "    let build_script = PathBuf::from(lines.next().expect(\"build-script path\"))\n",
+            "        .canonicalize().expect(\"restored build-script path exists\");\n",
+            "    let expected = PathBuf::from(env!(\"CARGO_MANIFEST_DIR\"))\n",
+            "        .join(\"fixture-input\").canonicalize().expect(\"consumer fixture input exists\");\n",
+            "    assert_eq!(actual, expected);\n",
+            "    assert_eq!(build_script, expected);\n",
             "}\n",
         ),
     )
