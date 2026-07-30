@@ -172,6 +172,33 @@ result. This is why Moria remains part of the test strategy: a synthetic
 Rust-only fixture would not have exercised the native dependency graph that
 real Bevy projects carry.
 
+### Cold source acquisition exposed a qualification blind spot
+
+The first implementation issue in a later Moria wave required
+`futures-channel 0.3.33`, which was absent from the shared Cargo home.
+cargo-reapi's strict-snapshot preparation unconditionally invoked `cargo
+metadata --offline`, so the quality gate failed before any compiler action.
+The production harness initially treated that as project feedback, and an
+agent produced a lockfile-only repair that downgraded dependencies to versions
+already present on the host. The run was stopped and that change was closed
+without merge.
+
+The earlier qualification did not catch this because its runner explicitly
+prefetched every fixture. The regression now creates a locked Git dependency
+and two empty Cargo homes. An explicitly offline invocation must remain
+offline and fail without acquiring the dependency; a normal first invocation
+must acquire the locked source before entering the network-denied transition
+sandbox. The test failed against the old binary and passed with the repair,
+followed by the complete formatting, Clippy, and test suite.
+
+The live Moria retry then passed with the original lockfile. External
+inspection found both the `futures-channel-0.3.33.crate` archive and extracted
+source in the shared Cargo home, and the replacement PR contained only the
+original implementation commit. This result distinguishes source acquisition
+from compiler/build-script execution: Cargo may provision the resolved source
+graph before strict execution, while the transition itself remains
+network-denied.
+
 ## Resource behavior
 
 At one measured five-session production point:
