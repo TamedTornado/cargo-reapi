@@ -314,21 +314,34 @@ fn apply_relocation_environment(command: &mut Command) -> Result<()> {
         let Some(value) = std::env::var_os(name) else {
             continue;
         };
-        let path = PathBuf::from(&value);
-        let Some((root, relative)) = roots.iter().find_map(|root| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|relative| (root, relative))
-        }) else {
-            continue;
-        };
-        let mut relocated = execution_slot(&root.to_string_lossy())?;
-        if !relative.as_os_str().is_empty() {
-            relocated.push_str(&relative.to_string_lossy());
+        if let Some(relocated) = relocated_environment_path(&value, &roots)? {
+            command.env(name, relocated);
         }
-        command.env(name, relocated);
+    }
+    for (name, value) in
+        std::env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("CARGO_BIN_EXE_"))
+    {
+        if let Some(relocated) = relocated_environment_path(&value, &roots)? {
+            command.env(name, relocated);
+        }
     }
     Ok(())
+}
+
+fn relocated_environment_path(value: &OsStr, roots: &[PathBuf]) -> Result<Option<OsString>> {
+    let path = PathBuf::from(value);
+    let Some((root, relative)) = roots.iter().find_map(|root| {
+        path.strip_prefix(root)
+            .ok()
+            .map(|relative| (root, relative))
+    }) else {
+        return Ok(None);
+    };
+    let mut relocated = execution_slot(&root.to_string_lossy())?;
+    if !relative.as_os_str().is_empty() {
+        relocated.push_str(&relative.to_string_lossy());
+    }
+    Ok(Some(OsString::from(relocated)))
 }
 
 fn option_values(args: &[OsString], option: &str) -> Vec<String> {
@@ -438,6 +451,19 @@ mod tests {
                 "missing environment removal for {name}"
             );
         }
+    }
+
+    #[test]
+    fn relocates_cargo_binary_paths_into_the_target_slot() {
+        let target = PathBuf::from("/workspace/target");
+        let actual = OsStr::new("/workspace/target/debug/tool");
+        let relocated = relocated_environment_path(actual, std::slice::from_ref(&target))
+            .expect("relocate binary path");
+        let expected = format!(
+            "{}debug/tool",
+            execution_slot(target.to_str().unwrap()).unwrap()
+        );
+        assert_eq!(relocated, Some(OsString::from(expected)));
     }
 
     #[test]

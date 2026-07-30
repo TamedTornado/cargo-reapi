@@ -89,6 +89,37 @@ fn write_library_app_fixture(root: &Path) {
     .expect("app source");
 }
 
+fn write_companion_binary_fixture(root: &Path) {
+    fs::create_dir_all(root.join("src/bin")).expect("binary source directory");
+    fs::create_dir_all(root.join("tests")).expect("integration test directory");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='companion-fixture'\nversion='0.0.0'\nedition='2024'\n",
+    )
+    .expect("fixture manifest");
+    fs::write(
+        root.join("src/bin/companion.rs"),
+        "fn main() { println!(\"companion-ok\"); }\n",
+    )
+    .expect("companion source");
+    fs::write(
+        root.join("tests/spawns_companion.rs"),
+        concat!(
+            "use std::process::Command;\n",
+            "#[test]\n",
+            "fn integration_test_can_spawn_its_cargo_binary() {\n",
+            "    let companion = env!(\"CARGO_BIN_EXE_companion\");\n",
+            "    let output = Command::new(companion)\n",
+            "        .output()\n",
+            "        .unwrap_or_else(|error| panic!(\"companion binary {companion} should exist: {error}\"));\n",
+            "    assert!(output.status.success());\n",
+            "    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), \"companion-ok\");\n",
+            "}\n",
+        ),
+    )
+    .expect("integration test source");
+}
+
 fn run(
     root: &std::path::Path,
     cargo_command: &str,
@@ -99,6 +130,7 @@ fn run(
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
+        .env_remove("CARGO_TARGET_DIR")
         .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .args(["--backend", backend, "--action-log"])
         .arg(&action_log);
@@ -1898,6 +1930,82 @@ fn linked_binary_is_durably_cached_and_runs_in_a_later_worktree() {
     assert_eq!(
         fs::canonicalize(embedded_manifest.trim()).expect("embedded consumer manifest path"),
         fs::canonicalize(second.path()).expect("consumer manifest path")
+    );
+}
+
+#[test]
+fn restored_action_relocates_integration_test_companion_binary_to_consumer_target() {
+    let worktrees = tempdir().expect("worktree parent");
+    let cache = tempdir().expect("shared cache directory");
+    let producer = worktrees.path().join("producer");
+    let consumer = worktrees
+        .path()
+        .join("consumer-with-a-different-path-length");
+    fs::create_dir_all(&producer).expect("producer worktree");
+    fs::create_dir_all(&consumer).expect("consumer worktree");
+    write_companion_binary_fixture(&producer);
+    write_companion_binary_fixture(&consumer);
+
+    let producer_actions = run(&producer, "test", "cache", Some(cache.path()));
+    let producer_companion = producer_actions
+        .iter()
+        .find(|action| {
+            action["crate_name"] == "companion"
+                && !action["arguments"]
+                    .as_array()
+                    .is_some_and(|arguments| arguments.iter().any(|argument| argument == "--test"))
+        })
+        .expect("producer companion compiler action");
+    assert_eq!(producer_companion["execution"], "local-cache-miss");
+    fs::remove_dir_all(&producer).expect("remove producer before consumer");
+
+    let consumer_action_log = consumer.join("target/cargo-reapi/actions.jsonl");
+    let consumer_status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(&consumer)
+        .env_remove("CARGO_TARGET_DIR")
+        .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
+        .env("CARGO_REGISTRY_TOKEN", "do-not-record")
+        .args(["--backend", "cache", "--action-log"])
+        .arg(&consumer_action_log)
+        .arg("--cache-dir")
+        .arg(cache.path())
+        .args(["--", "test"])
+        .status()
+        .expect("run consumer cargo-reapi test");
+    let consumer_actions = read_actions(&consumer_action_log);
+    let companion_action = consumer_actions
+        .iter()
+        .find(|action| {
+            action["crate_name"] == "companion"
+                && !action["arguments"]
+                    .as_array()
+                    .is_some_and(|arguments| arguments.iter().any(|argument| argument == "--test"))
+        })
+        .expect("consumer companion compiler action");
+    assert!(
+        consumer_status.success(),
+        "restored integration test could not spawn its companion binary; restored action: {companion_action:#}",
+    );
+    assert_eq!(
+        producer_companion["arguments"], companion_action["arguments"],
+        "normalized companion arguments differ"
+    );
+    assert_eq!(
+        producer_companion["keyed_environment"], companion_action["keyed_environment"],
+        "normalized companion environment differs"
+    );
+    assert_eq!(
+        producer_companion["inputs"], companion_action["inputs"],
+        "normalized companion inputs differ"
+    );
+    assert_eq!(
+        companion_action["execution"], "cache-hit",
+        "the fixture must exercise partial action reuse; producer_key={} consumer_key={}",
+        producer_companion["action_key"], companion_action["action_key"],
+    );
+    assert!(
+        consumer.join("target/debug/companion").is_file(),
+        "consumer target is missing the Cargo-visible companion binary"
     );
 }
 
