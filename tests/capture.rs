@@ -216,6 +216,127 @@ fn run_snapshot_gate_with_inputs(
     command.status().expect("run whole-gate snapshot build")
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_locked_git_dependency_fixture(root: &Path) -> PathBuf {
+    let dependency = root.join("dependency");
+    fs::create_dir_all(dependency.join("src")).expect("dependency source directory");
+    fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname='cold-dependency'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .expect("dependency manifest");
+    fs::write(
+        dependency.join("src/lib.rs"),
+        "pub fn answer() -> u8 { 42 }\n",
+    )
+    .expect("dependency source");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "cargo-reapi@example.invalid"],
+        vec!["config", "user.name", "cargo-reapi test"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "seed dependency"],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&dependency)
+            .status()
+            .expect("prepare dependency repository");
+        assert!(status.success());
+    }
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&dependency)
+        .output()
+        .expect("resolve dependency revision");
+    assert!(revision.status.success());
+    let revision = String::from_utf8(revision.stdout)
+        .expect("utf8 dependency revision")
+        .trim()
+        .to_owned();
+
+    let consumer = root.join("consumer");
+    fs::create_dir_all(consumer.join("src")).expect("consumer source directory");
+    let dependency_url = format!("file://{}", dependency.display());
+    fs::write(
+        consumer.join("Cargo.toml"),
+        format!(
+            "[package]\nname='cold-consumer'\nversion='0.1.0'\nedition='2024'\n\
+             [dependencies]\ncold-dependency={{git='{dependency_url}',rev='{revision}'}}\n"
+        ),
+    )
+    .expect("consumer manifest");
+    fs::write(
+        consumer.join("src/lib.rs"),
+        "pub fn answer() -> u8 { cold_dependency::answer() }\n",
+    )
+    .expect("consumer source");
+
+    let lock_home = root.join("lock-home");
+    fs::create_dir_all(&lock_home).expect("lock cargo home");
+    let lock_status = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(&consumer)
+        .env("CARGO_HOME", &lock_home)
+        .status()
+        .expect("generate locked dependency graph");
+    assert!(lock_status.success());
+    consumer
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn strict_snapshot_first_use_provisions_a_locked_git_dependency() {
+    let roots = tempdir().expect("first-use roots");
+    let consumer = write_locked_git_dependency_fixture(roots.path());
+
+    let offline_home = roots.path().join("offline-home");
+    fs::create_dir_all(&offline_home).expect("offline cargo home");
+    let offline_home_text = offline_home.to_string_lossy().into_owned();
+    let offline_status = run_snapshot_gate_with_environment(
+        &consumer,
+        &roots.path().join("offline-cache"),
+        &roots.path().join("offline-actions.jsonl"),
+        &["check", "--locked"],
+        &[
+            ("CARGO_HOME", offline_home_text.as_str()),
+            ("CARGO_NET_OFFLINE", "true"),
+        ],
+        None,
+    );
+    assert!(
+        !offline_status.success(),
+        "cargo-reapi must preserve an explicit caller offline policy"
+    );
+    assert!(
+        !offline_home.join("git/checkouts").exists(),
+        "an explicitly offline invocation unexpectedly acquired a dependency"
+    );
+
+    let cold_home = roots.path().join("cold-home");
+    fs::create_dir_all(&cold_home).expect("cold cargo home");
+    let cold_home_text = cold_home.to_string_lossy().into_owned();
+    let cache = roots.path().join("cache");
+    let action_log = roots.path().join("actions.jsonl");
+    let status = run_snapshot_gate_with_environment(
+        &consumer,
+        &cache,
+        &action_log,
+        &["check", "--locked"],
+        &[("CARGO_HOME", cold_home_text.as_str())],
+        None,
+    );
+
+    assert!(
+        status.success(),
+        "a first strict-snapshot invocation must acquire locked sources before entering the network-denied build sandbox"
+    );
+    assert!(
+        cold_home.join("git/checkouts").is_dir(),
+        "the invocation did not populate the initially empty Cargo home"
+    );
+}
+
 fn observed_crates(trace: &Path, worktree: &Path) -> Vec<String> {
     let worktree = fs::canonicalize(worktree).expect("canonical worktree");
     let mut crates = Vec::new();

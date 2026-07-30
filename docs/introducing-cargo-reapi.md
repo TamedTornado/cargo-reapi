@@ -128,6 +128,13 @@ compiles C++, archives an object, links it, and executes the result.
 All three bugs reduced availability or reuse. None produced a false hit. That
 is the failure direction we want.
 
+Strict snapshots do not require an operator to pre-warm Cargo's registry.
+Before constructing the network-denied transition sandbox, cargo-reapi runs
+compiler-free Cargo metadata and allows Cargo to acquire any locked registry or
+git sources missing from `CARGO_HOME`. The resolved package roots then become
+read-only sandbox inputs. Callers that explicitly configure Cargo offline
+remain offline, and compiler/build-script actions never receive network access.
+
 ## What the measurements look like
 
 On a Linux/XFS qualification host, one cold Moria gate took 3,125.608 seconds

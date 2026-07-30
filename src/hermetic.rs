@@ -716,7 +716,11 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn package_roots(workspace: &Path, cache: &Path) -> Result<BTreeSet<PathBuf>> {
-    let output = crate::query::cargo_metadata_output(workspace, cache, &["--offline"])
+    // Resolve and acquire locked package sources before constructing the
+    // network-denied transition sandbox. Cargo's own offline configuration
+    // remains authoritative; cargo-reapi must not silently impose an
+    // operator-managed pre-warm requirement on otherwise online callers.
+    let output = crate::query::cargo_metadata_output(workspace, cache, &[])
         .context("running cargo metadata for the strict snapshot policy")?;
     if !output.status.success() {
         bail!(
