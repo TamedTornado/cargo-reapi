@@ -29,22 +29,37 @@ pub struct ResourceCapacity {
 
 impl ResourceCapacity {
     pub fn from_env() -> Result<Self> {
-        let contract = AcceptanceContract::embedded()?;
-        let host_cpu = host_logical_cpus().unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(contract.minimum_logical_cpus, usize::from)
-        });
-        let default_cpu = host_cpu.min(contract.minimum_logical_cpus);
-        let default_memory = usize::try_from(contract.maximum_build_rss_gib)
-            .context("resource memory capacity does not fit usize")?;
-        let cpu = positive_env(CPU_CAPACITY_ENV)?.unwrap_or(default_cpu);
-        let memory_gib = positive_env(MEMORY_CAPACITY_ENV)?.unwrap_or(default_memory);
-        if cpu > host_cpu {
+        let host_cpu = host_logical_cpus()
+            .or_else(|| std::thread::available_parallelism().ok().map(usize::from));
+        Self::resolve(
+            host_cpu,
+            host_memory_gib(),
+            positive_env(CPU_CAPACITY_ENV)?,
+            positive_env(MEMORY_CAPACITY_ENV)?,
+        )
+    }
+
+    fn resolve(
+        host_cpu: Option<usize>,
+        host_memory: Option<usize>,
+        configured_cpu: Option<usize>,
+        configured_memory: Option<usize>,
+    ) -> Result<Self> {
+        let cpu = configured_cpu
+            .or(host_cpu)
+            .with_context(|| format!("cannot detect host CPUs; set {CPU_CAPACITY_ENV}"))?;
+        let memory_gib = configured_memory
+            .or(host_memory)
+            .with_context(|| format!("cannot detect host memory; set {MEMORY_CAPACITY_ENV}"))?;
+        if let Some(host_cpu) = host_cpu
+            && cpu > host_cpu
+        {
             bail!("{CPU_CAPACITY_ENV}={cpu} exceeds the host's {host_cpu} logical CPUs");
         }
         if memory_gib < 7 {
             bail!("{MEMORY_CAPACITY_ENV} must be at least 7 GiB for a native link lease");
         }
-        if let Some(host_memory_gib) = host_memory_gib()
+        if let Some(host_memory_gib) = host_memory
             && memory_gib > host_memory_gib
         {
             bail!(
@@ -52,6 +67,13 @@ impl ResourceCapacity {
             );
         }
         Ok(Self { cpu, memory_gib })
+    }
+
+    pub fn apply_to(self, command: &mut std::process::Command) {
+        // Resolve outside the strict sandbox, whose proc view may hide host
+        // discovery. Every wrapper must use the same selected ledger capacity.
+        command.env(CPU_CAPACITY_ENV, self.cpu.to_string());
+        command.env(MEMORY_CAPACITY_ENV, self.memory_gib.to_string());
     }
 }
 
@@ -261,7 +283,40 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
-    use super::ResourceLease;
+    use super::{ResourceCapacity, ResourceLease};
+
+    #[test]
+    fn defaults_use_host_capacity_instead_of_acceptance_benchmark_limits() {
+        assert_eq!(
+            ResourceCapacity::resolve(Some(20), Some(125), None, None).unwrap(),
+            ResourceCapacity {
+                cpu: 20,
+                memory_gib: 125
+            },
+        );
+    }
+
+    #[test]
+    fn configured_capacity_is_respected_and_validated_against_the_host() {
+        assert_eq!(
+            ResourceCapacity::resolve(Some(20), Some(125), Some(3), Some(11)).unwrap(),
+            ResourceCapacity {
+                cpu: 3,
+                memory_gib: 11
+            },
+        );
+        assert!(ResourceCapacity::resolve(Some(20), Some(125), Some(21), None).is_err());
+        assert!(ResourceCapacity::resolve(Some(20), Some(125), None, Some(126)).is_err());
+        assert!(ResourceCapacity::resolve(Some(20), Some(125), None, Some(6)).is_err());
+        assert!(ResourceCapacity::resolve(None, None, None, None).is_err());
+        assert_eq!(
+            ResourceCapacity::resolve(None, None, Some(3), Some(11)).unwrap(),
+            ResourceCapacity {
+                cpu: 3,
+                memory_gib: 11
+            },
+        );
+    }
 
     #[test]
     fn distinct_physical_actions_overlap_without_exceeding_the_ledger() {

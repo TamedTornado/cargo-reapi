@@ -435,6 +435,9 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         )?
     };
     let mut cargo = hermetic.command;
+    if matches!(cli.backend, Backend::Cache | Backend::Reapi) {
+        ResourceCapacity::from_env()?.apply_to(&mut cargo);
+    }
     cargo.args(&cli.cargo_args);
     // Agent and container runtimes synthesize per-invocation plumbing. Letting
     // it reach build scripts would make otherwise identical worktrees

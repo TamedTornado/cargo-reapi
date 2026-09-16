@@ -294,6 +294,36 @@ fn run_snapshot_gate(root: &Path, cache_dir: &Path, action_log: &Path, cargo_arg
     assert!(status.success());
 }
 
+#[test]
+fn strict_compiler_actions_use_the_drivers_selected_capacity() {
+    let root = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_fixture(root.path(), false);
+    let log = root.path().join("target/cargo-reapi/actions.jsonl");
+    assert!(
+        run_snapshot_gate_with_environment(
+            root.path(),
+            cache.path(),
+            &log,
+            &["check"],
+            &[
+                ("CARGO_REAPI_RESOURCE_CPU_CAPACITY", "1"),
+                ("CARGO_REAPI_RESOURCE_MEMORY_GIB_CAPACITY", "7")
+            ],
+            None,
+        )
+        .success()
+    );
+    let actions = read_actions(&log);
+    assert!(!actions.is_empty());
+    for action in actions {
+        assert_eq!(
+            action["resource_capacity"],
+            serde_json::json!({"cpu": 1, "memory_gib": 7})
+        );
+    }
+}
+
 fn run_snapshot_gate_with_environment(
     root: &Path,
     cache_dir: &Path,
@@ -588,11 +618,34 @@ fn mutation_rebuilds_only_leaf_and_dependents_under_external_observation() {
         )
         .success()
     );
+    let warm_log = roots.path().join("warm.jsonl");
+    assert!(
+        run_snapshot_gate_with_environment(
+            &consumer,
+            cache.path(),
+            &warm_log,
+            &["build", "--workspace"],
+            &[],
+            Some(trace.path()),
+        )
+        .success()
+    );
+    assert!(
+        fs::read_to_string(warm_log)
+            .unwrap()
+            .contains("gate-snapshot-hit")
+    );
     fs::write(
         consumer.join("leaf/src/lib.rs"),
         "pub fn answer() -> u32 { 43 }\n",
     )
     .expect("mutate leaf");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(consumer.join("leaf/src/lib.rs"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        .expect("backdate changed leaf in the restored target");
     fs::remove_dir_all(&producer).expect("retire producer");
     assert!(
         run_snapshot_gate_with_environment(
@@ -1720,6 +1773,68 @@ fn failing_simultaneous_gates_all_fail_and_publish_nothing() {
         !objects.exists() || fs::read_dir(objects).unwrap().next().is_none(),
         "failed producer published a partial snapshot"
     );
+}
+
+#[test]
+fn changed_source_in_an_existing_target_cannot_reuse_stale_cargo_freshness() {
+    for restore in [false, true] {
+        let root = tempdir().expect("workspace");
+        let cache = tempdir().expect("cache");
+        write_fixture(root.path(), false);
+        let target = root.path().join("target");
+        let log = target.join("cargo-reapi/actions.jsonl");
+        run_snapshot_gate(root.path(), cache.path(), &log, &["check"]);
+        if restore {
+            fs::remove_dir_all(&target).expect("retire target");
+            run_snapshot_gate(root.path(), cache.path(), &log, &["check"]);
+            assert!(
+                fs::read_to_string(&log)
+                    .unwrap()
+                    .contains("gate-snapshot-hit")
+            );
+        }
+        let source = root.path().join("src/lib.rs");
+        let original = fs::read(&source).expect("original source");
+        fs::write(&source, "compile_error!(\"changed source must fail\");\n")
+            .expect("poison source");
+        // Snapshot timestamps can be newer than the filesystem's next write
+        // timestamp. A content-key miss must not trust Cargo's old freshness.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .expect("simulate source timestamp older than cached fingerprints");
+        let outcome = run_snapshot_gate_with_environment(
+            root.path(),
+            cache.path(),
+            &log,
+            &["check"],
+            &[],
+            None,
+        );
+        assert!(
+            !outcome.success(),
+            "stale target returned success; restored={restore}"
+        );
+        assert_eq!(
+            fs::read_dir(cache.path().join("gate-snapshots/objects"))
+                .unwrap()
+                .count(),
+            1,
+            "a failed content state must not publish a gate snapshot"
+        );
+        fs::write(&source, original).expect("revert failed edit");
+        fs::remove_file(&log).expect("retire action log");
+        run_snapshot_gate(root.path(), cache.path(), &log, &["check"]);
+        let actions = read_actions(&log);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["execution"], "gate-snapshot-hit");
+        assert_eq!(
+            actions[0]["snapshot_marker_hit"], false,
+            "a failed replan must invalidate the old target marker"
+        );
+    }
 }
 
 #[test]

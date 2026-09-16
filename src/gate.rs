@@ -143,6 +143,9 @@ impl GateSnapshot {
                     .context("retiring a gate snapshot with stale declared inputs")?;
             }
         }
+        if !gate.restored {
+            gate.invalidate_target_freshness()?;
+        }
         Ok(gate)
     }
 
@@ -160,7 +163,6 @@ impl GateSnapshot {
             fs::remove_dir_all(&temporary)?;
         }
         let observed_inputs = collect_observed_inputs(&self.target)?;
-        stabilize_target_mtimes(&self.target)?;
         fs::create_dir_all(temporary.join("target"))?;
         clone_tree(&self.target, &temporary.join("target"))?;
         let generated = temporary.join("target/cargo-reapi");
@@ -287,7 +289,6 @@ impl GateSnapshot {
             &self.target,
             &self.resource_ledger,
         )?;
-        stabilize_target_mtimes(&self.target)?;
         self.relocation_ms = relocation_started.elapsed().as_millis();
         self.write_target_marker(&manifest.key)?;
         self.restored = true;
@@ -296,6 +297,37 @@ impl GateSnapshot {
 
     fn target_marker(&self) -> PathBuf {
         self.target.join("cargo-reapi/gate-state-v16")
+    }
+
+    fn invalidate_target_freshness(&self) -> Result<()> {
+        // The gate hashes content; Cargo normally checks source mtimes. On a
+        // content miss, old Cargo fingerprints cannot establish freshness even
+        // when source timestamps were preserved, rounded or moved backwards.
+        // Keep artifacts and the action cache: Cargo plans again, and unchanged
+        // compiler actions still reuse their content-addressed outputs.
+        match fs::remove_file(self.target_marker()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("invalidating target snapshot marker"),
+        }
+        if !self.target.exists() {
+            return Ok(());
+        }
+        let mut entries = WalkDir::new(&self.target).follow_links(false).into_iter();
+        while let Some(entry) = entries.next() {
+            let entry = entry?;
+            if entry.file_name() != ".fingerprint" {
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                entries.skip_current_dir();
+                fs::remove_dir_all(entry.path())
+                    .context("invalidating Cargo timestamp fingerprints")?;
+            } else if entry.file_type().is_symlink() {
+                fs::remove_file(entry.path()).context("invalidating Cargo fingerprint link")?;
+            }
+        }
+        Ok(())
     }
 
     fn target_marker_matches(&self, selected_key: &str) -> bool {
@@ -1420,23 +1452,6 @@ fn observed_input_digest(kind: &str, name: &str) -> String {
         _ => hash_field(&mut hasher, b"<unsupported>"),
     }
     format!("{:x}", hasher.finalize())
-}
-
-fn stabilize_target_mtimes(target: &Path) -> Result<()> {
-    let timestamp = std::time::SystemTime::now();
-    let times = fs::FileTimes::new()
-        .set_accessed(timestamp)
-        .set_modified(timestamp);
-    for entry in WalkDir::new(target).follow_links(false) {
-        let entry = entry?;
-        if entry.file_type().is_file() {
-            OpenOptions::new()
-                .write(true)
-                .open(entry.path())?
-                .set_times(times)?;
-        }
-    }
-    Ok(())
 }
 
 fn copy_tree_portable(source: &Path, destination: &Path) -> Result<()> {

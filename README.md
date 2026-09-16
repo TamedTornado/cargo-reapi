@@ -29,7 +29,10 @@ production REAPI service remains a separate milestone.
 complete Cargo target state and skips Cargo entirely. When the gate differs,
 Cargo remains the planner and runs inside the strict sandbox, while individual
 compiler and linker actions reuse verified cached outputs or coalesce identical
-concurrent misses. Only invalidated actions execute physically, and a successful
+concurrent misses. A gate miss discards Cargo's timestamp fingerprints before
+replanning, so preserved or older source timestamps cannot hide changed content.
+Existing artifacts remain available to the content-addressed action cache.
+Only invalidated actions execute physically, and a successful
 result becomes a new whole-gate snapshot. The adversarial mutation qualification
 proves this by rebuilding exactly the changed leaf and its dependants while
 restoring unrelated work. The
@@ -225,6 +228,14 @@ before a worker is admitted. `cache gc` takes an exclusive maintenance lease,
 waits for all active restores and producers, evicts least-recently-used action
 and whole-gate entries, and then removes unreferenced blobs. A dry run reports
 the same selection without mutation.
+
+Without explicit capacities the ledger uses detected host logical CPUs and
+physical memory, rather than the acceptance benchmark's reference machine.
+The driver passes its selected capacities into the strict sandbox so compiler
+wrappers share the same accounting even when host discovery is hidden there.
+Set explicit capacities to reserve resources for other workloads. Undetectable
+capacity requires explicit configuration; values exceeding detected host
+capacity are rejected.
 
 `CARGO_REAPI_RESOURCE_LEDGER` selects a separate shared physical-action ledger.
 Use the same path and capacity settings for all workers on one physical host,
