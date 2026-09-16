@@ -212,6 +212,64 @@ fn cache_command(root: &Path, cache_dir: &Path) -> (Command, PathBuf) {
 }
 
 #[test]
+fn strict_sandbox_uses_the_configured_temporary_directory() {
+    let root = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    let temporary = tempdir().expect("caller temporary storage");
+    write_fixture(root.path(), false);
+    let log = root.path().join("target/cargo-reapi/actions.jsonl");
+    assert!(
+        run_snapshot_gate_with_environment(
+            root.path(),
+            cache.path(),
+            &log,
+            &["check"],
+            &[("TMPDIR", temporary.path().to_str().unwrap())],
+            None,
+        )
+        .success()
+    );
+    let control = temporary
+        .path()
+        .join("cargo-reapi-srt")
+        .canonicalize()
+        .expect("sandbox control storage beneath caller TMPDIR");
+    let policy: Value = serde_json::from_slice(
+        &fs::read(root.path().join("target/cargo-reapi/srt-policy-v1.json"))
+            .expect("strict policy"),
+    )
+    .expect("policy JSON");
+    assert_eq!(
+        policy["network"]["allowUnixSockets"],
+        serde_json::json!([control])
+    );
+    assert!(
+        read_actions(&log)
+            .iter()
+            .any(|action| action["crate_name"] == "capture_fixture")
+    );
+}
+
+#[test]
+fn strict_sandbox_reports_an_overlong_temporary_socket_path() {
+    let root = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    let temporary = root.path().join("long-temporary-directory-".repeat(5));
+    fs::create_dir_all(&temporary).unwrap();
+    write_fixture(root.path(), false);
+    let (mut command, _) = cache_command(root.path(), cache.path());
+    let output = command
+        .env("TMPDIR", &temporary)
+        .output()
+        .expect("run cargo-reapi");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("set TMPDIR to a shorter writable directory")
+    );
+}
+
+#[test]
 fn separate_project_caches_share_the_explicit_ledger_in_strict_sandboxes() {
     let roots = tempdir().expect("project roots");
     let ledger = roots.path().join("shared-physical-actions");

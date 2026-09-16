@@ -165,8 +165,7 @@ fn strict_cargo_command(
         .env("CARGO_NET_OFFLINE", "true")
         .env("PATH", command_path)
         // Keep srt's private mux socket out of the snapshotted, stable child
-        // TMPDIR. A per-driver directory also prevents a crashed/reused srt PID
-        // from colliding with stale provider plumbing.
+        // TMPDIR while retaining the caller's temporary-storage location.
         .env("TMPDIR", control_temporary)
         // srt deliberately replaces TMPDIR for sandboxed children. Point its
         // documented override at our declared, writable target directory.
@@ -816,19 +815,33 @@ fn create_and_canonicalize(path: &Path, label: &str) -> Result<PathBuf> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn srt_control_directory() -> Result<PathBuf> {
-    // Unix-domain socket paths are short (104 bytes on macOS). A worktree
-    // target can exceed that before srt appends its PID suffix, causing two
-    // different proxy sockets to truncate to the same kernel address.
-    // Provider-only plumbing therefore uses a fixed short directory while the
-    // sandboxed child retains its target-local hermetic TMPDIR.
-    let path = PathBuf::from("/tmp/cargo-reapi-srt");
+    // Pinned srt 0.0.66's longest socket basename uses a 16-digit random hex
+    // suffix. Reserve its full length, including the path separator and NUL,
+    // against the Unix sockaddr_un limit rather than silently truncating.
+    #[cfg(target_os = "macos")]
+    const UNIX_SOCKET_PATH_BYTES: usize = 104;
+    #[cfg(target_os = "linux")]
+    const UNIX_SOCKET_PATH_BYTES: usize = 108;
+    const SRT_SOCKET_SUFFIX: &str = "/claude-socks-0000000000000000.sock\0";
+
+    // Respect the caller's writable temporary storage, including containers
+    // whose /tmp is read-only. Keep provider plumbing outside the snapshotted
+    // target; sandboxed children retain their target-local hermetic TMPDIR.
+    let path = env::temp_dir().join("cargo-reapi-srt");
     if path.exists() && fs::symlink_metadata(&path)?.file_type().is_symlink() {
         bail!(
             "refusing symlinked srt control directory {}",
             path.display()
         );
     }
-    create_and_canonicalize(&path, "srt control temporary directory")
+    let path = create_and_canonicalize(&path, "srt control temporary directory")?;
+    if path.as_os_str().len() + SRT_SOCKET_SUFFIX.len() > UNIX_SOCKET_PATH_BYTES {
+        bail!(
+            "srt control directory {} is too long for Unix sockets; set TMPDIR to a shorter writable directory",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 fn create_file_and_canonicalize(path: &Path, label: &str) -> Result<PathBuf> {

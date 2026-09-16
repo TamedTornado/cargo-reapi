@@ -187,6 +187,12 @@ recursive Node dependency closure and the platform helper executables into
 every snapshot key. `CARGO_REAPI_SRT` may point to an exact pinned installation
 for development and CI; it is not a version bypass.
 
+The sandbox provider stores its control sockets beneath the caller's `TMPDIR`
+(the operating system's temporary directory by default). This directory must be
+writable and short enough for Unix socket paths. Cargo ReAPI reports an overlong
+path before starting the provider. Compiler temporary files remain isolated in
+the worktree's target directory.
+
 ```sh
 cargo install cargo-reapi --locked
 cargo reapi --backend capture -- test
