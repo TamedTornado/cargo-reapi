@@ -226,6 +226,15 @@ waits for all active restores and producers, evicts least-recently-used action
 and whole-gate entries, and then removes unreferenced blobs. A dry run reports
 the same selection without mutation.
 
+`CARGO_REAPI_RESOURCE_LEDGER` selects a separate shared physical-action ledger.
+Use the same path and capacity settings for all workers on one physical host,
+including workers with separate project artifact caches. The driver, snapshot
+restoration and strict sandbox all honor this setting. Only that directory is
+added to the sandbox's allowed paths. Without an explicit setting, the ledger
+lives in `resource-ledger-v1` below the selected cache directory. Keep writable
+target directories private to each worker; sharing a ledger does not share
+artifacts or target state.
+
 The complete local proof runner has no concurrency or threshold flags. It cold-seeds one
 producer, retires that producer path, then runs the full canonical gate in one, five, and
 ten clean worktrees. The five and ten populations are launched simultaneously and their

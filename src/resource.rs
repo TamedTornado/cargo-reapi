@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -9,6 +9,17 @@ use crate::acceptance::AcceptanceContract;
 
 const CPU_CAPACITY_ENV: &str = "CARGO_REAPI_RESOURCE_CPU_CAPACITY";
 const MEMORY_CAPACITY_ENV: &str = "CARGO_REAPI_RESOURCE_MEMORY_GIB_CAPACITY";
+
+/// One explicitly selected host ledger can coordinate separate artifact caches.
+/// Resolve it once by the same rule at every driver and sandbox boundary.
+pub fn ledger_root(cache_root: &Path) -> Result<PathBuf> {
+    let root = std::env::var_os("CARGO_REAPI_RESOURCE_LEDGER")
+        .map_or_else(|| cache_root.join("resource-ledger-v1"), PathBuf::from);
+    fs::create_dir_all(&root)
+        .with_context(|| format!("creating resource ledger {}", root.display()))?;
+    root.canonicalize()
+        .with_context(|| format!("resolving resource ledger {}", root.display()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ResourceCapacity {

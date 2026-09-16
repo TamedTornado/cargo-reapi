@@ -211,6 +211,75 @@ fn cache_command(root: &Path, cache_dir: &Path) -> (Command, PathBuf) {
     (command, action_log)
 }
 
+#[test]
+fn separate_project_caches_share_the_explicit_ledger_in_strict_sandboxes() {
+    let roots = tempdir().expect("project roots");
+    let ledger = roots.path().join("shared-physical-actions");
+    let ledger_text = ledger.to_str().expect("ledger path");
+    let mut projects = Vec::new();
+    for name in ["left", "right"] {
+        let workspace = roots.path().join(name);
+        let cache = roots.path().join(format!("{name}-cache"));
+        let log = workspace.join("target/cargo-reapi/actions.jsonl");
+        write_fixture(&workspace, false);
+        projects.push((workspace, cache, log));
+    }
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = projects
+            .iter()
+            .map(|(workspace, cache, log)| {
+                scope.spawn(move || {
+                    assert!(
+                        run_snapshot_gate_with_environment(
+                            workspace,
+                            cache,
+                            log,
+                            &["check"],
+                            &[("CARGO_REAPI_RESOURCE_LEDGER", ledger_text)],
+                            None,
+                        )
+                        .success()
+                    );
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("strict Cargo worker");
+        }
+    });
+    assert!(
+        fs::read_dir(&ledger)
+            .expect("shared ledger")
+            .next()
+            .is_some()
+    );
+    let canonical_ledger = ledger.canonicalize().expect("canonical ledger");
+    for (workspace, cache, _) in projects {
+        assert!(
+            !cache.join("resource-ledger-v1").exists(),
+            "the driver ignored the external ledger"
+        );
+        let policy: Value = serde_json::from_slice(
+            &fs::read(workspace.join("target/cargo-reapi/srt-policy-v1.json"))
+                .expect("strict policy"),
+        )
+        .expect("policy JSON");
+        let allowed = Value::String(canonical_ledger.to_string_lossy().into_owned());
+        assert!(
+            policy["filesystem"]["allowWrite"]
+                .as_array()
+                .unwrap()
+                .contains(&allowed)
+        );
+        assert!(
+            policy["filesystem"]["allowRead"]
+                .as_array()
+                .unwrap()
+                .contains(&allowed)
+        );
+    }
+}
+
 fn read_actions(action_log: &Path) -> Vec<Value> {
     fs::read_to_string(action_log)
         .expect("action log")

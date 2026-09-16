@@ -407,6 +407,10 @@ fn readable_paths(
         paths.temporary.to_path_buf(),
     ]);
     readable.extend(cargo_configuration_files(paths.workspace));
+    let ledger = crate::resource::ledger_root(paths.cache)?;
+    if !ledger.starts_with(paths.cache) {
+        readable.insert(ledger);
+    }
     extend_system_readable(&mut readable);
     extend_toolchain_readable(&mut readable, paths.workspace)?;
     for input in explicit_inputs {
@@ -521,6 +525,10 @@ fn writable_paths(paths: &PolicyPaths<'_>) -> Result<BTreeSet<PathBuf>> {
         paths.action_log.to_path_buf(),
         paths.temporary.to_path_buf(),
     ]);
+    let ledger = crate::resource::ledger_root(paths.cache)?;
+    if !ledger.starts_with(paths.cache) {
+        writable.insert(ledger);
+    }
     #[cfg(target_os = "macos")]
     {
         let host_temporary = env::temp_dir();

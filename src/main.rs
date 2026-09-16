@@ -471,7 +471,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         cargo
             .env(
                 "CARGO_REAPI_RESOURCE_LEDGER",
-                cache_dir.join("resource-ledger-v1"),
+                resource::ledger_root(&cache_dir)?,
             )
             .env("CARGO_REAPI_CACHE_DIR", cache_dir);
     }

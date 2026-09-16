@@ -99,7 +99,7 @@ impl GateSnapshot {
             workspace: workspace.to_path_buf(),
             target: target.to_path_buf(),
             snapshot,
-            resource_ledger: cache_root.join("resource-ledger-v1"),
+            resource_ledger: crate::resource::ledger_root(cache_root)?,
             lock: None,
             restored: false,
             coalesced: false,
