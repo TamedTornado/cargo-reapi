@@ -114,9 +114,7 @@ fn cached_query(
         stdout: output.stdout,
         stderr: output.stderr,
     };
-    let temporary = object.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temporary, serde_json::to_vec(&response)?)?;
-    fs::rename(&temporary, &object)?;
+    crate::cache::write_atomic(&object, &serde_json::to_vec(&response)?)?;
     FileExt::unlock(&lock)?;
     Ok(response)
 }

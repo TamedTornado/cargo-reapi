@@ -158,10 +158,10 @@ impl GateSnapshot {
             .snapshot
             .parent()
             .context("gate snapshot has no object directory")?;
-        let temporary = parent.join(format!(".{}.tmp-{}", self.key, std::process::id()));
-        if temporary.exists() {
-            fs::remove_dir_all(&temporary)?;
-        }
+        let staging = tempfile::Builder::new()
+            .prefix(".gate-")
+            .tempdir_in(parent)?;
+        let temporary = staging.path();
         let observed_inputs = collect_observed_inputs(&self.target)?;
         fs::create_dir_all(temporary.join("target"))?;
         clone_tree(&self.target, &temporary.join("target"))?;
@@ -190,10 +190,9 @@ impl GateSnapshot {
             temporary.join("manifest.json"),
             serde_json::to_vec_pretty(&manifest)?,
         )?;
-        match fs::rename(&temporary, &self.snapshot) {
+        match fs::rename(temporary, &self.snapshot) {
             Ok(()) => {}
             Err(error) if self.is_published() => {
-                fs::remove_dir_all(&temporary).ok();
                 let _ = error;
             }
             Err(error) => return Err(error).context("publishing gate snapshot"),
@@ -1224,10 +1223,13 @@ fn clone_tree(source: &Path, destination: &Path) -> Result<CloneMethod> {
 }
 
 pub fn probe_clone_method(cache_root: &Path) -> Result<&'static str> {
-    let probe = cache_root.join(format!(".doctor-clone-{}", std::process::id()));
-    if probe.exists() {
-        fs::remove_dir_all(&probe)?;
-    }
+    fs::create_dir_all(cache_root)?;
+    // PIDs repeat across containers sharing this cache. Reserve a unique path
+    // atomically and remove only this invocation's own probe on every exit.
+    let directory = tempfile::Builder::new()
+        .prefix(".doctor-clone-")
+        .tempdir_in(cache_root)?;
+    let probe = directory.path();
     let source = probe.join("source");
     let destination = probe.join("destination");
     fs::create_dir_all(&source)?;
@@ -1237,7 +1239,6 @@ pub fn probe_clone_method(cache_root: &Path) -> Result<&'static str> {
     if fs::read(source.join("probe"))? != b"cargo-reapi-clone-probe" {
         bail!("clone probe destination mutation changed the source");
     }
-    fs::remove_dir_all(&probe)?;
     Ok(method.name())
 }
 
@@ -1477,6 +1478,42 @@ fn copy_tree_portable(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_probe_preserves_another_containers_reused_pid_directory() {
+        let cache = tempfile::tempdir().unwrap();
+        let other = cache
+            .path()
+            .join(format!(".doctor-clone-{}", std::process::id()));
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("owned-by-another-container"), b"retain").unwrap();
+
+        probe_clone_method(cache.path()).unwrap();
+
+        assert_eq!(
+            fs::read(other.join("owned-by-another-container")).unwrap(),
+            b"retain"
+        );
+        assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn shared_cache_probes_and_statistics_are_safe_with_the_same_pid() {
+        let cache = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..12 {
+                        probe_clone_method(cache.path()).unwrap();
+                        crate::maintenance::cache_stats(cache.path()).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn portable_snapshot_copy_is_a_complete_isolated_fallback() {

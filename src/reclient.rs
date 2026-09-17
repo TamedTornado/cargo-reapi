@@ -162,9 +162,7 @@ fn materialize_output(
         .with_context(|| format!("output has no parent: {}", output.actual_path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating output directory {}", parent.display()))?;
-    let temporary = output
-        .actual_path
-        .with_extension(format!("reapi-{}", std::process::id()));
+    let temporary = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
     if output
         .actual_path
         .extension()

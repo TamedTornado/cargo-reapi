@@ -193,6 +193,12 @@ writable and short enough for Unix socket paths. Cargo ReAPI reports an overlong
 path before starting the provider. Compiler temporary files remain isolated in
 the worktree's target directory.
 
+Shared-cache temporary files and clone probes are reserved atomically; process
+IDs are not unique across containers. Each invocation cleans up only its own
+temporary paths. Cache statistics tolerate files disappearing during concurrent
+publication and cleanup, so their counts describe a changing cache rather than
+an atomic snapshot.
+
 ```sh
 cargo install cargo-reapi --locked
 cargo reapi --backend capture -- test

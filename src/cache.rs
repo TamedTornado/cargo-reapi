@@ -3,7 +3,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -18,8 +17,6 @@ use crate::relocation::{
     restored_logical_digest,
 };
 use crate::resource::ResourceLease;
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct CacheOptions {
     root: PathBuf,
@@ -244,23 +241,20 @@ fn execute_cached_link(
         }
     }
 
-    let capture_path = cache_options.root.join("link-captures").join(format!(
-        "{}-{}-{}.jsonl",
-        base_action_key,
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
+    let capture_root = cache_options.root.join("link-captures");
+    fs::create_dir_all(&capture_root)?;
+    let capture_file = tempfile::NamedTempFile::new_in(&capture_root)?;
+    let capture_path = capture_file.path();
     let wrapper = std::env::current_exe().context("locating cargo-reapi linker wrapper")?;
     let real_linker = resolve_real_linker(invocation)?;
     let _lease = ResourceLease::acquire(true)?;
-    let exit_code =
-        invocation.execute_with_linker_capture(&wrapper, &capture_path, &real_linker)?;
+    let exit_code = invocation.execute_with_linker_capture(&wrapper, capture_path, &real_linker)?;
     let result = if exit_code == 0 {
         match discover_link_inputs(
             invocation,
             &prepared,
             cache_options,
-            &capture_path,
+            capture_path,
             &real_linker,
         ) {
             Ok(discovery) => {
@@ -292,7 +286,6 @@ fn execute_cached_link(
         record_invocation(capture_options, &prepared, "local-failed", exit_code)?;
         exit_code
     };
-    fs::remove_file(&capture_path).ok();
     FileExt::unlock(&lock).context("unlocking linked action cache entry")?;
     Ok(result)
 }
@@ -981,7 +974,7 @@ fn materialize_blob(
         .with_context(|| format!("output has no parent: {}", output.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating output directory {}", parent.display()))?;
-    let temporary = temporary_path(output);
+    let temporary = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
     if cached.path_rewritten {
         let bytes = fs::read(&blob)
             .with_context(|| format!("reading path-normalized blob {}", cached.sha256))?;
@@ -1081,19 +1074,20 @@ fn blob_matches(path: &Path, digest: &str, size: u64) -> Result<bool> {
     Ok(format!("{:x}", Sha256::digest(bytes)) == digest)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("cache path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating cache directory {}", parent.display()))?;
-    let temporary = temporary_path(path);
-    let mut file = File::create(&temporary)
-        .with_context(|| format!("creating temporary cache file {}", temporary.display()))?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temporary cache file beside {}", path.display()))?;
     file.write_all(bytes)
-        .with_context(|| format!("writing temporary cache file {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing temporary cache file {}", temporary.display()))?;
+        .with_context(|| format!("writing temporary cache file beside {}", path.display()))?;
+    file.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temporary cache file beside {}", path.display()))?;
+    let temporary = file.into_temp_path();
     match fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) if path.exists() => {
@@ -1135,11 +1129,6 @@ fn blob_path(options: &CacheOptions, digest: &str) -> PathBuf {
     options.root.join("blobs").join(digest)
 }
 
-fn temporary_path(path: &Path) -> PathBuf {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("tmp-{}-{sequence}", std::process::id()))
-}
-
 #[cfg(unix)]
 fn unix_mode(metadata: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -1157,9 +1146,22 @@ fn set_unix_mode(path: &Path, mode: u32) -> Result<()> {
 mod tests {
     use super::{
         LinkDiscovery, LinkInput, discovered_action_key, resolve_linker_candidate,
-        traced_path_matches_library,
+        traced_path_matches_library, write_atomic,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn failed_publication_removes_only_its_own_temporary_file() {
+        let root = tempfile::tempdir().unwrap();
+        let occupied = root.path().join("destination");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("retained"), b"retain").unwrap();
+
+        assert!(write_atomic(&occupied, b"replacement").is_err());
+
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(occupied.join("retained")).unwrap(), b"retain");
+    }
 
     fn discovery(actual_path: &str, sha256: &str, modified: u128) -> LinkDiscovery {
         LinkDiscovery {

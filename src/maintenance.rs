@@ -377,7 +377,14 @@ fn entry_count(directory: &Path, directories: bool) -> Result<usize> {
     let mut count = 0;
     for entry in entries {
         let entry = entry?;
-        let file_type = entry.file_type()?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if (directories && file_type.is_dir()) || (!directories && file_type.is_file()) {
             count += 1;
         }
@@ -391,9 +398,28 @@ fn directory_size(path: &Path) -> Result<u64> {
     }
     let mut size = 0_u64;
     for entry in WalkDir::new(path).follow_links(false) {
-        let entry = entry?;
+        // Statistics observe a live shared cache: another process may publish
+        // or remove its own temporary files while this traversal is underway.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if entry.file_type().is_file() {
-            size = size.saturating_add(entry.metadata()?.len());
+            match entry.metadata() {
+                Ok(metadata) => size = size.saturating_add(metadata.len()),
+                Err(error)
+                    if error
+                        .io_error()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
     }
     Ok(size)
