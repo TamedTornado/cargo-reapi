@@ -241,6 +241,14 @@ waits for all active restores and producers, evicts least-recently-used action
 and whole-gate entries, and then removes unreferenced blobs. A dry run reports
 the same selection without mutation.
 
+A waiting collector closes cache admission before draining existing readers.
+Active readers remain concurrent; new readers wait until collection finishes.
+Snapshot waiters release their maintenance lease before waiting for a producer,
+so that producer can still finish and publish without a collector lock cycle.
+The admission fence is an OS file lock: process exit releases it without stale
+marker repair. Upgrade every reader and collector sharing a cache together;
+older binaries do not participate in this admission protocol.
+
 Without explicit capacities the ledger uses detected host logical CPUs and
 physical memory, rather than the acceptance benchmark's reference machine.
 The driver passes its selected capacities into the strict sandbox so compiler
