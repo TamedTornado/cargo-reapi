@@ -9,6 +9,7 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 const MAINTENANCE_LOCK: &str = ".maintenance.lock";
+const MAINTENANCE_ADMISSION_LOCK: &str = ".maintenance-admission.lock";
 
 pub struct CacheSharedGuard {
     lock: File,
@@ -22,18 +23,23 @@ impl Drop for CacheSharedGuard {
 
 pub fn acquire_shared(cache_root: &Path) -> Result<CacheSharedGuard> {
     fs::create_dir_all(cache_root)?;
-    let lock = open_lock(cache_root)?;
+    // A collector holds admission while draining existing readers. New readers
+    // cannot repeatedly barge ahead of its exclusive maintenance request.
+    let admission = open_lock(cache_root, MAINTENANCE_ADMISSION_LOCK)?;
+    FileExt::lock_exclusive(&admission).context("entering cargo-reapi cache admission")?;
+    let lock = open_lock(cache_root, MAINTENANCE_LOCK)?;
     FileExt::lock_shared(&lock).context("acquiring shared cargo-reapi cache maintenance lock")?;
+    FileExt::unlock(&admission).context("leaving cargo-reapi cache admission")?;
     Ok(CacheSharedGuard { lock })
 }
 
-fn open_lock(cache_root: &Path) -> Result<File> {
+fn open_lock(cache_root: &Path, name: &str) -> Result<File> {
     OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(cache_root.join(MAINTENANCE_LOCK))
+        .open(cache_root.join(name))
         .context("opening cargo-reapi cache maintenance lock")
 }
 
@@ -136,7 +142,9 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         bail!("target free bytes must be greater than or equal to minimum free bytes");
     }
     fs::create_dir_all(cache_root)?;
-    let lock = open_lock(cache_root)?;
+    let admission = open_lock(cache_root, MAINTENANCE_ADMISSION_LOCK)?;
+    FileExt::lock_exclusive(&admission).context("closing cargo-reapi cache admission for GC")?;
+    let lock = open_lock(cache_root, MAINTENANCE_LOCK)?;
     FileExt::lock_exclusive(&lock)
         .context("acquiring exclusive cargo-reapi cache maintenance lock")?;
     let before = cache_stats(cache_root)?;
@@ -187,6 +195,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         cache_stats(cache_root)?
     };
     FileExt::unlock(&lock).context("unlocking cargo-reapi cache maintenance lock")?;
+    FileExt::unlock(&admission).context("reopening cargo-reapi cache admission after GC")?;
     let capacity_satisfied = after.total_bytes <= options.max_bytes
         && (!recovering_free_space || after.available_bytes >= options.target_free_bytes);
     Ok(GcReport {
@@ -517,6 +526,68 @@ mod tests {
             .expect("GC should proceed after the active cache operation ends")
             .unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn waiting_gc_closes_admission_to_new_readers() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("blobs")).unwrap();
+        fs::write(root.path().join("blobs/unreferenced"), b"discardable").unwrap();
+        let active = acquire_shared(root.path()).unwrap();
+        let admission = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.path().join(".maintenance-admission.lock"))
+            .unwrap();
+        let cache_root = root.path().to_path_buf();
+        let collector = thread::spawn(move || {
+            collect_garbage(
+                &cache_root,
+                GcOptions {
+                    max_bytes: u64::MAX,
+                    min_free_bytes: 0,
+                    target_free_bytes: 0,
+                    dry_run: false,
+                },
+            )
+            .unwrap()
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let admission_closed = loop {
+            match FileExt::try_lock_shared(&admission) {
+                Ok(()) => FileExt::unlock(&admission).unwrap(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break true,
+                Err(error) => panic!("checking collector admission: {error}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        if !admission_closed {
+            drop(active);
+            collector.join().unwrap();
+            panic!("waiting collector never closed admission to new cache readers");
+        }
+
+        let cache_root = root.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let _guard = acquire_shared(&cache_root).unwrap();
+            sender
+                .send(cache_root.join("blobs/unreferenced").exists())
+                .unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(root.path().join("blobs/unreferenced").exists());
+
+        drop(active);
+        assert!(!receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(collector.join().unwrap().removed_blob_entries, 1);
+        reader.join().unwrap();
     }
 
     #[test]

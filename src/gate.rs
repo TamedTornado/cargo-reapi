@@ -75,7 +75,7 @@ impl GateSnapshot {
         cargo_args: &[OsString],
         declared_inputs: &[PathBuf],
     ) -> Result<Self> {
-        let _maintenance = acquire_shared(cache_root)?;
+        let maintenance = acquire_shared(cache_root)?;
         let action_log = if action_log.is_absolute() {
             action_log.to_path_buf()
         } else {
@@ -114,6 +114,11 @@ impl GateSnapshot {
             return Ok(gate);
         }
 
+        // Never hold a maintenance reader while waiting for a gate producer:
+        // that producer needs maintenance admission again to publish. A queued
+        // collector must be able to drain readers without forming a lock cycle.
+        drop(maintenance);
+
         let lock_path = root.join("locks").join(format!("{key}.lock"));
         let lock = OpenOptions::new()
             .create(true)
@@ -132,6 +137,7 @@ impl GateSnapshot {
             Err(error) => return Err(error).context("trying gate snapshot lock"),
         };
         gate.lock = Some(lock);
+        let _maintenance = acquire_shared(cache_root)?;
         if gate.is_published() {
             if gate.observed_inputs_match()? {
                 gate.coalesced = waited;
