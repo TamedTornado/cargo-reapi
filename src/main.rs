@@ -1,6 +1,5 @@
 mod acceptance;
 mod action;
-mod build_environment;
 mod cache;
 mod capture;
 mod evidence;
@@ -276,7 +275,6 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<i32> {
-    build_environment::enter_if_configured()?;
     let args: Vec<OsString> = env::args_os().collect();
     if env::var_os("CARGO_REAPI_RUSTC_QUERY_SHIM").is_some() {
         return query::run_shim(&args);

@@ -232,24 +232,6 @@ Long-lived runtimes may configure the backend and cache once, then use the ordin
 driver form `cargo-reapi check`, `cargo-reapi clippy ...`, or `cargo-reapi test`.
 `CARGO_REAPI_BACKEND`, `CARGO_REAPI_CACHE_DIR`, and the other documented driver
 options are environment-backed defaults; explicit CLI flags still take precedence.
-
-Project images may set `CARGO_REAPI_BUILD_ENVIRONMENT` to an explicit JSON file
-with schema `cargo-reapi.build-environment/v1`, a `set` map of environment names
-to string values, and a `remove` array of environment names. The driver validates
-the file and re-enters with those actual values **before** source acquisition,
-Cargo planning, snapshot keying or compiler execution. It consumes the selector
-so children inherit the resolved environment, not a second application of policy.
-Invalid or unreadable profiles fail; there is no ambient-environment fallback.
-
-This separates an agent's model/session environment from a project's build
-environment. For example, a project can select one writable build `HOME` and
-remove its agent-only `CODEX_HOME` in both author and mechanical phases. This is
-not an environment-key exclusion: project code sees the same effective values
-that the cache keys. All other environment inputs remain preserved and keyed.
-Choose removals deliberately; do not discard compiler flags, project inputs or
-required package-network trust merely to force cache hits. Agent credentials and
-model configuration remain on the parent process, outside the build environment.
-
 `CARGO_REAPI_RESOURCE_CPU_CAPACITY` and
 `CARGO_REAPI_RESOURCE_MEMORY_GIB_CAPACITY` define one host-wide physical-action
 ledger; they do not cap logical Cargo gates. `doctor` proves the pinned sandbox,
