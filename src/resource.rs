@@ -151,6 +151,44 @@ fn host_memory_gib() -> Option<usize> {
 
 pub struct ResourceLease {
     files: Vec<File>,
+    progress: PathBuf,
+}
+
+/// Each lease release rewrites this marker, so waiters can tell a queue
+/// behind live work from a ledger where nothing completes.
+const PROGRESS_MARKER: &str = "progress";
+
+fn record_progress(marker: &Path) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    // Best effort: a lost write can only shorten a waiter's patience.
+    let _ = fs::write(marker, format!("{}:{nanos}", std::process::id()));
+}
+
+/// Retries `attempt` until it yields a value. Waiting behind other leases is
+/// not a stall: the deadline restarts whenever another lease in the ledger is
+/// released. Returns `None` only after `stall` passes with no release at all.
+fn wait_for_progress<T>(
+    marker: &Path,
+    stall: Duration,
+    mut attempt: impl FnMut() -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    let mut observed = fs::read(marker).ok();
+    let mut deadline = Instant::now() + stall;
+    loop {
+        if let Some(value) = attempt()? {
+            return Ok(Some(value));
+        }
+        let current = fs::read(marker).ok();
+        if current != observed {
+            observed = current;
+            deadline = Instant::now() + stall;
+        } else if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 impl ResourceLease {
@@ -189,32 +227,36 @@ impl ResourceLease {
         let memory_demand = if native_link { 7 } else { 2 };
         fs::create_dir_all(lease_root.join("cpu"))?;
         fs::create_dir_all(lease_root.join("memory-gib"))?;
-        let deadline = Instant::now() + Duration::from_secs(contract.stall_seconds);
+        let progress = lease_root.join(PROGRESS_MARKER);
 
-        loop {
-            let mut files = Vec::with_capacity(cpu_demand + memory_demand);
-            if try_acquire_tokens(
-                &lease_root.join("cpu"),
-                capacity.cpu,
-                cpu_demand,
-                &mut files,
-            )? && try_acquire_tokens(
-                &lease_root.join("memory-gib"),
-                capacity.memory_gib,
-                memory_demand,
-                &mut files,
-            )? {
-                return Ok(Self { files });
-            }
-            drop(files);
-            if Instant::now() >= deadline {
-                bail!(
-                    "infrastructure stall: no {cpu_demand}-CPU/{memory_demand}-GiB physical-action lease became available within {} seconds",
-                    contract.stall_seconds
-                );
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let lease = wait_for_progress(
+            &progress,
+            Duration::from_secs(contract.stall_seconds),
+            || {
+                let mut files = Vec::with_capacity(cpu_demand + memory_demand);
+                let acquired = try_acquire_tokens(
+                    &lease_root.join("cpu"),
+                    capacity.cpu,
+                    cpu_demand,
+                    &mut files,
+                )? && try_acquire_tokens(
+                    &lease_root.join("memory-gib"),
+                    capacity.memory_gib,
+                    memory_demand,
+                    &mut files,
+                )?;
+                Ok(acquired.then(|| Self {
+                    files,
+                    progress: progress.clone(),
+                }))
+            },
+        )?;
+        lease.with_context(|| {
+            format!(
+                "infrastructure stall: no {cpu_demand}-CPU/{memory_demand}-GiB physical-action lease was released for {} seconds",
+                contract.stall_seconds
+            )
+        })
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -222,20 +264,25 @@ impl ResourceLease {
         let contract = AcceptanceContract::embedded()?;
         let root = lease_root.join("snapshot-signing");
         fs::create_dir_all(&root)?;
-        let deadline = Instant::now() + Duration::from_secs(contract.stall_seconds);
-        loop {
-            let mut files = Vec::with_capacity(1);
-            if try_acquire_tokens(&root, 4, 1, &mut files)? {
-                return Ok(Self { files });
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "infrastructure stall: no snapshot-signing lease became available within {} seconds",
-                    contract.stall_seconds
-                );
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let progress = root.join(PROGRESS_MARKER);
+        let lease = wait_for_progress(
+            &progress,
+            Duration::from_secs(contract.stall_seconds),
+            || {
+                let mut files = Vec::with_capacity(1);
+                let acquired = try_acquire_tokens(&root, 4, 1, &mut files)?;
+                Ok(acquired.then(|| Self {
+                    files,
+                    progress: progress.clone(),
+                }))
+            },
+        )?;
+        lease.with_context(|| {
+            format!(
+                "infrastructure stall: no snapshot-signing lease was released for {} seconds",
+                contract.stall_seconds
+            )
+        })
     }
 }
 
@@ -244,6 +291,8 @@ impl Drop for ResourceLease {
         for file in &self.files {
             let _ = FileExt::unlock(file);
         }
+        // Announce only after the tokens are free.
+        record_progress(&self.progress);
     }
 }
 
@@ -283,7 +332,60 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
-    use super::{ResourceCapacity, ResourceLease};
+    use super::{ResourceCapacity, ResourceLease, record_progress, wait_for_progress};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_queue_behind_releasing_leases_waits_past_the_stall_window() {
+        let root = tempdir().expect("ledger root");
+        let marker = root.path().join("progress");
+        let stall = Duration::from_millis(150);
+        let releases = {
+            let marker = marker.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(40));
+                    record_progress(&marker);
+                }
+            })
+        };
+        let started = Instant::now();
+        let ready_after = Duration::from_millis(600);
+
+        let outcome = wait_for_progress(&marker, stall, || {
+            Ok((started.elapsed() >= ready_after).then_some(()))
+        })
+        .expect("wait");
+
+        releases.join().expect("release thread");
+        assert_eq!(outcome, Some(()), "a live queue is not a stall");
+        assert!(started.elapsed() >= ready_after);
+    }
+
+    #[test]
+    fn a_ledger_with_no_releases_still_stalls() {
+        let root = tempdir().expect("ledger root");
+        let marker = root.path().join("progress");
+        let stall = Duration::from_millis(150);
+        let started = Instant::now();
+
+        let outcome = wait_for_progress::<()>(&marker, stall, || Ok(None)).expect("wait");
+
+        assert_eq!(outcome, None);
+        assert!(started.elapsed() >= stall);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn releasing_a_lease_records_ledger_progress() {
+        let root = tempdir().expect("ledger root");
+        let marker = root.path().join("progress");
+        let before = std::fs::read(&marker).ok();
+
+        drop(ResourceLease::acquire_at(root.path(), false).expect("lease"));
+
+        assert_ne!(std::fs::read(&marker).ok(), before);
+    }
 
     #[test]
     fn defaults_use_host_capacity_instead_of_acceptance_benchmark_limits() {
