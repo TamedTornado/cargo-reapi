@@ -4,6 +4,11 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+- Classify a physical-action or snapshot-signing wait as an infrastructure
+  stall only after 300 seconds in which no lease in the shared ledger was
+  released. Queueing behind concurrent gates that are making progress no
+  longer fails them.
+
 ## [0.1.1] - 2026-07-30
 
 - Provision locked Cargo sources before entering strict offline snapshots, while
