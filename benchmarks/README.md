@@ -19,6 +19,9 @@ The latest current-schema measurements are recorded in
 [`results/2026-07-21-linux-xfs-schema-v3.md`](results/2026-07-21-linux-xfs-schema-v3.md).
 The first production Bro/Moria dogfood pass is recorded separately in
 [`results/2026-07-22-bro-moria-production.md`](results/2026-07-22-bro-moria-production.md).
+A later field observation of five concurrent cold Moria gates sharing one
+ledger, after the progress-based stall rule, is in
+[`results/2026-10-04-bro-moria-five-cold-gates.md`](results/2026-10-04-bro-moria-five-cold-gates.md).
 The preceding-model final Linux qualification remains in
 [`results/2026-07-20-linux-xfs.md`](results/2026-07-20-linux-xfs.md). Earlier
 historical and partial results remain linked from the result files and are not
