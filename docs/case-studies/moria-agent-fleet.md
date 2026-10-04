@@ -263,6 +263,23 @@ non-cacheable control probes. The gate completed successfully before the run
 was stopped again, so no downstream product work is included in this
 infrastructure result.
 
+### Five cold gates showed that a full queue is not a stall
+
+On 2026-10-04 Bro split one large Moria issue into five parallel issues. Each
+agent changed different source, so five cold, divergent gates compiled at once
+against one host-wide physical-action ledger of 20 CPU tokens. cargo-reapi
+`4a893c1` classified any action that waited 300 seconds for a lease as an
+infrastructure stall, even while the other gates kept completing actions, so
+two of the five gates failed on a busy but healthy host.
+
+The acceptance criteria define a stall as 300 seconds with no compiler or
+linker progress. `275284e` makes releasing a lease rewrite a progress marker in
+the ledger and restarts a waiter's stall clock whenever it changes. After the
+fix, the same five-gate load filled the 20-token ledger with no infrastructure
+stall, and 71% of cacheable actions reused outputs. The
+[field observation](../../benchmarks/results/2026-10-04-bro-moria-five-cold-gates.md)
+records the samples and the action histogram.
+
 ## Resource behavior
 
 At one measured five-session production point:

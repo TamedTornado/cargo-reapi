@@ -4,10 +4,33 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-04
+
+Upgrade every reader and collector that shares a cache together: the cache
+admission protocol changed, and older binaries do not participate in it.
+
 - Classify a physical-action or snapshot-signing wait as an infrastructure
   stall only after 300 seconds in which no lease in the shared ledger was
   released. Queueing behind concurrent gates that are making progress no
   longer fails them.
+- `CARGO_REAPI_RESOURCE_LEDGER` selects one shared physical-action ledger for
+  every worker on a host, including workers with separate project caches. The
+  driver, snapshot restoration and strict sandbox all honor it.
+- Without explicit capacities, the ledger uses the host's detected logical CPUs
+  and physical memory instead of the acceptance benchmark's reference machine.
+  The driver passes its capacities into the strict sandbox; capacities above
+  the detected host are rejected.
+- A gate miss discards Cargo's timestamp fingerprints before replanning, so
+  preserved or older source timestamps cannot hide changed content.
+- A waiting cache collector closes admission before draining existing readers,
+  so collection completes under continuous compilation instead of starving.
+  Snapshot waiters release their maintenance lease before waiting for a
+  producer, preserving lock ordering.
+- Shared-cache temporary paths and clone probes are reserved atomically rather
+  than by process ID, which is not unique across containers. Cache statistics
+  tolerate files disappearing during concurrent publication and cleanup.
+- The strict sandbox's control sockets live beneath the caller's `TMPDIR`, with
+  an early error when that path is too long for a Unix socket.
 
 ## [0.1.1] - 2026-07-30
 
