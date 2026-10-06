@@ -75,11 +75,12 @@ dependencies = [
 
 [[package]]
 name = "cargo-reapi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
  "fs2",
+ "libc",
  "memchr",
  "serde",
  "serde_json",

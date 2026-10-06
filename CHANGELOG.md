@@ -4,6 +4,27 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-06
+
+Upgrade collectors and anything that reads their reports together: report
+`schema_version` is now 2 and `total_bytes` changed meaning.
+
+- `cache gc` and `cache stats` measure the cache's physical footprint. They
+  summed file lengths, so every reflinked gate snapshot counted in full
+  although it occupies almost no new disk; collections evicted hot action
+  entries and blobs to free space that was never used, and the next gates
+  recompiled them. On Linux the footprint comes from each file's extent map
+  and counts every shared block once. Elsewhere, and for files without an
+  exact extent map, a file's allocated size counts as unshared, which can
+  over-count clones but never under-counts.
+- Evicting an action is credited with the blobs no surviving action
+  references; it was credited only with its manifest, so reaching the budget
+  evicted far more actions than necessary. Evicting an entry whose blocks are
+  still shared frees nothing and is credited with nothing.
+- Free-space recovery measures available space after each removal instead of
+  projecting it, since blocks still shared outside the cache stay allocated.
+- Reports add `apparent_bytes`, the sum of file lengths.
+
 ## [0.2.1] - 2026-10-06
 
 - `cache gc` removes gate snapshot staging directories abandoned by producers

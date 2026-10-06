@@ -3,6 +3,7 @@ mod action;
 mod cache;
 mod capture;
 mod evidence;
+mod footprint;
 mod gate;
 mod hermetic;
 mod invocation;

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::Serialize;
 use walkdir::WalkDir;
+
+use crate::footprint::{Footprint, FootprintBuilder, OwnerId};
 
 const MAINTENANCE_LOCK: &str = ".maintenance.lock";
 const MAINTENANCE_ADMISSION_LOCK: &str = ".maintenance-admission.lock";
@@ -82,11 +84,23 @@ pub fn record_access(cache_root: &Path, kind: AccessKind, key: &str) -> Result<(
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+/// Schema 2 reports the physical footprint as `total_bytes`; schema 1 summed
+/// file lengths there.
+const REPORT_SCHEMA_VERSION: u32 = 2;
+
+/// Owner of every file no collection removes: locks, access markers, the
+/// resource ledger and anything else outside the eviction candidates.
+const PINNED: OwnerId = 0;
+
+#[derive(Clone, Debug, Serialize)]
 pub struct CacheStats {
     pub schema_version: u32,
     pub cache_root: PathBuf,
+    /// Physical bytes the cache occupies, each shared block counted once.
     pub total_bytes: u64,
+    /// Sum of file lengths. Reflinked gate snapshots make this far larger
+    /// than the disk the cache actually occupies.
+    pub apparent_bytes: u64,
     pub available_bytes: u64,
     pub action_entries: usize,
     pub gate_entries: usize,
@@ -95,15 +109,41 @@ pub struct CacheStats {
 
 pub fn cache_stats(cache_root: &Path) -> Result<CacheStats> {
     fs::create_dir_all(cache_root)?;
+    let footprint = measure_footprint(cache_root, &HashMap::new())?;
+    stats(
+        cache_root,
+        footprint.total_bytes(),
+        directory_size(cache_root)?,
+    )
+}
+
+fn stats(cache_root: &Path, total_bytes: u64, apparent_bytes: u64) -> Result<CacheStats> {
     Ok(CacheStats {
-        schema_version: 1,
+        schema_version: REPORT_SCHEMA_VERSION,
         cache_root: cache_root.to_path_buf(),
-        total_bytes: directory_size(cache_root)?,
+        total_bytes,
+        apparent_bytes,
         available_bytes: fs2::available_space(cache_root)?,
         action_entries: entry_count(&cache_root.join("actions"), false)?,
         gate_entries: entry_count(&cache_root.join("gate-snapshots/objects"), true)?,
         blob_entries: entry_count(&cache_root.join("blobs"), false)?,
     })
+}
+
+/// Attributes each file to the removable unit containing it: the nearest
+/// ancestor (or the file itself) registered in `owners`, else [`PINNED`].
+fn measure_footprint(cache_root: &Path, owners: &HashMap<PathBuf, OwnerId>) -> Result<Footprint> {
+    let mut builder = FootprintBuilder::default();
+    for file in cache_files(cache_root)? {
+        let owner = file
+            .ancestors()
+            .take_while(|ancestor| *ancestor != cache_root)
+            .find_map(|ancestor| owners.get(ancestor))
+            .copied()
+            .unwrap_or(PINNED);
+        builder.add_file(owner, &file)?;
+    }
+    Ok(builder.build())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -154,44 +194,72 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
     let lock = open_lock(cache_root, MAINTENANCE_LOCK)?;
     FileExt::lock_exclusive(&lock)
         .context("acquiring exclusive cargo-reapi cache maintenance lock")?;
-    let before = cache_stats(cache_root)?;
+
+    let Units {
+        staging: abandoned_staging,
+        candidates,
+        blobs: blob_owners,
+        owners,
+    } = removable_units(cache_root)?;
+    let mut removal = Removal {
+        footprint: measure_footprint(cache_root, &owners)?,
+        apparent_bytes: directory_size(cache_root)?,
+        dry_run: options.dry_run,
+    };
+    let before = stats(
+        cache_root,
+        removal.footprint.total_bytes(),
+        removal.apparent_bytes,
+    )?;
+
     let recovering_free_space = before.available_bytes < options.min_free_bytes;
-    let mut projected_bytes = before.total_bytes;
     let mut projected_free = before.available_bytes;
     let mut removed_action_entries = 0;
     let mut removed_gate_entries = 0;
     let mut removed_auxiliary_entries = 0;
     let mut removed_blob_entries = 0;
 
-    // Abandoned staging is never a reuse candidate, yet it counts toward the
-    // cache size. Left in place it can exceed the budget on its own, and every
-    // collection would then evict all reusable entries without satisfying it.
-    let abandoned_staging = abandoned_gate_staging(cache_root)?;
+    // Abandoned staging is never a reuse candidate, yet it occupies the disk.
+    // Left in place it can exceed the budget on its own, and every collection
+    // would then evict all reusable entries without satisfying it.
     let removed_abandoned_staging_entries = abandoned_staging.len();
-    for staging in abandoned_staging {
-        let staging_bytes = path_size(&staging)?;
-        if !options.dry_run {
-            remove_path(&staging)?;
-        }
-        projected_bytes = projected_bytes.saturating_sub(staging_bytes);
-        projected_free = projected_free.saturating_add(staging_bytes);
+    for (staging, owner) in &abandoned_staging {
+        projected_free = projected_free.saturating_add(removal.remove(staging, *owner)?);
     }
 
-    let mut candidates = candidates(cache_root)?;
-    candidates.sort_by_key(|candidate| candidate.last_used);
-    for candidate in candidates {
-        let within_limit = projected_bytes <= options.max_bytes;
+    // An action's real size is its output blobs. A blob is freed only once no
+    // surviving action references it; unreferenced blobs go immediately.
+    let mut references = BlobReferences::of(&candidates)?;
+    for (digest, (owner, path)) in &blob_owners {
+        if !references.is_referenced(digest) {
+            projected_free = projected_free.saturating_add(removal.remove(path, *owner)?);
+            removed_blob_entries += 1;
+        }
+    }
+
+    for (index, (candidate, owner)) in candidates.iter().enumerate() {
+        let within_limit = removal.footprint.total_bytes() <= options.max_bytes;
         let free_recovered = !recovering_free_space || projected_free >= options.target_free_bytes;
         if within_limit && free_recovered {
             break;
         }
-        let entry_bytes = path_size(&candidate.path)?;
+        let mut freed = removal.remove(&candidate.path, *owner)?;
         if !options.dry_run {
-            remove_path(&candidate.path)?;
-            remove_access_marker(cache_root, &candidate);
+            remove_access_marker(cache_root, candidate);
         }
-        projected_bytes = projected_bytes.saturating_sub(entry_bytes);
-        projected_free = projected_free.saturating_add(entry_bytes);
+        for digest in references.release(index) {
+            if let Some((blob_owner, path)) = blob_owners.get(&digest) {
+                freed = freed.saturating_add(removal.remove(path, *blob_owner)?);
+                removed_blob_entries += 1;
+            }
+        }
+        // Blocks shared outside the cache stay allocated when it lets go of
+        // them, so a real collection measures recovered space directly.
+        projected_free = if recovering_free_space && !options.dry_run {
+            fs2::available_space(cache_root)?
+        } else {
+            projected_free.saturating_add(freed)
+        };
         match candidate.kind {
             CandidateKind::Action => removed_action_entries += 1,
             CandidateKind::Gate => removed_gate_entries += 1,
@@ -199,20 +267,21 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         }
     }
 
-    if !options.dry_run {
-        removed_blob_entries = sweep_unreferenced_blobs(cache_root)?;
-    }
     let after = if options.dry_run {
         CacheStats {
-            schema_version: before.schema_version,
-            cache_root: before.cache_root.clone(),
-            total_bytes: projected_bytes,
+            total_bytes: removal.footprint.total_bytes(),
+            apparent_bytes: removal.apparent_bytes,
             available_bytes: projected_free,
+            // Entry counts skip dot-files; removals also cover stray temporaries.
             action_entries: before.action_entries.saturating_sub(removed_action_entries),
             gate_entries: before.gate_entries.saturating_sub(removed_gate_entries),
-            blob_entries: before.blob_entries,
+            blob_entries: before.blob_entries.saturating_sub(removed_blob_entries),
+            ..before.clone()
         }
     } else {
+        // Nothing may remain unreferenced, including blobs an action manifest
+        // listed but this collection did not observe.
+        removed_blob_entries += sweep_unreferenced_blobs(cache_root)?;
         cache_stats(cache_root)?
     };
     FileExt::unlock(&lock).context("unlocking cargo-reapi cache maintenance lock")?;
@@ -220,7 +289,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
     let capacity_satisfied = after.total_bytes <= options.max_bytes
         && (!recovering_free_space || after.available_bytes >= options.target_free_bytes);
     Ok(GcReport {
-        schema_version: 1,
+        schema_version: REPORT_SCHEMA_VERSION,
         dry_run: options.dry_run,
         estimated_freed_bytes: before.total_bytes.saturating_sub(after.total_bytes),
         before,
@@ -232,6 +301,178 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         removed_blob_entries,
         capacity_satisfied,
     })
+}
+
+/// Everything a collection may remove. Each unit owns its files, so the
+/// footprint knows exactly which physical bytes removing it frees.
+struct Units {
+    staging: Vec<(PathBuf, OwnerId)>,
+    /// Least recently used first.
+    candidates: Vec<(Candidate, OwnerId)>,
+    blobs: BTreeMap<String, (OwnerId, PathBuf)>,
+    owners: HashMap<PathBuf, OwnerId>,
+}
+
+/// Call only under the exclusive maintenance lock.
+fn removable_units(cache_root: &Path) -> Result<Units> {
+    let mut owners = HashMap::new();
+    let mut register = |path: &Path| {
+        let owner = PINNED + 1 + owners.len();
+        owners.insert(path.to_path_buf(), owner);
+        owner
+    };
+
+    let staging = abandoned_gate_staging(cache_root)?
+        .into_iter()
+        .map(|path| {
+            let owner = register(&path);
+            (path, owner)
+        })
+        .collect();
+    let mut candidates = candidates(cache_root)?;
+    candidates.sort_by_key(|candidate| candidate.last_used);
+    let candidates = candidates
+        .into_iter()
+        .map(|candidate| {
+            let owner = register(&candidate.path);
+            (candidate, owner)
+        })
+        .collect();
+    let blobs = blob_files(cache_root)?
+        .into_iter()
+        .map(|(digest, path)| (digest, (register(&path), path)))
+        .collect();
+
+    Ok(Units {
+        staging,
+        candidates,
+        blobs,
+        owners,
+    })
+}
+
+/// Removes whole units under the exclusive lock and tracks what that frees.
+struct Removal {
+    footprint: Footprint,
+    apparent_bytes: u64,
+    dry_run: bool,
+}
+
+impl Removal {
+    /// Removes one unit (unless this is a dry run) and returns the physical
+    /// bytes no remaining unit references.
+    fn remove(&mut self, path: &Path, owner: OwnerId) -> Result<u64> {
+        self.apparent_bytes = self.apparent_bytes.saturating_sub(path_size(path)?);
+        if !self.dry_run {
+            remove_path(path)?;
+        }
+        Ok(self.footprint.release(owner))
+    }
+}
+
+/// How many candidate actions still reference each blob.
+struct BlobReferences {
+    /// Output digests per candidate, in candidate order; empty for non-actions.
+    outputs: Vec<Vec<String>>,
+    counts: BTreeMap<String, usize>,
+}
+
+impl BlobReferences {
+    fn of(candidates: &[(Candidate, OwnerId)]) -> Result<Self> {
+        let outputs = candidates
+            .iter()
+            .map(|(candidate, _)| match candidate.kind {
+                CandidateKind::Action => action_outputs(&candidate.path),
+                CandidateKind::Gate | CandidateKind::Auxiliary => Ok(Vec::new()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut counts = BTreeMap::<String, usize>::new();
+        for digest in outputs.iter().flatten() {
+            *counts.entry(digest.clone()).or_default() += 1;
+        }
+        Ok(Self { outputs, counts })
+    }
+
+    fn is_referenced(&self, digest: &str) -> bool {
+        self.counts.contains_key(digest)
+    }
+
+    /// Drops one evicted candidate's references and returns the digests no
+    /// remaining action references.
+    fn release(&mut self, candidate: usize) -> Vec<String> {
+        let mut unreferenced = Vec::new();
+        for digest in std::mem::take(&mut self.outputs[candidate]) {
+            let count = self
+                .counts
+                .get_mut(&digest)
+                .expect("every output digest was counted");
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&digest);
+                unreferenced.push(digest);
+            }
+        }
+        unreferenced
+    }
+}
+
+/// The output digests an action manifest references.
+fn action_outputs(manifest: &Path) -> Result<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(manifest)?)?;
+    let outputs = value
+        .get("outputs")
+        .and_then(serde_json::Value::as_array)
+        .context("action manifest has no outputs array")?;
+    outputs
+        .iter()
+        .map(|output| {
+            output
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .context("action manifest output has no sha256")
+        })
+        .collect()
+}
+
+fn blob_files(cache_root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let Ok(entries) = fs::read_dir(cache_root.join("blobs")) else {
+        return Ok(Vec::new());
+    };
+    let mut blobs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            blobs.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            ));
+        }
+    }
+    Ok(blobs)
+}
+
+/// Every regular file in the cache. Statistics observe a live shared cache, so
+/// files another process removes during the traversal are skipped.
+fn cache_files(cache_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in WalkDir::new(cache_root).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
+        }
+    }
+    Ok(files)
 }
 
 /// Call only under the exclusive maintenance lock, which excludes every live
@@ -383,18 +624,7 @@ fn sweep_unreferenced_blobs(cache_root: &Path) -> Result<usize> {
             if !action.file_type()?.is_file() {
                 continue;
             }
-            let value: serde_json::Value = serde_json::from_slice(&fs::read(action.path())?)?;
-            let outputs = value
-                .get("outputs")
-                .and_then(serde_json::Value::as_array)
-                .context("action manifest has no outputs array")?;
-            for output in outputs {
-                let digest = output
-                    .get("sha256")
-                    .and_then(serde_json::Value::as_str)
-                    .context("action manifest output has no sha256")?;
-                referenced.insert(digest.to_owned());
-            }
+            referenced.extend(action_outputs(&action.path())?);
         }
     }
     let mut removed = 0;

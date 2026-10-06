@@ -238,8 +238,17 @@ ledger; they do not cap logical Cargo gates. `doctor` proves the pinned sandbox,
 copy-on-write selection, configured resource capacity, and cache readability
 before a worker is admitted. `cache gc` takes an exclusive maintenance lease,
 waits for all active restores and producers, evicts least-recently-used action
-and whole-gate entries, and then removes unreferenced blobs. A dry run reports
-the same selection without mutation.
+and whole-gate entries, and removes blobs that no surviving action references.
+A dry run reports the same selection without mutation.
+
+`--max-bytes` bounds the cache's physical footprint, reported as
+`total_bytes`. On Linux it comes from each file's extent map, so blocks shared
+by reflinked gate snapshots count once, and evicting an entry is credited only
+with the blocks no surviving entry still references. An action is credited
+with the blobs only it referenced. Files without an exact extent map, and every
+file on other platforms, count their allocated size as unshared, which can
+over-count clones but never under-counts. `apparent_bytes` reports the sum of
+file lengths for comparison.
 
 A waiting collector closes cache admission before draining existing readers.
 Active readers remain concurrent; new readers wait until collection finishes.
