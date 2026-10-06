@@ -756,4 +756,193 @@ mod tests {
         assert!(!root.path().join("actions/older.json").exists());
         assert!(root.path().join("actions/newer.json").exists());
     }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Distinct, non-zero content, so no file system can store it sparsely.
+    fn patterned(bytes: usize, seed: &str) -> Vec<u8> {
+        let seed = seed.bytes().fold(0_u8, u8::wrapping_add);
+        (0..bytes)
+            .map(|index| {
+                let low = u8::try_from(index % 251).expect("index modulo 251 fits in a byte");
+                low.wrapping_add(seed) | 1
+            })
+            .collect()
+    }
+
+    fn write_action(root: &Path, key: &str, blobs: &[&str], blob_bytes: usize) {
+        fs::create_dir_all(root.join("actions")).unwrap();
+        fs::create_dir_all(root.join("blobs")).unwrap();
+        for blob in blobs {
+            let path = root.join("blobs").join(blob);
+            if !path.exists() {
+                fs::write(path, patterned(blob_bytes, blob)).unwrap();
+            }
+        }
+        let outputs = blobs
+            .iter()
+            .map(|blob| format!(r#"{{"sha256":"{blob}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            root.join("actions").join(format!("{key}.json")),
+            format!(r#"{{"schema_version":1,"action_key":"{key}","outputs":[{outputs}]}}"#),
+        )
+        .unwrap();
+    }
+
+    /// Access markers have millisecond timestamps; keep the LRU order explicit.
+    fn touch(root: &Path, kind: AccessKind, key: &str) {
+        record_access(root, kind, key).unwrap();
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    fn collect_within(root: &Path, max_bytes: u64) -> GcReport {
+        collect_garbage(
+            root,
+            GcOptions {
+                max_bytes,
+                min_free_bytes: 0,
+                target_free_bytes: 0,
+                dry_run: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn mib(bytes: usize) -> u64 {
+        u64::try_from(bytes).unwrap()
+    }
+
+    #[test]
+    fn evicting_an_action_credits_the_blobs_only_it_referenced() {
+        let root = tempdir().unwrap();
+        for key in ["a0", "a1", "a2", "a3"] {
+            write_action(root.path(), key, &[&format!("{key}-blob")], 4 * MIB);
+            touch(root.path(), AccessKind::Action, key);
+        }
+        let before = cache_stats(root.path()).unwrap();
+
+        // Freeing two MiB needs exactly the oldest action and its own blob.
+        let report = collect_within(root.path(), before.total_bytes - mib(2 * MIB));
+
+        assert_eq!(report.removed_action_entries, 1);
+        assert!(!root.path().join("actions/a0.json").exists());
+        assert!(!root.path().join("blobs/a0-blob").exists());
+        for key in ["a1", "a2", "a3"] {
+            assert!(root.path().join(format!("actions/{key}.json")).exists());
+            assert!(root.path().join(format!("blobs/{key}-blob")).exists());
+        }
+        assert!(report.capacity_satisfied);
+    }
+
+    #[test]
+    fn a_blob_still_referenced_by_a_surviving_action_is_not_credited() {
+        let root = tempdir().unwrap();
+        write_action(root.path(), "a0", &["shared"], 4 * MIB);
+        touch(root.path(), AccessKind::Action, "a0");
+        write_action(root.path(), "a1", &["shared"], 4 * MIB);
+        touch(root.path(), AccessKind::Action, "a1");
+        write_action(root.path(), "a2", &["a2-blob"], 4 * MIB);
+        touch(root.path(), AccessKind::Action, "a2");
+        let before = cache_stats(root.path()).unwrap();
+
+        // Evicting a0 frees nothing while a1 still needs the shared blob.
+        let report = collect_within(root.path(), before.total_bytes - mib(2 * MIB));
+
+        assert_eq!(report.removed_action_entries, 2);
+        assert!(!root.path().join("blobs/shared").exists());
+        assert!(root.path().join("actions/a2.json").exists());
+        assert!(root.path().join("blobs/a2-blob").exists());
+        assert!(report.capacity_satisfied);
+    }
+
+    /// A temporary directory on a reflink-capable file system, which the
+    /// footprint tests need in order to create real shared extents.
+    #[cfg(target_os = "linux")]
+    fn cow_test_root() -> tempfile::TempDir {
+        let base = std::env::var_os("CARGO_REAPI_COW_TEST_DIR").expect(
+            "set CARGO_REAPI_COW_TEST_DIR to a directory on a reflink-capable file system (XFS or Btrfs)",
+        );
+        tempfile::Builder::new()
+            .prefix("footprint-")
+            .tempdir_in(base)
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_snapshot(root: &Path, name: &str, bytes: usize) -> PathBuf {
+        let object = root.join("gate-snapshots/objects").join(name);
+        fs::create_dir_all(object.join("target")).unwrap();
+        fs::write(object.join("target/data"), patterned(bytes, name)).unwrap();
+        object
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reflink_snapshot(root: &Path, source: &Path, name: &str) -> PathBuf {
+        let destination = root.join("gate-snapshots/objects").join(name);
+        let status = std::process::Command::new("cp")
+            .args(["--reflink=always", "-a"])
+            .arg(source)
+            .arg(&destination)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "CARGO_REAPI_COW_TEST_DIR must support reflink"
+        );
+        destination
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reflinked_gate_snapshots_count_their_shared_blocks_once() {
+        let root = cow_test_root();
+        let cache = root.path();
+        write_action(cache, "hot", &["hot-blob"], 8 * MIB);
+        touch(cache, AccessKind::Action, "hot");
+        let first = write_snapshot(cache, "snapshot-0", 32 * MIB);
+        touch(cache, AccessKind::Gate, "snapshot-0");
+        for index in 1..5 {
+            let name = format!("snapshot-{index}");
+            reflink_snapshot(cache, &first, &name);
+            touch(cache, AccessKind::Gate, &name);
+        }
+
+        // Apparent size is 8 + 5 * 32 MiB; the disk holds 8 + 32 MiB.
+        let report = collect_within(cache, mib(48 * MIB));
+
+        assert!(
+            report.before.total_bytes < mib(48 * MIB),
+            "footprint {} counts shared snapshot blocks more than once",
+            report.before.total_bytes
+        );
+        assert_eq!(report.removed_action_entries, 0);
+        assert_eq!(report.removed_gate_entries, 0);
+        assert!(cache.join("blobs/hot-blob").exists());
+        assert!(report.capacity_satisfied);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evicting_a_snapshot_whose_blocks_are_still_shared_frees_nothing() {
+        let root = cow_test_root();
+        let cache = root.path();
+        let old = write_snapshot(cache, "old", 32 * MIB);
+        touch(cache, AccessKind::Gate, "old");
+        write_action(cache, "action", &["action-blob"], 8 * MIB);
+        touch(cache, AccessKind::Action, "action");
+        let new = reflink_snapshot(cache, &old, "new");
+        touch(cache, AccessKind::Gate, "new");
+
+        // About 40 MiB is on disk. Evicting `old` frees nothing because `new`
+        // shares its blocks, so the action must go to reach 36 MiB.
+        let report = collect_within(cache, mib(36 * MIB));
+
+        assert!(!old.exists());
+        assert!(!cache.join("actions/action.json").exists());
+        assert!(new.exists(), "the newest snapshot fits within the budget");
+        assert!(report.after.total_bytes <= mib(36 * MIB));
+        assert!(report.capacity_satisfied);
+    }
 }
