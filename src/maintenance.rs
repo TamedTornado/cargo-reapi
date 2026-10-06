@@ -11,6 +11,12 @@ use walkdir::WalkDir;
 const MAINTENANCE_LOCK: &str = ".maintenance.lock";
 const MAINTENANCE_ADMISSION_LOCK: &str = ".maintenance-admission.lock";
 
+/// Prefix of a gate snapshot being staged inside `gate-snapshots/objects`.
+/// A producer holds a shared maintenance lease from creating such a directory
+/// until renaming it into place, so one observed under the exclusive lease was
+/// left by a producer that died before its cleanup ran.
+pub(crate) const GATE_STAGING_PREFIX: &str = ".gate-";
+
 pub struct CacheSharedGuard {
     lock: File,
 }
@@ -117,6 +123,7 @@ pub struct GcReport {
     pub removed_action_entries: usize,
     pub removed_gate_entries: usize,
     pub removed_auxiliary_entries: usize,
+    pub removed_abandoned_staging_entries: usize,
     pub removed_blob_entries: usize,
     pub estimated_freed_bytes: u64,
     pub capacity_satisfied: bool,
@@ -149,8 +156,6 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         .context("acquiring exclusive cargo-reapi cache maintenance lock")?;
     let before = cache_stats(cache_root)?;
     let recovering_free_space = before.available_bytes < options.min_free_bytes;
-    let mut candidates = candidates(cache_root)?;
-    candidates.sort_by_key(|candidate| candidate.last_used);
     let mut projected_bytes = before.total_bytes;
     let mut projected_free = before.available_bytes;
     let mut removed_action_entries = 0;
@@ -158,6 +163,22 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
     let mut removed_auxiliary_entries = 0;
     let mut removed_blob_entries = 0;
 
+    // Abandoned staging is never a reuse candidate, yet it counts toward the
+    // cache size. Left in place it can exceed the budget on its own, and every
+    // collection would then evict all reusable entries without satisfying it.
+    let abandoned_staging = abandoned_gate_staging(cache_root)?;
+    let removed_abandoned_staging_entries = abandoned_staging.len();
+    for staging in abandoned_staging {
+        let staging_bytes = path_size(&staging)?;
+        if !options.dry_run {
+            remove_path(&staging)?;
+        }
+        projected_bytes = projected_bytes.saturating_sub(staging_bytes);
+        projected_free = projected_free.saturating_add(staging_bytes);
+    }
+
+    let mut candidates = candidates(cache_root)?;
+    candidates.sort_by_key(|candidate| candidate.last_used);
     for candidate in candidates {
         let within_limit = projected_bytes <= options.max_bytes;
         let free_recovered = !recovering_free_space || projected_free >= options.target_free_bytes;
@@ -207,9 +228,31 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         removed_action_entries,
         removed_gate_entries,
         removed_auxiliary_entries,
+        removed_abandoned_staging_entries,
         removed_blob_entries,
         capacity_satisfied,
     })
+}
+
+/// Call only under the exclusive maintenance lock, which excludes every live
+/// producer's staging (see [`GATE_STAGING_PREFIX`]).
+fn abandoned_gate_staging(cache_root: &Path) -> Result<Vec<PathBuf>> {
+    let Ok(entries) = fs::read_dir(cache_root.join("gate-snapshots/objects")) else {
+        return Ok(Vec::new());
+    };
+    let mut staging = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(GATE_STAGING_PREFIX)
+        {
+            staging.push(entry.path());
+        }
+    }
+    Ok(staging)
 }
 
 fn candidates(cache_root: &Path) -> Result<Vec<Candidate>> {
@@ -498,6 +541,96 @@ mod tests {
         .unwrap();
         assert_eq!(report.removed_gate_entries, 1);
         assert!(root.path().join("gate-snapshots/objects/gate").exists());
+    }
+
+    fn write_gate_object(root: &Path, name: &str, bytes: usize) -> PathBuf {
+        let object = root.join("gate-snapshots/objects").join(name);
+        fs::create_dir_all(object.join("target")).unwrap();
+        fs::write(object.join("target/data"), vec![0_u8; bytes]).unwrap();
+        object
+    }
+
+    #[test]
+    fn gc_removes_abandoned_staging_before_evicting_reusable_entries() {
+        let root = tempdir().unwrap();
+        let published = write_gate_object(root.path(), "published", 1024);
+        let abandoned = write_gate_object(root.path(), ".gate-abandoned", 64 * 1024);
+
+        // The budget fits every reusable entry but not the abandoned staging.
+        let report = collect_garbage(
+            root.path(),
+            GcOptions {
+                max_bytes: 8 * 1024,
+                min_free_bytes: 0,
+                target_free_bytes: 0,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        assert!(!abandoned.exists());
+        assert!(published.exists());
+        assert_eq!(report.removed_abandoned_staging_entries, 1);
+        assert_eq!(report.removed_gate_entries, 0);
+        assert!(report.capacity_satisfied);
+    }
+
+    #[test]
+    fn dry_run_reports_abandoned_staging_without_removing_it() {
+        let root = tempdir().unwrap();
+        let abandoned = write_gate_object(root.path(), ".gate-abandoned", 1024);
+
+        let report = collect_garbage(
+            root.path(),
+            GcOptions {
+                max_bytes: u64::MAX,
+                min_free_bytes: 0,
+                target_free_bytes: 0,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.removed_abandoned_staging_entries, 1);
+        assert!(abandoned.exists());
+    }
+
+    #[test]
+    fn gc_never_removes_staging_owned_by_a_live_producer() {
+        let root = tempdir().unwrap();
+        // A producer stages while holding its shared maintenance lease.
+        let producer = acquire_shared(root.path()).unwrap();
+        let staging = write_gate_object(root.path(), ".gate-live", 1024);
+        let cache_root = root.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        let collector = thread::spawn(move || {
+            let result = collect_garbage(
+                &cache_root,
+                GcOptions {
+                    max_bytes: 0,
+                    min_free_bytes: 0,
+                    target_free_bytes: 0,
+                    dry_run: false,
+                },
+            );
+            sender.send(result).unwrap();
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(staging.exists());
+
+        // Publication renames the staging into place before the lease ends.
+        let published = root.path().join("gate-snapshots/objects/published");
+        fs::rename(&staging, &published).unwrap();
+        drop(producer);
+        let report = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("GC should proceed after the producer publishes")
+            .unwrap();
+        collector.join().unwrap();
+
+        assert_eq!(report.removed_abandoned_staging_entries, 0);
+        assert_eq!(report.removed_gate_entries, 1);
     }
 
     #[test]

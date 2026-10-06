@@ -4,6 +4,17 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-06
+
+- `cache gc` removes gate snapshot staging directories abandoned by producers
+  that died before publishing, and reports them as
+  `removed_abandoned_staging_entries`. Such staging was never a reuse
+  candidate but counted toward the cache size; once it exceeded `--max-bytes`
+  on its own, every collection evicted all reusable action, blob and gate
+  entries without satisfying the budget. A live producer's staging is never
+  removed: it holds a shared maintenance lease until it publishes, and the
+  collector removes staging only under the exclusive lease.
+
 ## [0.2.0] - 2026-10-04
 
 Upgrade every reader and collector that shares a cache together: the cache

@@ -13,7 +13,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::maintenance::{AccessKind, acquire_shared, record_access};
+use crate::maintenance::{AccessKind, GATE_STAGING_PREFIX, acquire_shared, record_access};
 use crate::relocation::{RecordedPathMapping, execution_slot};
 #[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
@@ -164,8 +164,10 @@ impl GateSnapshot {
             .snapshot
             .parent()
             .context("gate snapshot has no object directory")?;
+        // The shared maintenance lease above covers this staging directory
+        // until the rename publishes it; the collector relies on that.
         let staging = tempfile::Builder::new()
-            .prefix(".gate-")
+            .prefix(GATE_STAGING_PREFIX)
             .tempdir_in(parent)?;
         let temporary = staging.path();
         let observed_inputs = collect_observed_inputs(&self.target)?;

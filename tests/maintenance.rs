@@ -1,11 +1,13 @@
 use std::fs::{self, File, OpenOptions};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use serde_json::Value;
 use tempfile::tempdir;
+use walkdir::WalkDir;
 
 struct OwnedChild(Child);
 
@@ -38,6 +40,105 @@ fn collector(cache: &Path) -> OwnedChild {
             .spawn()
             .unwrap(),
     )
+}
+
+fn fixture_workspace(root: &Path, name: &str) -> PathBuf {
+    let workspace = root.join(name);
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname='maintenance-fixture'\nversion='0.0.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() { println!(\"complete\"); }\n",
+    )
+    .unwrap();
+    workspace
+}
+
+fn cached_build(workspace: &Path, cache: &Path, action_log: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(workspace)
+        .env_remove("CARGO_TARGET_DIR")
+        .args(["--backend", "cache", "--cache-dir"])
+        .arg(cache)
+        .arg("--action-log")
+        .arg(action_log)
+        .args(["--", "build", "--offline"])
+        .output()
+        .unwrap()
+}
+
+fn tree_bytes(path: &Path) -> u64 {
+    WalkDir::new(path)
+        .into_iter()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.metadata().unwrap().len())
+        .sum()
+}
+
+fn published_gates(cache: &Path) -> Vec<String> {
+    fs::read_dir(cache.join("gate-snapshots/objects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
+        .collect()
+}
+
+#[test]
+fn collection_reclaims_abandoned_gate_staging_and_keeps_reusable_snapshots() {
+    let root = tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let producer = fixture_workspace(root.path(), "producer");
+
+    let built = cached_build(&producer, &cache, &root.path().join("producer.jsonl"));
+    assert!(built.status.success(), "{built:?}");
+    let published = published_gates(&cache);
+    assert_eq!(
+        published.len(),
+        1,
+        "the successful build publishes its gate"
+    );
+    let reusable_bytes = tree_bytes(&cache);
+
+    // A producer killed during publication never runs its staging cleanup.
+    let abandoned = cache.join("gate-snapshots/objects/.gate-killed");
+    fs::create_dir_all(abandoned.join("target")).unwrap();
+    fs::write(abandoned.join("target/data"), vec![0_u8; 4 * 1024 * 1024]).unwrap();
+
+    // The budget fits every reusable entry, but not the abandoned staging.
+    let collected = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .args(["cache", "gc", "--cache-dir"])
+        .arg(&cache)
+        .arg("--max-bytes")
+        .arg((reusable_bytes + 1024 * 1024).to_string())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(collected.status.success(), "{collected:?}");
+    let report: Value = serde_json::from_slice(&collected.stdout).unwrap();
+
+    assert_eq!(report["removed_gate_entries"], 0, "{report}");
+    assert_eq!(report["removed_action_entries"], 0, "{report}");
+    assert_eq!(report["capacity_satisfied"], true, "{report}");
+    assert_eq!(report["removed_abandoned_staging_entries"], 1, "{report}");
+    assert!(!abandoned.exists());
+    assert_eq!(published_gates(&cache), published);
+
+    // A fresh workspace still reuses the surviving gate snapshot.
+    let consumer = fixture_workspace(root.path(), "consumer");
+    let consumer_log = root.path().join("consumer.jsonl");
+    let reused = cached_build(&consumer, &cache, &consumer_log);
+    assert!(reused.status.success(), "{reused:?}");
+    let actions = fs::read_to_string(&consumer_log).unwrap();
+    assert!(actions.contains("\"gate-snapshot-hit\""), "{actions}");
+    let output = Command::new(consumer.join("target/debug/maintenance-fixture"))
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, b"complete\n");
 }
 
 #[test]
