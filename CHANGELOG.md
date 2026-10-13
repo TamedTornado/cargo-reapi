@@ -4,6 +4,16 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-13
+
+- The hermetic sandbox no longer lists a readable path that lies beneath
+  another readable path. Each package root under the already readable Cargo
+  registry became its own read-only bind in the single `sh -c` command srt
+  hands bubblewrap; once a workspace reached about 700 packages that
+  argument passed Linux's 128 KiB `MAX_ARG_STRLEN` and every build failed
+  with `spawn E2BIG`. Reading a directory already permits reading beneath
+  it, so the nested entries granted nothing.
+
 ## [0.2.2] - 2026-10-06
 
 Upgrade collectors and anything that reads their reports together: report
