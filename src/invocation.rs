@@ -210,12 +210,14 @@ impl RustcInvocation {
                 String::from_utf8_lossy(&printed.stderr).trim()
             )
         }
-        let link_name = String::from_utf8(printed.stdout)
-            .context("rustc returned a non-UTF-8 output filename")?
-            .lines()
-            .next()
-            .context("rustc returned no output filename")?
-            .to_owned();
+        // One linked file per crate type: a `cdylib` and `rlib` library links
+        // both a `.so` and an `.rlib`.
+        let printed = String::from_utf8(printed.stdout)
+            .context("rustc returned a non-UTF-8 output filename")?;
+        let link_names: Vec<&str> = printed.lines().filter(|line| !line.is_empty()).collect();
+        if link_names.is_empty() {
+            bail!("rustc returned no output filename");
+        }
         let mut outputs = Vec::new();
         for (kind, explicit_path) in emits {
             if let Some(path) = explicit_path {
@@ -223,7 +225,7 @@ impl RustcInvocation {
                 continue;
             }
             match kind.as_str() {
-                "link" => outputs.push(out_dir.join(&link_name)),
+                "link" => outputs.extend(link_names.iter().map(|name| out_dir.join(name))),
                 "metadata" => {
                     outputs.push(out_dir.join(format!("lib{crate_name}{extra_filename}.rmeta")));
                 }

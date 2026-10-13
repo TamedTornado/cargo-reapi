@@ -2265,6 +2265,66 @@ fn linked_binary_is_durably_cached_and_runs_in_a_later_worktree() {
     );
 }
 
+/// A library built as both a `cdylib` and an `rlib`, and a binary in the
+/// same package that links the `rlib`.
+fn write_two_crate_type_fixture(root: &Path) {
+    fs::create_dir_all(root.join("src")).expect("source directory");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"capture-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [lib]\nname = \"both_kinds\"\ncrate-type = [\"cdylib\", \"rlib\"]\n",
+    )
+    .expect("fixture manifest");
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").expect("library source");
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", both_kinds::answer()); }\n",
+    )
+    .expect("binary source");
+}
+
+#[test]
+fn a_library_with_two_crate_types_restores_both_from_the_cache() {
+    let cache = tempdir().expect("shared cache directory");
+    let first = tempdir().expect("first fixture directory");
+    let second = tempdir().expect("second fixture directory");
+    write_two_crate_type_fixture(first.path());
+    write_two_crate_type_fixture(second.path());
+
+    let library = |actions: &[Value]| {
+        actions
+            .iter()
+            .find(|action| action["crate_name"] == "both_kinds")
+            .expect("library compiler action")
+            .clone()
+    };
+    let first_action = library(&run(first.path(), "build", "cache", Some(cache.path())));
+    drop(first);
+    // The binary links the restored rlib, so this build fails without it.
+    let second_action = library(&run(second.path(), "build", "cache", Some(cache.path())));
+
+    assert_eq!(first_action["execution"], "local-cache-miss");
+    assert_eq!(second_action["execution"], "cache-hit");
+    let outputs = second_action["output_files"].to_string();
+    assert!(
+        outputs.contains(".rlib") && outputs.contains(".so"),
+        "declared outputs: {outputs}"
+    );
+
+    let restored: Vec<String> = fs::read_dir(second.path().join("target/debug/deps"))
+        .expect("restored dependency outputs")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("libboth_kinds"))
+        .collect();
+    for extension in [".rlib", ".so"] {
+        assert!(
+            restored.iter().any(|name| name.ends_with(extension)),
+            "restored {extension}: {restored:?}"
+        );
+    }
+}
+
 #[test]
 fn restored_action_relocates_integration_test_companion_binary_to_consumer_target() {
     let worktrees = tempdir().expect("worktree parent");
