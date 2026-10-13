@@ -4,6 +4,17 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-13
+
+- A library with several crate types caches every file it links. Only the
+  first file `rustc --print file-names` reported was declared as an output,
+  so a `crate-type = ["cdylib", "rlib"]` library cached its `.so` alone; a
+  cache hit restored no `.rlib` and every crate depending on it failed with
+  "reading input …rlib: No such file". The fault predates 0.2.3 and showed
+  once such a crate entered a shared cache. Declared outputs are part of the
+  action key, so the incomplete entries cached by earlier versions are never
+  served again.
+
 ## [0.2.3] - 2026-10-13
 
 - The hermetic sandbox no longer lists a readable path that lies beneath
