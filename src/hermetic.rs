@@ -423,7 +423,7 @@ fn readable_paths(
         }
         readable.insert(canonical_or_absolute(&input)?);
     }
-    Ok(readable)
+    Ok(without_covered_paths(readable))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -552,6 +552,28 @@ fn writable_paths(paths: &PolicyPaths<'_>) -> Result<BTreeSet<PathBuf>> {
 #[cfg(target_os = "linux")]
 fn remove_readonly_ancestors_of_writable_path(readable: &mut BTreeSet<PathBuf>, writable: &Path) {
     readable.retain(|path| !writable.starts_with(path));
+}
+
+/// Drops every readable path beneath another readable path. Reading a
+/// directory already permits reading everything beneath it, so the nested
+/// entries grant nothing. On Linux each one is still a read-only bind in the
+/// single `sh -c` command srt hands bubblewrap, and Linux caps one argument at
+/// 128 KiB (`MAX_ARG_STRLEN`). Package roots under the already readable Cargo
+/// registry, one per dependency, overflowed it (`spawn E2BIG`) once a
+/// workspace reached about 700 packages.
+fn without_covered_paths(readable: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    // Paths order by component, so a directory's descendants directly follow
+    // it, before any sibling such as `registry-other` after `registry`.
+    let mut kept = BTreeSet::new();
+    let mut covering: Option<PathBuf> = None;
+    for path in readable {
+        if covering.as_ref().is_some_and(|root| path.starts_with(root)) {
+            continue;
+        }
+        covering = Some(path.clone());
+        kept.insert(path);
+    }
+    kept
 }
 
 #[cfg(target_os = "linux")]
@@ -877,7 +899,7 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::{
         SrtFilesystemPolicy, SrtNetworkPolicy, SrtPolicy, canonical_policy_bytes,
-        normalize_policy_identity_bytes,
+        normalize_policy_identity_bytes, without_covered_paths,
     };
     #[cfg(target_os = "linux")]
     use super::{remove_readonly_ancestors_of_writable_path, workspace_inputs_excluding_target};
@@ -976,5 +998,34 @@ mod tests {
         assert!(readable.contains(&nested_package));
         assert!(readable.contains(&external_package));
         assert!(!readable.iter().any(|path| target.starts_with(path)));
+    }
+
+    #[test]
+    fn package_roots_under_a_readable_registry_are_not_listed_again() {
+        let registry = Path::new("/home/builder/.cargo/registry");
+        let sibling = Path::new("/home/builder/.cargo/registry-other");
+        let workspace_crate = Path::new("/work/crates/leaf");
+        let mut readable = std::collections::BTreeSet::from([
+            registry.to_path_buf(),
+            sibling.to_path_buf(),
+            workspace_crate.to_path_buf(),
+            Path::new("/work/crates/leaf/src").to_path_buf(),
+        ]);
+        for package in 0..2000 {
+            readable.insert(registry.join(format!("src/index-1949cf8c/package-{package}-1.0.0")));
+        }
+
+        let readable = without_covered_paths(readable);
+
+        // 2000 package binds alone would exceed one 128 KiB argument.
+        assert_eq!(
+            readable.into_iter().collect::<Vec<_>>(),
+            [workspace_crate, registry, sibling]
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
     }
 }
