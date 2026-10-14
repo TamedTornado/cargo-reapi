@@ -402,19 +402,30 @@ fn gate_key(
         crate::hermetic::provider_identity_digest()?.as_bytes(),
     );
     hash_field(&mut hasher, b"sandbox-policy");
+    // Building the policy acquires the selected project's sources and
+    // settles its lockfile, so the tree hashed below is the one Cargo builds.
+    let selection = crate::query::metadata_selection(cargo_args);
     let policy_identity = crate::hermetic::policy_identity_bytes(
         workspace,
         target,
         cache,
         action_log,
         declared_inputs,
+        &selection,
     )?;
     hash_field(&mut hasher, &policy_identity);
     hash_gate_environment(&mut hasher, workspace, target);
 
     hash_tree(&mut hasher, workspace, "workspace", target, action_log)?;
     hash_cargo_configuration(&mut hasher, workspace)?;
-    hash_external_path_dependencies(&mut hasher, cache, workspace, target, action_log)?;
+    hash_external_path_dependencies(
+        &mut hasher,
+        cache,
+        workspace,
+        &selection,
+        target,
+        action_log,
+    )?;
     hash_declared_inputs(&mut hasher, declared_inputs, workspace, target, action_log)?;
     let state_key = format!("{:x}", hasher.finalize());
     let mut exact = Sha256::new();
@@ -702,10 +713,11 @@ fn hash_external_path_dependencies(
     hasher: &mut Sha256,
     cache: &Path,
     workspace: &Path,
+    selection: &[OsString],
     target: &Path,
     action_log: &Path,
 ) -> Result<()> {
-    let output = crate::query::cargo_metadata_output(workspace, cache, &[])
+    let output = crate::query::cargo_metadata_output(workspace, cache, selection)
         .context("running cargo metadata for gate key")?;
     if !output.status.success() {
         bail!(

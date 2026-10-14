@@ -21,10 +21,17 @@ struct QueryResponse {
     stderr: Vec<u8>,
 }
 
+/// Runs `cargo metadata` for the project a Cargo invocation selects, with
+/// its `selection` (see [`metadata_selection`]).
+///
+/// It runs outside the strict sandbox, where Cargo may use the network, so
+/// it is also where the selected project's dependency sources are acquired:
+/// Cargo downloads every package it resolves, and writes the lockfile when
+/// the invocation permits it, before the network-denied build starts.
 pub fn cargo_metadata_output(
     workspace: &Path,
     cache: &Path,
-    arguments: &[&str],
+    selection: &[OsString],
 ) -> Result<std::process::Output> {
     let executable = env::current_exe().context("locating cargo-reapi query shim")?;
     let compiler = env::var_os("RUSTC")
@@ -34,7 +41,7 @@ pub fn cargo_metadata_output(
     let mut command = Command::new("cargo");
     command
         .args(["metadata", "--format-version", "1"])
-        .args(arguments)
+        .args(selection)
         .current_dir(workspace)
         .env("RUSTC", executable)
         .env_remove("RUSTC_WRAPPER")
@@ -44,6 +51,40 @@ pub fn cargo_metadata_output(
     command
         .output()
         .context("running compiler-free Cargo metadata")
+}
+
+/// The options of a Cargo invocation that decide what `cargo metadata` must
+/// resolve to match it: the manifest (`--manifest-path`), the lockfile and
+/// network policy (`--locked`, `--frozen`, `--offline`) and configuration
+/// (`--config`, `-Z`). Arguments after `--` belong to the program Cargo
+/// runs.
+pub fn metadata_selection(cargo_args: &[OsString]) -> Vec<OsString> {
+    const FLAGS: [&str; 3] = ["--locked", "--frozen", "--offline"];
+    const OPTIONS: [&str; 3] = ["--manifest-path", "--config", "-Z"];
+
+    let mut selection = Vec::new();
+    let mut arguments = cargo_args.iter();
+    while let Some(argument) = arguments.next() {
+        let Some(text) = argument.to_str() else {
+            continue;
+        };
+        if text == "--" {
+            break;
+        }
+
+        let attached = |option: &str| {
+            text.strip_prefix(option)
+                .is_some_and(|rest| rest.starts_with('=') || (option == "-Z" && !rest.is_empty()))
+        };
+        if FLAGS.contains(&text) || OPTIONS.iter().any(|option| attached(option)) {
+            selection.push(argument.clone());
+        } else if OPTIONS.contains(&text)
+            && let Some(value) = arguments.next()
+        {
+            selection.extend([argument.clone(), value.clone()]);
+        }
+    }
+    selection
 }
 
 pub fn run_shim(arguments: &[OsString]) -> Result<i32> {
@@ -181,6 +222,37 @@ fn resolve_executable(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_selection_keeps_what_chooses_the_project_and_its_lockfile() {
+        let arguments = [
+            "build",
+            "--manifest-path",
+            "vendor/tool/Cargo.toml",
+            "-p",
+            "tool",
+            "--locked",
+            "--config=net.retry=2",
+            "-Zunstable-options",
+            "--features",
+            "extra",
+            "--",
+            "--offline",
+        ]
+        .map(OsString::from);
+
+        let selection = metadata_selection(&arguments);
+
+        let expected = [
+            "--manifest-path",
+            "vendor/tool/Cargo.toml",
+            "--locked",
+            "--config=net.retry=2",
+            "-Zunstable-options",
+        ]
+        .map(OsString::from);
+        assert_eq!(selection, expected);
+    }
 
     #[cfg(unix)]
     #[test]

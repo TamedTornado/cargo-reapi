@@ -78,7 +78,7 @@ struct Cli {
     )]
     backend: Backend,
 
-    /// JSON Lines action log. Defaults to target/cargo-reapi/actions.jsonl.
+    /// JSON Lines action log. Defaults to cargo-reapi/actions.jsonl in Cargo's target directory.
     #[arg(long, env = "CARGO_REAPI_ACTION_LOG")]
     action_log: Option<PathBuf>,
 
@@ -412,11 +412,14 @@ fn describe_compile_environment(
 }
 
 fn run_cli(cli: &Cli) -> Result<i32> {
-    let (executable, workspace_root, target_root) = resolve_driver_context()?;
-    let action_log = cli
-        .action_log
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("target/cargo-reapi/actions.jsonl"));
+    let selection = crate::query::metadata_selection(&cli.cargo_args);
+    let (executable, workspace_root, target_root) = resolve_driver_context(&selection)?;
+    // Compiles run in their package's directory, so a relative log would
+    // land beside each package rather than where the caller asked.
+    let action_log = cli.action_log.as_ref().map_or_else(
+        || target_root.join("cargo-reapi/actions.jsonl"),
+        |path| workspace_root.join(path),
+    );
     let action_log_for_snapshot = action_log.clone();
     let cache_dir = cli.cache_dir.clone();
     let snapshot_policy: SnapshotPolicy = cli.snapshot_policy.into();
@@ -454,6 +457,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
                 .context("cache directory is required")?,
             &action_log_for_snapshot,
             &cli.declared_inputs,
+            &selection,
         )?
     } else {
         crate::hermetic::cargo_command(
@@ -463,6 +467,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
             cache_dir.as_deref().unwrap_or(&target_root),
             &action_log_for_snapshot,
             &[],
+            &selection,
         )?
     };
     let mut cargo = hermetic.command;
@@ -513,22 +518,42 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn resolve_driver_context() -> Result<(PathBuf, PathBuf, PathBuf)> {
+fn resolve_driver_context(selection: &[OsString]) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let executable = env::current_exe()
         .context("locating cargo-reapi executable")?
         .canonicalize()
         .context("resolving cargo-reapi executable")?;
     let workspace_root = env::current_dir().context("locating Cargo workspace root")?;
-    let target_root = resolve_target_root(&workspace_root)?;
+    let target_root = resolve_target_root(&workspace_root, selection)?;
     validate_driver_paths(&executable, &target_root)?;
     Ok((executable, workspace_root, target_root))
 }
 
-fn resolve_target_root(workspace_root: &Path) -> Result<PathBuf> {
-    resolve_target_root_from(
-        workspace_root,
-        env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
-    )
+fn resolve_target_root(workspace_root: &Path, selection: &[OsString]) -> Result<PathBuf> {
+    let configured = env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .or_else(|| cargo_target_directory(workspace_root, selection));
+    resolve_target_root_from(workspace_root, configured)
+}
+
+/// The target directory Cargo itself uses for the selected project: beside
+/// a `--manifest-path` workspace, or wherever `build.target-dir` puts it.
+/// `None` when Cargo cannot describe a project there, as for commands that
+/// run outside one.
+fn cargo_target_directory(workspace_root: &Path, selection: &[OsString]) -> Option<PathBuf> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .args(selection)
+        .current_dir(workspace_root)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    metadata["target_directory"].as_str().map(PathBuf::from)
 }
 
 fn resolve_target_root_from(workspace_root: &Path, configured: Option<PathBuf>) -> Result<PathBuf> {

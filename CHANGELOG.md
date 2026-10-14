@@ -4,6 +4,23 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+- A new dependency of a project selected with `--manifest-path` is fetched
+  before the strict sandbox starts. Sources were acquired for the workspace in
+  the working directory only, so building or fetching a separate workspace,
+  such as a vendored tool excluded from the main one, failed offline with "no
+  matching package named …". The pre-sandbox `cargo metadata` now takes the
+  invocation's `--manifest-path`, `--locked`, `--frozen`, `--offline`,
+  `--config` and `-Z` options, so it also never writes a lockfile that a
+  `--locked` build would have refused. The gate key's path dependencies come
+  from the same project.
+- Without `CARGO_TARGET_DIR`, the target directory is the one Cargo reports
+  for the selected project, including `build.target-dir`. A `--manifest-path`
+  workspace was built into the working directory's `target`, where the
+  sandbox did not let Cargo write, or a gate restored it there.
+- The default action log lives in that target directory and every compile
+  finds it. It was a relative path, which compiles run from a package outside
+  the workspace resolved beside that package, failing in the sandbox.
+
 ## [0.2.7] - 2026-10-14
 
 Three faults below could serve a wrong cache hit. Earlier entries cannot be

@@ -296,7 +296,7 @@ and a current operator-authorized `sudo` session. Its tool-selected OS event
 stream is independent of cargo-reapi's wrapper and action log. Rotational mode
 uses the fixed compatibility clocks but cannot substitute for the SSD result.
 
-The default log is `target/cargo-reapi/actions.jsonl`. Cache mode deliberately requires an explicit cache directory so separate worktrees share only the operator-selected store. REAPI mode expects `reproxy` to be started and stopped through reclient's `bootstrap` lifecycle outside each individual Cargo action. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
+The default log is `cargo-reapi/actions.jsonl` in the target directory Cargo uses for the invocation; a relative `--action-log` is relative to the directory cargo-reapi starts in. Cache mode deliberately requires an explicit cache directory so separate worktrees share only the operator-selected store. REAPI mode expects `reproxy` to be started and stopped through reclient's `bootstrap` lifecycle outside each individual Cargo action. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
 
 Strict snapshot execution denies network access, denies reads outside the
 workspace/package/toolchain/configuration/declared-input set, and denies writes
@@ -306,6 +306,17 @@ receive it through `--declared-input`; undeclared filesystem or network effects
 fail the gate and publish no snapshot. `--snapshot-policy off` is an explicit
 uncached compatibility mode, not a fallback: strict mode never silently
 degrades when the provider or an OS primitive is unavailable.
+
+Because the sandboxed Cargo runs offline, cargo-reapi acquires dependency
+sources first, outside the sandbox: it runs `cargo metadata` for the project
+the invocation selects, with its `--manifest-path`, `--locked`, `--frozen`,
+`--offline`, `--config` and `-Z` options, so Cargo downloads every package and
+git checkout it resolves and writes the lockfile only when the invocation
+would. A dependency newly added to the selected project, including a
+separate workspace built with `--manifest-path`, is fetched before the build,
+and `cargo reapi fetch` works the same way. Without `CARGO_TARGET_DIR`, the
+target directory is the one Cargo reports for that project, so a
+`--manifest-path` workspace builds into its own `target` as under plain Cargo.
 
 ### Compile environment
 

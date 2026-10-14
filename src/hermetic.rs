@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,14 +95,20 @@ pub fn cargo_command(
     cache: &Path,
     action_log: &Path,
     explicit_inputs: &[PathBuf],
+    selection: &[OsString],
 ) -> Result<HermeticCargo> {
     match policy {
         SnapshotPolicy::Off => Ok(HermeticCargo {
             command: Command::new("cargo"),
         }),
-        SnapshotPolicy::Strict => {
-            strict_cargo_command(workspace, target, cache, action_log, explicit_inputs)
-        }
+        SnapshotPolicy::Strict => strict_cargo_command(
+            workspace,
+            target,
+            cache,
+            action_log,
+            explicit_inputs,
+            selection,
+        ),
     }
 }
 
@@ -112,6 +119,7 @@ fn strict_cargo_command(
     cache: &Path,
     action_log: &Path,
     explicit_inputs: &[PathBuf],
+    selection: &[OsString],
 ) -> Result<HermeticCargo> {
     let workspace = canonical_or_absolute(workspace)?;
     let target = create_and_canonicalize(target, "target")?;
@@ -123,15 +131,15 @@ fn strict_cargo_command(
     )?;
     let control_temporary = srt_control_directory()?;
     let installation = resolve_srt_installation()?;
-    let policy = build_policy(
-        &workspace,
-        &target,
-        &cache,
-        &action_log,
-        &temporary,
-        &control_temporary,
-        explicit_inputs,
-    )?;
+    let paths = PolicyPaths {
+        workspace: &workspace,
+        target: &target,
+        cache: &cache,
+        action_log: &action_log,
+        temporary: &temporary,
+        selection,
+    };
+    let policy = build_policy(&paths, &control_temporary, explicit_inputs)?;
     let policy_path = target.join("cargo-reapi/srt-policy-v1.json");
     fs::write(&policy_path, canonical_policy_bytes(&policy)?)
         .with_context(|| format!("writing srt policy {}", policy_path.display()))?;
@@ -188,6 +196,7 @@ fn strict_cargo_command(
     _cache: &Path,
     _action_log: &Path,
     _explicit_inputs: &[PathBuf],
+    _selection: &[OsString],
 ) -> Result<HermeticCargo> {
     bail!(
         "strict whole-gate snapshots support macOS and Linux through pinned Anthropic Sandbox Runtime {SRT_REQUIRED_VERSION}; use --snapshot-policy off to run without whole-gate restoration"
@@ -249,6 +258,7 @@ pub fn policy_identity_bytes(
     cache: &Path,
     action_log: &Path,
     explicit_inputs: &[PathBuf],
+    selection: &[OsString],
 ) -> Result<Vec<u8>> {
     let workspace = canonical_or_absolute(workspace)?;
     let target = absolute(target)?;
@@ -256,15 +266,15 @@ pub fn policy_identity_bytes(
     let action_log = absolute(action_log)?;
     let temporary = target.join("cargo-reapi/hermetic-tmp");
     let control_temporary = srt_control_directory()?;
-    let policy = build_policy(
-        &workspace,
-        &target,
-        &cache,
-        &action_log,
-        &temporary,
-        &control_temporary,
-        explicit_inputs,
-    )?;
+    let paths = PolicyPaths {
+        workspace: &workspace,
+        target: &target,
+        cache: &cache,
+        action_log: &action_log,
+        temporary: &temporary,
+        selection,
+    };
+    let policy = build_policy(&paths, &control_temporary, explicit_inputs)?;
     normalize_policy_identity_bytes(
         canonical_policy_bytes(&policy)?,
         &control_temporary,
@@ -333,27 +343,19 @@ struct PolicyPaths<'a> {
     cache: &'a Path,
     action_log: &'a Path,
     temporary: &'a Path,
+    /// What the Cargo invocation selects; see
+    /// [`crate::query::metadata_selection`].
+    selection: &'a [OsString],
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn build_policy(
-    workspace: &Path,
-    target: &Path,
-    cache: &Path,
-    action_log: &Path,
-    temporary: &Path,
+    paths: &PolicyPaths<'_>,
     control_temporary: &Path,
     explicit_inputs: &[PathBuf],
 ) -> Result<SrtPolicy> {
-    let paths = PolicyPaths {
-        workspace,
-        target,
-        cache,
-        action_log,
-        temporary,
-    };
-    let readable = readable_paths(&paths, explicit_inputs)?;
-    let writable = writable_paths(&paths)?;
+    let readable = readable_paths(paths, explicit_inputs)?;
+    let writable = writable_paths(paths)?;
     Ok(SrtPolicy {
         network: SrtNetworkPolicy {
             allowed_domains: Vec::new(),
@@ -386,7 +388,7 @@ fn readable_paths(
     paths: &PolicyPaths<'_>,
     explicit_inputs: &[PathBuf],
 ) -> Result<BTreeSet<PathBuf>> {
-    let mut readable = package_roots(paths.workspace, paths.cache)?;
+    let mut readable = package_roots(paths.workspace, paths.cache, paths.selection)?;
     #[cfg(target_os = "linux")]
     {
         // A root package contributes `workspace` through cargo metadata. Do
@@ -746,12 +748,19 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn package_roots(workspace: &Path, cache: &Path) -> Result<BTreeSet<PathBuf>> {
-    // Resolve and acquire locked package sources before constructing the
-    // network-denied transition sandbox. Cargo's own offline configuration
-    // remains authoritative; cargo-reapi must not silently impose an
-    // operator-managed pre-warm requirement on otherwise online callers.
-    let output = crate::query::cargo_metadata_output(workspace, cache, &[])
+fn package_roots(
+    workspace: &Path,
+    cache: &Path,
+    selection: &[OsString],
+) -> Result<BTreeSet<PathBuf>> {
+    // Resolve and acquire the selected project's package sources before
+    // constructing the network-denied transition sandbox. The selection
+    // carries the invocation's `--manifest-path`, so a project outside the
+    // working directory's workspace is acquired too, and its lockfile and
+    // offline options, so Cargo's own policy remains authoritative;
+    // cargo-reapi must not silently impose an operator-managed pre-warm
+    // requirement on otherwise online callers.
+    let output = crate::query::cargo_metadata_output(workspace, cache, selection)
         .context("running cargo metadata for the strict snapshot policy")?;
     if !output.status.success() {
         bail!(
