@@ -307,6 +307,69 @@ fail the gate and publish no snapshot. `--snapshot-policy off` is an explicit
 uncached compatibility mode, not a fallback: strict mode never silently
 degrades when the provider or an OS primitive is unavailable.
 
+### Compile environment
+
+In cache mode, each compile runs with only the environment variables its
+action key covers. Every other variable is removed before rustc starts, so an
+unkeyed variable cannot change an artifact, and unrelated shell state (`OLDPWD`,
+`PWD`, terminal and agent session variables) does not split the cache between
+shells. A compile receives:
+
+- the variables rustc, Cargo, Clippy, the dynamic loader, the C toolchain and
+  native linkers read: every `CARGO*`, `__CARGO*`, `RUST*`, `CLIPPY_*`, `LD_*`,
+  `DYLD_*`, `GCC_*`, `COLLECT_*`, `CCC_*`, `CLANG_*`, `LC_*` and `MOLD_*`
+  variable, `*_DEPLOYMENT_TARGET`, and `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`,
+  `LANG`, `LANGUAGE`, `LIBRARY_PATH`, `COMPILER_PATH`, `SOURCE_DATE_EPOCH`, `CC`,
+  `CXX`, `AR`, `LD`, `CFLAGS`, `CXXFLAGS`, `CPPFLAGS`, `LDFLAGS`, `SDKROOT`,
+  `DEVELOPER_DIR`, `ZERO_AR_DATE`, `MAKEFLAGS`, `MFLAGS`, `OUT_DIR`, `TARGET`,
+  `HOST`, `PROFILE`, `DEBUG`, `OPT_LEVEL` and `NUM_JOBS`;
+- everything Cargo defined for the compile beyond the caller's environment,
+  including `.cargo/config.toml` `[env]` entries and build-script `rustc-env`
+  values;
+- the build script's `cargo::rerun-if-env-changed` variables;
+- variables rustc recorded as `# env-dep:` dependencies (`env!`, `option_env!`
+  and tracked proc-macro reads). The first compile that tracks a set variable
+  it was not given is repeated with it, and the cache remembers the name for
+  that crate. If such a compile had already succeeded, it fails once with an
+  explanation instead, because Cargo may already have used its artifacts; the
+  next build passes the variable;
+- every name in `CARGO_REAPI_DECLARED_ENV`, a comma-separated list.
+
+cargo-reapi's own settings (action log, cache directory, backend, worktree
+roots and resource capacity) are read by the wrapper only; they never reach a
+compile and are not keyed. The audit observer's `CARGO_REAPI_REAL_RUSTC` and
+`CARGO_REAPI_RUSTC_TRACE` reach the compiler unkeyed.
+
+Search lists (`PATH`, `LD_LIBRARY_PATH`, `LIBRARY_PATH`, `COMPILER_PATH` and
+the `DYLD_*` library paths) are keyed by the canonical directories they
+resolve through, so a per-shell symlink to the same directory does not change
+the key. Their values are passed unchanged. The compiler's binary digest,
+version, host and arguments, including `--target`, stay in the key, so
+different toolchains never share an entry.
+
+A proc macro that reads a variable through `std::env` is invisible to rustc's
+dependency tracking, so it sees that variable as unset unless the variable is
+in one of the groups above. Such a macro usually fails with a message naming
+the variable: sqlx's `DATABASE_URL` is a typical case. Declare it:
+
+```sh
+CARGO_REAPI_DECLARED_ENV=DATABASE_URL,SQLX_OFFLINE cargo reapi --backend cache -- build
+```
+
+Set `CARGO_REAPI_REPORT_STRIPPED_ENV=1` to have every cached compile list the
+variables removed from it on stderr. The action log records the same list as
+`stripped_environment`, beside the `keyed_environment` digests.
+
+If cargo-reapi cannot determine a compile's environment (the driver did not
+start Cargo, the compile emits no dep-info, or the build script's output is
+unreadable), that compile runs with the whole environment and keys all of it.
+Capture and REAPI modes run compiles with the caller's whole environment.
+Build scripts always run under Cargo with its whole environment. Whatever they
+produce reaches a compile only as `OUT_DIR` contents, compiler arguments or
+`rustc-env` values, and all of those are action inputs. So a build script that
+reads an undeclared variable cannot cause a wrong action hit; whole-gate
+snapshots key the entire environment.
+
 For Linux container consumers, build the repository's image rather than bind-mounting a host binary across an OS boundary:
 
 ```sh

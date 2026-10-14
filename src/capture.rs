@@ -17,7 +17,8 @@ use crate::action::{
     ActionInput, DeterministicAction, PlatformIdentity, RemoteEligibility, ToolchainIdentity,
     action_key,
 };
-use crate::invocation::{NON_SEMANTIC_COMPILER_ENVIRONMENT, RustcInvocation};
+use crate::environment::CompileEnvironment;
+use crate::invocation::RustcInvocation;
 use crate::relocation::{
     cache_slot, execution_slot, normalize_artifact_slots, record_path_mappings,
     restored_logical_digest,
@@ -53,6 +54,7 @@ struct ActionCapture {
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
     keyed_environment: BTreeMap<String, String>,
+    stripped_environment: Vec<String>,
     inputs: Vec<ActionInput>,
     output_directory: Option<String>,
     output_files: Vec<String>,
@@ -72,6 +74,8 @@ pub struct PreparedInvocation {
     pub arguments: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub keyed_environment: BTreeMap<String, String>,
+    pub stripped_environment: Vec<String>,
+    pub dep_info: Option<PreparedOutput>,
     pub inputs: Vec<PreparedInput>,
     pub toolchain_sha256: String,
     pub platform_os: &'static str,
@@ -92,7 +96,7 @@ pub struct PreparedInput {
     pub size_bytes: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PreparedOutput {
     pub logical_path: String,
     pub actual_path: PathBuf,
@@ -112,14 +116,21 @@ struct CaptureRoots {
     toolchain: PathBuf,
 }
 
+/// Records the action and runs the compiler with the caller's whole
+/// environment. The recorded key covers the environment a cached compile
+/// would start with.
 pub fn capture_invocation(invocation: &RustcInvocation, options: &CaptureOptions) -> Result<i32> {
-    let prepared = prepare_invocation(invocation)?;
+    let environment = CompileEnvironment::for_compile(invocation, None);
+    let prepared = prepare_invocation(invocation, &environment)?;
     let exit_code = invocation.execute()?;
     record_invocation(options, &prepared, "local-capture", exit_code)?;
     Ok(exit_code)
 }
 
-pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvocation> {
+pub fn prepare_invocation(
+    invocation: &RustcInvocation,
+    compile_environment: &CompileEnvironment,
+) -> Result<PreparedInvocation> {
     let roots = CaptureRoots::from_env(invocation)?;
     // Cargo probes rustc through the wrapper with control invocations such as
     // `rustc -vV`. Those invocations produce no artifact and may run while the
@@ -145,7 +156,7 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         .into_iter()
         .map(|(name, value)| (name, roots.normalize_text(&value)))
         .collect();
-    let key_environment = keyed_environment(&roots);
+    let key_environment = compile_environment.keyed_values(|value| roots.normalize_text(value));
     let deterministic_action = DeterministicAction {
         compiler: ToolchainIdentity {
             sha256: toolchain.sha256.clone(),
@@ -192,6 +203,17 @@ pub fn prepare_invocation(invocation: &RustcInvocation) -> Result<PreparedInvoca
         arguments,
         environment,
         keyed_environment: key_environment,
+        stripped_environment: compile_environment.stripped(),
+        dep_info: invocation.dep_info_file().and_then(|path| {
+            let actual_path = absolute(&path, &invocation.cwd);
+            roots
+                .normalize(&actual_path, &invocation.cwd)
+                .ok()
+                .map(|logical_path| PreparedOutput {
+                    logical_path,
+                    actual_path,
+                })
+        }),
         inputs,
         output_directory: invocation
             .out_dir()
@@ -267,6 +289,7 @@ pub fn record_invocation(
         arguments: prepared.arguments.clone(),
         environment: prepared.environment.clone(),
         keyed_environment: prepared.keyed_environment.clone(),
+        stripped_environment: prepared.stripped_environment.clone(),
         inputs: prepared
             .inputs
             .iter()
@@ -586,28 +609,6 @@ fn captured_environment() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn keyed_environment(roots: &CaptureRoots) -> BTreeMap<String, String> {
-    env::vars()
-        .filter(|(name, _)| is_keyed_environment(name))
-        .map(|(name, value)| {
-            let normalized = roots.normalize_text(&value);
-            (name, format!("sha256:{:x}", Sha256::digest(normalized)))
-        })
-        .collect()
-}
-
-fn is_keyed_environment(name: &str) -> bool {
-    !matches!(
-        name,
-        "CARGO_REAPI_ACTION_LOG"
-            | "CARGO_REAPI_BACKEND"
-            | "CARGO_REAPI_CACHE_DIR"
-            | "CARGO_REAPI_RUSTC_TRACE"
-            | "CARGO_REAPI_TARGET_ROOT"
-            | "CARGO_REAPI_WORKSPACE_ROOT"
-    ) && !NON_SEMANTIC_COMPILER_ENVIRONMENT.contains(&name)
-}
-
 fn is_compiler_environment(name: &str) -> bool {
     name.starts_with("CARGO_CFG_")
         || name.starts_with("CARGO_BIN_EXE_")
@@ -666,7 +667,7 @@ fn lossy(value: &OsStr) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{is_compiler_environment, is_keyed_environment, should_record_path_mappings};
+    use super::{is_compiler_environment, should_record_path_mappings};
     use crate::invocation::RustcInvocation;
 
     fn invocation(arguments: &[&str]) -> RustcInvocation {
@@ -710,16 +711,5 @@ mod tests {
         assert!(!is_compiler_environment("CARGO_REGISTRY_TOKEN"));
         assert!(!is_compiler_environment("CARGO_REGISTRIES_PRIVATE_TOKEN"));
         assert!(!is_compiler_environment("AWS_SECRET_ACCESS_KEY"));
-    }
-
-    #[test]
-    fn keys_user_inputs_but_not_ephemeral_sandbox_transport_ports() {
-        assert!(is_keyed_environment("RUSTFLAGS"));
-        assert!(is_keyed_environment("MY_PROC_MACRO_INPUT"));
-        assert!(!is_keyed_environment("CLAUDE_CODE_HOST_HTTP_PROXY_PORT"));
-        assert!(!is_keyed_environment("CLAUDE_CODE_HOST_SOCKS_PROXY_PORT"));
-        assert!(!is_keyed_environment("CODEX_THREAD_ID"));
-        assert!(!is_keyed_environment("HOSTNAME"));
-        assert!(!is_keyed_environment("SHLVL"));
     }
 }

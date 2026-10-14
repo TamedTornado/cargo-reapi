@@ -6,15 +6,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::environment::CompileEnvironment;
 use crate::relocation::execution_slot;
-
-pub const NON_SEMANTIC_COMPILER_ENVIRONMENT: [&str; 5] = [
-    "CLAUDE_CODE_HOST_HTTP_PROXY_PORT",
-    "CLAUDE_CODE_HOST_SOCKS_PROXY_PORT",
-    "CODEX_THREAD_ID",
-    "HOSTNAME",
-    "SHLVL",
-];
 
 #[derive(Debug)]
 pub struct RustcInvocation {
@@ -43,12 +36,18 @@ impl RustcInvocation {
         })
     }
 
+    /// Runs the compiler with the caller's whole environment, as Cargo would.
     pub fn execute(&self) -> Result<i32> {
+        self.execute_in(None)
+    }
+
+    /// Runs the compiler with `environment` alone, or with the caller's whole
+    /// environment when it is `None`.
+    pub fn execute_in(&self, environment: Option<&CompileEnvironment>) -> Result<i32> {
         self.record_physical_compiler_observation()?;
         let mut command = Command::new(&self.compiler);
         command.args(&self.args);
-        apply_relocation_environment(&mut command, &self.compiler)?;
-        remove_non_semantic_compiler_environment(&mut command);
+        apply_compiler_environment(&mut command, &self.compiler, environment)?;
         let status = command
             .status()
             .with_context(|| format!("executing {}", self.compiler.display()))?;
@@ -60,6 +59,7 @@ impl RustcInvocation {
         wrapper: &Path,
         capture_path: &Path,
         real_linker: &Path,
+        environment: &CompileEnvironment,
     ) -> Result<i32> {
         self.record_physical_compiler_observation()?;
         let mut arguments = self.args.clone();
@@ -70,8 +70,7 @@ impl RustcInvocation {
         )));
         let mut command = Command::new(&self.compiler);
         command.args(arguments);
-        apply_relocation_environment(&mut command, &self.compiler)?;
-        remove_non_semantic_compiler_environment(&mut command);
+        apply_compiler_environment(&mut command, &self.compiler, Some(environment))?;
         let status = command
             .env("CARGO_REAPI_LINKER_CAPTURE", capture_path)
             .env("CARGO_REAPI_REAL_LINKER", real_linker)
@@ -186,6 +185,22 @@ impl RustcInvocation {
         value_after(&self.args, "--out-dir").map(PathBuf::from)
     }
 
+    /// The dependency file rustc writes, when the compile asks for one.
+    pub fn dep_info_file(&self) -> Option<PathBuf> {
+        let (_, explicit_path) = emit_values(&self.args)
+            .into_iter()
+            .find(|(kind, _)| kind == "dep-info")?;
+        if let Some(path) = explicit_path {
+            return Some(PathBuf::from(path));
+        }
+        let crate_name = self.crate_name()?.to_string_lossy();
+        let extra_filename = codegen_value(&self.args, "extra-filename").unwrap_or_default();
+        Some(
+            self.out_dir()?
+                .join(format!("{crate_name}{extra_filename}.d")),
+        )
+    }
+
     pub fn output_files(&self) -> Result<Vec<PathBuf>> {
         if let Some(output) = value_after(&self.args, "-o") {
             return Ok(vec![PathBuf::from(output)]);
@@ -268,12 +283,6 @@ fn create_observation_file(trace_root: &Path, crate_name: &str) -> Result<File> 
     )
 }
 
-fn remove_non_semantic_compiler_environment(command: &mut Command) {
-    for name in NON_SEMANTIC_COMPILER_ENVIRONMENT {
-        command.env_remove(name);
-    }
-}
-
 fn is_cargo_driver_command(value: &OsStr) -> bool {
     matches!(
         value.to_str(),
@@ -299,7 +308,26 @@ fn is_cargo_driver_command(value: &OsStr) -> bool {
     )
 }
 
-fn apply_relocation_environment(command: &mut Command, compiler: &Path) -> Result<()> {
+/// Gives the compiler its environment: `environment` alone when present,
+/// otherwise everything inherited. Values under a worktree, target or
+/// toolchain root are relocated into their execution slots either way.
+fn apply_compiler_environment(
+    command: &mut Command,
+    compiler: &Path,
+    environment: Option<&CompileEnvironment>,
+) -> Result<()> {
+    if let Some(environment) = environment {
+        command.env_clear();
+        command.envs(std::env::vars_os().filter(|(name, _)| environment.passes(name)));
+    }
+    apply_relocation_environment(command, compiler, environment)
+}
+
+fn apply_relocation_environment(
+    command: &mut Command,
+    compiler: &Path,
+    environment: Option<&CompileEnvironment>,
+) -> Result<()> {
     let mut roots = Vec::new();
     for name in [
         "CARGO_MANIFEST_DIR",
@@ -317,6 +345,9 @@ fn apply_relocation_environment(command: &mut Command, compiler: &Path) -> Resul
     roots.dedup();
 
     for (name, value) in std::env::vars_os() {
+        if environment.is_some_and(|environment| !environment.passes(&name)) {
+            continue;
+        }
         if let Some(relocated) = relocated_environment_value(&value, &roots)? {
             command.env(name, relocated);
         }
@@ -470,22 +501,26 @@ mod tests {
     }
 
     #[test]
-    fn strips_ephemeral_sandbox_transport_ports_from_compiler_children() {
+    fn keyed_compiles_receive_only_their_keyed_environment() {
+        let keyed =
+            CompileEnvironment::Keyed(std::collections::BTreeSet::from(["PATH".to_owned()]));
         let mut command = Command::new("rustc");
-        for name in NON_SEMANTIC_COMPILER_ENVIRONMENT {
-            command.env(name, "ephemeral");
-        }
+        apply_compiler_environment(
+            &mut command,
+            Path::new("/toolchain/bin/rustc"),
+            Some(&keyed),
+        )
+        .expect("keyed environment");
 
-        remove_non_semantic_compiler_environment(&mut command);
-
-        for name in NON_SEMANTIC_COMPILER_ENVIRONMENT {
-            assert!(
-                command
-                    .get_envs()
-                    .any(|(candidate, value)| candidate == name && value.is_none()),
-                "missing environment removal for {name}"
-            );
-        }
+        let passed = command
+            .get_envs()
+            .filter_map(|(name, value)| value.map(|_| name.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        assert!(
+            passed
+                .iter()
+                .all(|name| name == "PATH" || name.starts_with("CARGO_REAPI_"))
+        );
     }
 
     #[test]

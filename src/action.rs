@@ -98,6 +98,19 @@ mod tests {
         let mut toolchain = baseline.clone();
         toolchain.compiler.sha256 = "different-toolchain".to_owned();
         mutations.push(toolchain);
+        // PATH is keyed by the directories it resolves through, so the
+        // compiler's own identity must separate toolchains: its version and
+        // host, and an explicit compilation target.
+        let mut version = baseline.clone();
+        version.compiler.version =
+            "rustc 1.94.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.0".to_owned();
+        mutations.push(version);
+        let mut target = baseline.clone();
+        target.arguments.extend([
+            "--target".to_owned(),
+            "aarch64-unknown-linux-gnu".to_owned(),
+        ]);
+        mutations.push(target);
         let mut platform = baseline.clone();
         platform.platform.arch = "different-arch";
         mutations.push(platform);

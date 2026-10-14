@@ -4,6 +4,29 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+- Cached compiles run with, and are keyed on, only the environment they can
+  read. Every variable outside a short deny list used to enter each action
+  key, including `OLDPWD`, `PWD`, agent session IDs and per-shell `PATH`
+  entries, so worktrees built from different shells shared almost nothing: a
+  fresh Moria worktree from a second shell had 666 misses and no hits. A
+  compile now receives only the toolchain variables rustc, Cargo, Clippy and
+  native linkers read; what Cargo defined for it (`[env]`, `rustc-env`,
+  crate variables); its build script's `rerun-if-env-changed` names; the
+  variables rustc recorded as `env-dep` dependencies; and the names in the new
+  `CARGO_REAPI_DECLARED_ENV`. Everything else is removed before rustc
+  starts, which fails closed: an unkeyed variable cannot change an artifact.
+  A proc macro that reads an undeclared variable through `std::env` now sees
+  it as unset. Declare it in `CARGO_REAPI_DECLARED_ENV` (for example sqlx's
+  `DATABASE_URL`). `CARGO_REAPI_REPORT_STRIPPED_ENV=1` lists the variables
+  removed from each compile, and the action log records them as
+  `stripped_environment`.
+- Search lists such as `PATH` are keyed by the canonical directories they
+  resolve through, so per-shell symlinks such as fnm's multishell directory
+  no longer change keys.
+- The strict sandbox removes srt's randomly numbered
+  `CLAUDE_CODE_HOST_HTTP_PROXY_PORT` and `CLAUDE_CODE_HOST_SOCKS_PROXY_PORT`
+  before Cargo starts, so build scripts no longer see them either.
+
 ## [0.2.4] - 2026-10-13
 
 - A library with several crate types caches every file it links. Only the

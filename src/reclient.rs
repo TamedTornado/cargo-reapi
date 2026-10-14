@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use crate::capture::{
     CaptureOptions, PreparedInvocation, PreparedOutput, prepare_invocation, record_invocation,
 };
+use crate::environment::CompileEnvironment;
 use crate::invocation::RustcInvocation;
 
 pub struct ReclientOptions {
@@ -50,7 +51,8 @@ pub fn execute_reapi(
     capture_options: &CaptureOptions,
     options: &ReclientOptions,
 ) -> Result<i32> {
-    let prepared = prepare_invocation(invocation)?;
+    let environment = CompileEnvironment::for_compile(invocation, None);
+    let prepared = prepare_invocation(invocation, &environment)?;
     if !prepared.remote_eligibility.eligible {
         let exit_code = invocation.execute()?;
         record_invocation(capture_options, &prepared, "local-ineligible", exit_code)?;

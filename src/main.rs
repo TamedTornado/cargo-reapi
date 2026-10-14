@@ -2,6 +2,7 @@ mod acceptance;
 mod action;
 mod cache;
 mod capture;
+mod environment;
 mod evidence;
 mod footprint;
 mod gate;
@@ -26,9 +27,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::cache::{CacheOptions, LinkerCaptureRecord, execute_cached};
 use crate::capture::{CaptureOptions, capture_invocation};
+use crate::environment::{CALLER_ENVIRONMENT, RUNTIME_PLUMBING_ENVIRONMENT, caller_record};
 use crate::gate::GateSnapshot;
 use crate::hermetic::SnapshotPolicy;
-use crate::invocation::{NON_SEMANTIC_COMPILER_ENVIRONMENT, RustcInvocation};
+use crate::invocation::RustcInvocation;
 use crate::maintenance::{GcOptions, cache_stats, collect_garbage};
 use crate::reclient::{ReclientOptions, execute_reapi, validate_platform_template};
 use crate::resource::ResourceCapacity;
@@ -444,10 +446,13 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     // it reach build scripts would make otherwise identical worktrees
     // semantically different; omitting it from a key without scrubbing it
     // would be unsound.
-    for name in NON_SEMANTIC_COMPILER_ENVIRONMENT {
+    for name in RUNTIME_PLUMBING_ENVIRONMENT {
         cargo.env_remove(name);
     }
     cargo
+        // Compiles compare against the caller's environment to find what
+        // Cargo itself defined for them.
+        .env(CALLER_ENVIRONMENT, caller_record())
         .env("RUSTC_WRAPPER", executable)
         .env(
             "CARGO_REAPI_BACKEND",

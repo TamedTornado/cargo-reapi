@@ -1331,7 +1331,12 @@ fn undeclared_proc_macro_filesystem_read_fails_closed() {
         cache.path(),
         &workspace.join("target/actions.jsonl"),
         &["build", "--workspace"],
-        &[("REAPI_PROC_FILE", external_text.as_str())],
+        // Declared, so the proc macro reaches its file read; the read
+        // itself must fail closed.
+        &[
+            ("REAPI_PROC_FILE", external_text.as_str()),
+            ("CARGO_REAPI_DECLARED_ENV", "REAPI_PROC_FILE"),
+        ],
         Some(trace.path()),
     );
     assert!(
@@ -1527,7 +1532,10 @@ fn proc_macro_environment_change_invalidates_compiler_action() {
             cache.path(),
             &roots.path().join("producer.jsonl"),
             &["build", "--workspace"],
-            &[("REAPI_PROC_VALUE", "42")],
+            &[
+                ("REAPI_PROC_VALUE", "42"),
+                ("CARGO_REAPI_DECLARED_ENV", "REAPI_PROC_VALUE"),
+            ],
             Some(trace.path()),
         )
         .success()
@@ -1539,7 +1547,10 @@ fn proc_macro_environment_change_invalidates_compiler_action() {
             cache.path(),
             &roots.path().join("consumer.jsonl"),
             &["build", "--workspace"],
-            &[("REAPI_PROC_VALUE", "43")],
+            &[
+                ("REAPI_PROC_VALUE", "43"),
+                ("CARGO_REAPI_DECLARED_ENV", "REAPI_PROC_VALUE"),
+            ],
             Some(trace.path()),
         )
         .success()

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::capture::{CaptureOptions, PreparedInvocation, prepare_invocation, record_invocation};
+use crate::environment::{CompileEnvironment, EnvironmentHints, tracked_environment};
 use crate::invocation::RustcInvocation;
 use crate::maintenance::{AccessKind, acquire_shared, record_access};
 use crate::relocation::{
@@ -85,24 +86,85 @@ pub(crate) struct LinkerCaptureRecord {
     pub traced_inputs: Vec<String>,
 }
 
+/// How one attempt at a cached compile ended.
+enum Resolution {
+    Finished(i32),
+    /// The compile tracked variables the caller set but its keyed environment
+    /// withheld. When `rerun` is false the compile already succeeded and Cargo
+    /// may have used its artifacts, so it cannot be repeated invisibly.
+    Withheld {
+        names: BTreeSet<String>,
+        rerun: bool,
+    },
+}
+
 pub fn execute_cached(
     invocation: &RustcInvocation,
     capture_options: &CaptureOptions,
     cache_options: &CacheOptions,
 ) -> Result<i32> {
     let _maintenance = acquire_shared(&cache_options.root)?;
-    let prepared = prepare_invocation(invocation)?;
-    if !prepared.cache_eligibility.eligible {
-        let exit_code = invocation.execute()?;
-        record_invocation(capture_options, &prepared, "local-ineligible", exit_code)?;
-        return Ok(exit_code);
-    }
+    let hints = EnvironmentHints::new(&cache_options.root, invocation);
+    let mut environment = CompileEnvironment::for_compile(invocation, hints.as_ref());
 
-    if invocation.requires_native_linker() {
-        return execute_cached_link(invocation, capture_options, cache_options, prepared);
-    }
+    loop {
+        let prepared = prepare_invocation(invocation, &environment)?;
+        if !prepared.cache_eligibility.eligible {
+            let exit_code = invocation.execute()?;
+            record_invocation(capture_options, &prepared, "local-ineligible", exit_code)?;
+            return Ok(exit_code);
+        }
+        environment.report(prepared_crate_name(invocation).as_deref());
 
-    execute_cached_regular(invocation, capture_options, cache_options, &prepared)
+        let resolution = if invocation.requires_native_linker() {
+            execute_cached_link(
+                invocation,
+                capture_options,
+                cache_options,
+                prepared,
+                &environment,
+            )?
+        } else {
+            execute_cached_regular(
+                invocation,
+                capture_options,
+                cache_options,
+                &prepared,
+                &environment,
+            )?
+        };
+
+        match resolution {
+            Resolution::Finished(exit_code) => return Ok(exit_code),
+            Resolution::Withheld { names, rerun } => {
+                if let Some(hints) = &hints {
+                    hints.record(&names)?;
+                }
+                if !rerun {
+                    report_withheld_after_success(invocation, &names);
+                    return Ok(1);
+                }
+                environment.pass(&names);
+            }
+        }
+    }
+}
+
+fn prepared_crate_name(invocation: &RustcInvocation) -> Option<String> {
+    invocation
+        .crate_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+fn report_withheld_after_success(invocation: &RustcInvocation, names: &BTreeSet<String>) {
+    let crate_name = prepared_crate_name(invocation).unwrap_or_else(|| "a compile".to_owned());
+    let names = names.iter().cloned().collect::<Vec<_>>().join(", ");
+    eprintln!(
+        "cargo-reapi: {crate_name} read {names} at compile time, but its keyed compile \
+         environment withheld them, so its artifacts would not match plain Cargo. cargo-reapi \
+         now passes them to {crate_name}; run the build again, or list them in \
+         CARGO_REAPI_DECLARED_ENV."
+    );
 }
 
 fn execute_cached_regular(
@@ -110,7 +172,8 @@ fn execute_cached_regular(
     capture_options: &CaptureOptions,
     cache_options: &CacheOptions,
     prepared: &PreparedInvocation,
-) -> Result<i32> {
+    environment: &CompileEnvironment,
+) -> Result<Resolution> {
     let (lock, coalesced) = lock_action(cache_options, &prepared.action_key)?;
     hold_test_producer_lock(coalesced)?;
 
@@ -119,6 +182,7 @@ fn execute_cached_regular(
         capture_options,
         cache_options,
         prepared,
+        environment,
         coalesced,
     )?;
 
@@ -174,9 +238,17 @@ fn finish_cached_execution(
     capture_options: &CaptureOptions,
     cache_options: &CacheOptions,
     prepared: &PreparedInvocation,
+    environment: &CompileEnvironment,
     coalesced: bool,
-) -> Result<i32> {
-    let result = if restore(cache_options, prepared)? {
+) -> Result<Resolution> {
+    let withheld = withheld_by_cached_entry(cache_options, prepared, environment);
+    if !withheld.is_empty() {
+        return Ok(Resolution::Withheld {
+            names: withheld,
+            rerun: true,
+        });
+    }
+    if restore(cache_options, prepared)? {
         record_access(
             &cache_options.root,
             AccessKind::Action,
@@ -192,26 +264,105 @@ fn finish_cached_execution(
             },
             0,
         )?;
-        0
+        return Ok(Resolution::Finished(0));
+    }
+
+    let _lease = ResourceLease::acquire(false)?;
+    remove_stale_dep_info(prepared)?;
+    let exit_code = invocation.execute_in(Some(environment))?;
+    let withheld = withheld_by_execution(prepared, environment)?;
+    if !withheld.is_empty() {
+        record_invocation(
+            capture_options,
+            prepared,
+            "local-environment-withheld",
+            exit_code,
+        )?;
+        return Ok(Resolution::Withheld {
+            names: withheld,
+            rerun: exit_code != 0,
+        });
+    }
+
+    let execution = if exit_code == 0 && publish(cache_options, prepared)? {
+        record_access(
+            &cache_options.root,
+            AccessKind::Action,
+            &prepared.action_key,
+        )?;
+        "local-cache-miss"
+    } else if exit_code == 0 {
+        "local-output-incomplete"
     } else {
-        let _lease = ResourceLease::acquire(false)?;
-        let exit_code = invocation.execute()?;
-        let execution = if exit_code == 0 && publish(cache_options, prepared)? {
-            record_access(
-                &cache_options.root,
-                AccessKind::Action,
-                &prepared.action_key,
-            )?;
-            "local-cache-miss"
-        } else if exit_code == 0 {
-            "local-output-incomplete"
-        } else {
-            "local-failed"
-        };
-        record_invocation(capture_options, prepared, execution, exit_code)?;
-        exit_code
+        "local-failed"
     };
-    Ok(result)
+    record_invocation(capture_options, prepared, execution, exit_code)?;
+    Ok(Resolution::Finished(exit_code))
+}
+
+/// Tracked variables a cached entry's compile recorded that the caller set
+/// but this environment withholds. Restoring that entry would hand Cargo an
+/// artifact built without them.
+fn withheld_by_cached_entry(
+    options: &CacheOptions,
+    prepared: &PreparedInvocation,
+    environment: &CompileEnvironment,
+) -> BTreeSet<String> {
+    let Some(dep_info) = &prepared.dep_info else {
+        return BTreeSet::new();
+    };
+    let Ok(encoded) = fs::read(action_manifest_path(options, &prepared.action_key)) else {
+        return BTreeSet::new();
+    };
+    let Ok(manifest) = serde_json::from_slice::<ActionManifest>(&encoded) else {
+        return BTreeSet::new();
+    };
+    let Some(cached) = manifest
+        .outputs
+        .iter()
+        .find(|output| output.logical_path == dep_info.logical_path)
+    else {
+        return BTreeSet::new();
+    };
+    let Ok(bytes) = fs::read(blob_path(options, &cached.sha256)) else {
+        return BTreeSet::new();
+    };
+    environment.withheld(&tracked_environment(&bytes))
+}
+
+/// Tracked variables the compile just recorded that the caller set but this
+/// environment withheld.
+fn withheld_by_execution(
+    prepared: &PreparedInvocation,
+    environment: &CompileEnvironment,
+) -> Result<BTreeSet<String>> {
+    let Some(dep_info) = &prepared.dep_info else {
+        return Ok(BTreeSet::new());
+    };
+    match fs::read(&dep_info.actual_path) {
+        Ok(bytes) => Ok(environment.withheld(&tracked_environment(&bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error)
+            .with_context(|| format!("reading dep-info {}", dep_info.actual_path.display())),
+    }
+}
+
+/// A failed compile may stop before writing dep-info. Removing the previous
+/// one keeps its tracked variables from being mistaken for this compile's.
+fn remove_stale_dep_info(prepared: &PreparedInvocation) -> Result<()> {
+    let Some(dep_info) = &prepared.dep_info else {
+        return Ok(());
+    };
+    match fs::remove_file(&dep_info.actual_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "removing previous dep-info {}",
+                dep_info.actual_path.display()
+            )
+        }),
+    }
 }
 
 fn execute_cached_link(
@@ -219,12 +370,21 @@ fn execute_cached_link(
     capture_options: &CaptureOptions,
     cache_options: &CacheOptions,
     mut prepared: PreparedInvocation,
-) -> Result<i32> {
+    environment: &CompileEnvironment,
+) -> Result<Resolution> {
     let base_action_key = prepared.action_key.clone();
     let (lock, coalesced) = lock_action(cache_options, &base_action_key)?;
 
     if let Some(discovery) = load_link_discovery(cache_options, &base_action_key, &prepared)? {
         prepared.action_key = discovered_action_key(&base_action_key, &discovery)?;
+        let withheld = withheld_by_cached_entry(cache_options, &prepared, environment);
+        if !withheld.is_empty() {
+            FileExt::unlock(&lock).context("unlocking linked action cache entry")?;
+            return Ok(Resolution::Withheld {
+                names: withheld,
+                rerun: true,
+            });
+        }
         if restore(cache_options, &prepared)? {
             record_invocation(
                 capture_options,
@@ -237,7 +397,7 @@ fn execute_cached_link(
                 0,
             )?;
             FileExt::unlock(&lock).context("unlocking linked action cache entry")?;
-            return Ok(0);
+            return Ok(Resolution::Finished(0));
         }
     }
 
@@ -248,8 +408,26 @@ fn execute_cached_link(
     let wrapper = std::env::current_exe().context("locating cargo-reapi linker wrapper")?;
     let real_linker = resolve_real_linker(invocation)?;
     let _lease = ResourceLease::acquire(true)?;
-    let exit_code = invocation.execute_with_linker_capture(&wrapper, capture_path, &real_linker)?;
-    let result = if exit_code == 0 {
+    remove_stale_dep_info(&prepared)?;
+    let exit_code = invocation.execute_with_linker_capture(
+        &wrapper,
+        capture_path,
+        &real_linker,
+        environment,
+    )?;
+    let withheld = withheld_by_execution(&prepared, environment)?;
+    let result = if !withheld.is_empty() {
+        record_invocation(
+            capture_options,
+            &prepared,
+            "local-environment-withheld",
+            exit_code,
+        )?;
+        Resolution::Withheld {
+            names: withheld,
+            rerun: exit_code != 0,
+        }
+    } else if exit_code == 0 {
         match discover_link_inputs(
             invocation,
             &prepared,
@@ -270,7 +448,7 @@ fn execute_cached_link(
                         exit_code,
                     )?;
                 }
-                exit_code
+                Resolution::Finished(exit_code)
             }
             Err(error) => {
                 prepared.cache_eligibility.eligible = false;
@@ -279,12 +457,12 @@ fn execute_cached_link(
                     .reasons
                     .push(format!("link discovery failed closed: {error:#}"));
                 record_invocation(capture_options, &prepared, "local-ineligible", exit_code)?;
-                exit_code
+                Resolution::Finished(exit_code)
             }
         }
     } else {
         record_invocation(capture_options, &prepared, "local-failed", exit_code)?;
-        exit_code
+        Resolution::Finished(exit_code)
     };
     FileExt::unlock(&lock).context("unlocking linked action cache entry")?;
     Ok(result)

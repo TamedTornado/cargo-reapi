@@ -14,8 +14,10 @@ path only if the bytes produced by that action are relocatable to the consumer
 root. Otherwise two worktrees could share a key while a restored artifact still
 contains the producer's absolute path.
 
-Before executing rustc, cargo-reapi now scans every inherited environment value
-for the declared package, workspace, target, and toolchain roots. Every
+Before executing rustc, cargo-reapi now scans every environment value the
+compile receives for the declared package, workspace, target, and toolchain
+roots. In cache mode that is only the compile's keyed environment; see
+[Compile environment](../README.md#compile-environment). Every
 occurrence is replaced with the existing fixed-width execution slot. Artifact
 publication converts execution slots to logical cache slots, and restoration
 converts cache slots to the consumer's execution slots. Values outside those

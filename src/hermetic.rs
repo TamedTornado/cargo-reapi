@@ -18,6 +18,8 @@ pub const SRT_REQUIRED_VERSION: &str = "0.0.66";
 // build scripts. Execute Cargo through `env -u` inside the sandbox so strict
 // builds observe a stable, networkless environment.
 const SRT_EPHEMERAL_ENVIRONMENT: &[&str] = &[
+    "CLAUDE_CODE_HOST_HTTP_PROXY_PORT",
+    "CLAUDE_CODE_HOST_SOCKS_PROXY_PORT",
     "ALL_PROXY",
     "all_proxy",
     "HTTP_PROXY",
