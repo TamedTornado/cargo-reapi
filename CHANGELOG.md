@@ -4,6 +4,8 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-14
+
 - Cached compiles run with, and are keyed on, only the environment they can
   read. Every variable outside a short deny list used to enter each action
   key, including `OLDPWD`, `PWD`, agent session IDs and per-shell `PATH`
