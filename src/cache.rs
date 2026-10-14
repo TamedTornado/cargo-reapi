@@ -180,7 +180,7 @@ fn execute_cached_regular(
     environment: &CompileEnvironment,
 ) -> Result<Resolution> {
     let (lock, coalesced) = lock_action(cache_options, &prepared.action_key)?;
-    hold_test_producer_lock(coalesced)?;
+    hold_test_producer_lock(coalesced);
 
     let result = finish_cached_execution(
         invocation,
@@ -211,6 +211,10 @@ fn lock_action(options: &CacheOptions, action_key: &str) -> Result<(File, bool)>
     let coalesced = match lock.try_lock_exclusive() {
         Ok(()) => false,
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            if let Some(signal) = test_coalesce_signal() {
+                fs::write(&signal, b"")
+                    .with_context(|| format!("signalling {}", signal.display()))?;
+            }
             lock.lock_exclusive()
                 .with_context(|| format!("coalescing on action {action_key}"))?;
             true
@@ -223,19 +227,28 @@ fn lock_action(options: &CacheOptions, action_key: &str) -> Result<(File, bool)>
     Ok((lock, coalesced))
 }
 
-fn hold_test_producer_lock(coalesced: bool) -> Result<()> {
-    if coalesced || std::env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_none() {
-        return Ok(());
+/// Test synchronization for coalescing, only under
+/// `CARGO_REAPI_ACTION_CACHE_TEST_MODE`: a file that a process finding an
+/// action's lock held creates before it waits, and that the action's
+/// producer waits for before it executes. Two identical builds then
+/// coalesce however their processes are scheduled.
+fn test_coalesce_signal() -> Option<PathBuf> {
+    std::env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE")?;
+    std::env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_COALESCE_SIGNAL").map(PathBuf::from)
+}
+
+/// Holds a producer's action lock until another process waits on it; see
+/// [`test_coalesce_signal`].
+fn hold_test_producer_lock(coalesced: bool) {
+    if coalesced {
+        return;
     }
-    let Some(milliseconds) = std::env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_HOLD_LOCK_MS") else {
-        return Ok(());
+    let Some(signal) = test_coalesce_signal() else {
+        return;
     };
-    let milliseconds = milliseconds
-        .to_string_lossy()
-        .parse::<u64>()
-        .context("parsing CARGO_REAPI_ACTION_CACHE_TEST_HOLD_LOCK_MS")?;
-    std::thread::sleep(std::time::Duration::from_millis(milliseconds));
-    Ok(())
+    while !signal.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 fn finish_cached_execution(

@@ -2528,6 +2528,33 @@ fn shared_cache_restores_identical_action_outputs_across_worktrees() {
     assert!(dep_info.contains(&second.path().to_string_lossy().to_string()));
 }
 
+/// Waits for every child to succeed. A failed child fails the test at once
+/// and stops the others, which may be waiting for it.
+fn wait_for_all(children: &mut [std::process::Child]) {
+    let mut statuses = vec![None; children.len()];
+    while statuses.contains(&None) {
+        for (child, status) in children.iter_mut().zip(&mut statuses) {
+            if status.is_none() {
+                *status = child.try_wait().expect("inspect child");
+            }
+        }
+
+        let failure = statuses
+            .iter()
+            .flatten()
+            .find(|status| !status.success())
+            .copied();
+        if let Some(failure) = failure {
+            for child in children.iter_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            panic!("a cached Cargo action failed: {failure}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn concurrent_identical_actions_execute_once_and_coalesce_on_the_lock() {
     let cache = tempdir().expect("shared cache directory");
@@ -2543,24 +2570,23 @@ fn concurrent_identical_actions_execute_once_and_coalesce_on_the_lock() {
         fs::write(fixture.join("src/lib.rs"), source).expect("large fixture source");
     }
 
+    // Whichever build takes the action's lock holds it until the other
+    // signals that it is waiting on it.
+    let signal = cache.path().join("coalescer-waiting");
     let (mut first_command, first_log) = cache_command(first.path(), cache.path());
     let (mut second_command, second_log) = cache_command(second.path(), cache.path());
     for command in [&mut first_command, &mut second_command] {
-        command.env("CARGO_REAPI_ACTION_CACHE_TEST_HOLD_LOCK_MS", "1500");
+        command.env("CARGO_REAPI_ACTION_CACHE_TEST_COALESCE_SIGNAL", &signal);
     }
-    let mut first_child = first_command
-        .spawn()
-        .expect("start first cached Cargo action");
-    let mut second_child = second_command
-        .spawn()
-        .expect("start second cached Cargo action");
-    assert!(first_child.wait().expect("wait for first action").success());
-    assert!(
-        second_child
-            .wait()
-            .expect("wait for second action")
-            .success()
-    );
+    let mut builds = [
+        first_command
+            .spawn()
+            .expect("start first cached Cargo action"),
+        second_command
+            .spawn()
+            .expect("start second cached Cargo action"),
+    ];
+    wait_for_all(&mut builds);
 
     let first_actions = read_actions(&first_log);
     let second_actions = read_actions(&second_log);

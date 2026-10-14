@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 
 use crate::environment::learned_environment_digest;
 use crate::maintenance::{AccessKind, GATE_STAGING_PREFIX, acquire_shared, record_access};
+use crate::project::Project;
 use crate::relocation::{RecordedPathMapping, execution_slot};
 #[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
@@ -79,6 +80,7 @@ impl GateSnapshot {
         action_log: &Path,
         cargo_args: &[OsString],
         declared_inputs: &[PathBuf],
+        project: &Project,
     ) -> Result<Self> {
         let maintenance = acquire_shared(cache_root)?;
         let action_log = if action_log.is_absolute() {
@@ -87,15 +89,16 @@ impl GateSnapshot {
             workspace.join(action_log)
         };
         let learned_environment = learned_environment_digest(cache_root)?;
-        let key = gate_key(
-            cache_root,
+        let scope = GateScope {
+            cache: cache_root,
             workspace,
             target,
-            &action_log,
-            &learned_environment,
+            action_log: &action_log,
             cargo_args,
             declared_inputs,
-        )?;
+            project,
+        };
+        let key = gate_key(&scope, &learned_environment)?;
         let root = cache_root.join("gate-snapshots");
         fs::create_dir_all(root.join("locks"))?;
         fs::create_dir_all(root.join("objects"))?;
@@ -377,15 +380,28 @@ impl Drop for GateSnapshot {
     }
 }
 
-fn gate_key(
-    cache: &Path,
-    workspace: &Path,
-    target: &Path,
-    action_log: &Path,
-    learned_environment: &str,
-    cargo_args: &[OsString],
-    declared_inputs: &[PathBuf],
-) -> Result<String> {
+/// What one gate covers: the invocation and the project it builds.
+struct GateScope<'a> {
+    cache: &'a Path,
+    workspace: &'a Path,
+    target: &'a Path,
+    action_log: &'a Path,
+    cargo_args: &'a [OsString],
+    declared_inputs: &'a [PathBuf],
+    project: &'a Project,
+}
+
+fn gate_key(scope: &GateScope<'_>, learned_environment: &str) -> Result<String> {
+    let GateScope {
+        cache,
+        workspace,
+        target,
+        action_log,
+        cargo_args,
+        declared_inputs,
+        project,
+    } = *scope;
+
     let mut hasher = Sha256::new();
     hasher.update(b"cargo-reapi-gate-state-v17\0");
     hash_field(&mut hasher, b"learned-environment");
@@ -403,30 +419,22 @@ fn gate_key(
         crate::hermetic::provider_identity_digest()?.as_bytes(),
     );
     hash_field(&mut hasher, b"sandbox-policy");
-    // Building the policy acquires the selected project's sources and
-    // settles its lockfile, so the tree hashed below is the one Cargo builds.
-    let selection = crate::selection::select(workspace, cargo_args)?.metadata_arguments;
     let policy_identity = crate::hermetic::policy_identity_bytes(
         workspace,
         target,
         cache,
         action_log,
         declared_inputs,
-        &selection,
+        project,
     )?;
     hash_field(&mut hasher, &policy_identity);
     hash_gate_environment(&mut hasher, workspace, target);
 
+    // Resolving the project acquired its sources and settled its lockfile,
+    // so the trees hashed here are the ones Cargo builds.
     hash_tree(&mut hasher, workspace, "workspace", target, action_log)?;
     hash_cargo_configuration(&mut hasher, workspace)?;
-    hash_external_path_dependencies(
-        &mut hasher,
-        cache,
-        workspace,
-        &selection,
-        target,
-        action_log,
-    )?;
+    hash_selected_project(&mut hasher, project, workspace, target, action_log)?;
     hash_declared_inputs(&mut hasher, declared_inputs, workspace, target, action_log)?;
     let state_key = format!("{:x}", hasher.finalize());
     let mut exact = Sha256::new();
@@ -640,7 +648,7 @@ fn hash_cargo_configuration(hasher: &mut Sha256, workspace: &Path) -> Result<()>
             }
         }
     }
-    if let Some(cargo_home) = cargo_home() {
+    if let Some(cargo_home) = crate::cargo_config::cargo_home() {
         for name in ["config", "config.toml"] {
             let path = cargo_home.join(name);
             if path.is_file() {
@@ -664,16 +672,6 @@ fn hash_config_file(hasher: &mut Sha256, path: &Path) -> Result<()> {
     }
     hash_field(hasher, &fs::read(path)?);
     Ok(())
-}
-
-pub(crate) fn cargo_home() -> Option<PathBuf> {
-    std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cargo"))
-        })
 }
 
 fn resolve_executable(name: &str) -> Option<PathBuf> {
@@ -726,47 +724,54 @@ fn hash_tool_identity(hasher: &mut Sha256, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn hash_external_path_dependencies(
+/// Hashes the selected workspace and every local package the walk of the
+/// working directory did not reach, such as a `--manifest-path` project
+/// elsewhere, a path dependency outside the workspace, or a package beneath
+/// a directory named `target`. Paths are canonical, so a package reached
+/// through a symlink counts as hashed only when the walk, which does not
+/// follow symlinks, met its real directory.
+fn hash_selected_project(
     hasher: &mut Sha256,
-    cache: &Path,
+    project: &Project,
     workspace: &Path,
-    selection: &[OsString],
     target: &Path,
     action_log: &Path,
 ) -> Result<()> {
-    let output = crate::query::cargo_metadata_output(workspace, cache, selection)
-        .context("running cargo metadata for gate key")?;
-    if !output.status.success() {
-        bail!(
-            "cargo metadata failed while keying gate snapshot: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let mut packages = metadata["packages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|package| package["source"].is_null())
-        .filter_map(|package| {
-            let manifest = PathBuf::from(package["manifest_path"].as_str()?);
-            let root = manifest.parent()?.to_path_buf();
-            // Hash every selected package the workspace walk did not reach,
-            // such as one beneath a directory named `target`.
-            (!hashed_within(&root, workspace, target, action_log)).then(|| {
-                (
-                    package["id"].as_str().unwrap_or("local-package").to_owned(),
-                    root,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    packages.sort_by(|left, right| left.0.cmp(&right.0));
-    for (id, root) in packages {
+    let mut walked_roots = vec![workspace.to_path_buf()];
+    let covered = |walked_roots: &[PathBuf], root: &Path| {
+        walked_roots
+            .iter()
+            .any(|walked| hashed_within(root, walked, target, action_log))
+    };
+
+    // A virtual workspace root is no package, but its manifest and lockfile
+    // are inputs.
+    let workspace_root = &project.workspace_root;
+    if !covered(&walked_roots, workspace_root) {
         hash_tree(
             hasher,
-            &root,
-            &format!("path-dependency:{id}"),
+            workspace_root,
+            "selected-workspace",
+            target,
+            action_log,
+        )?;
+        walked_roots.push(workspace_root.clone());
+    }
+
+    let mut packages = project
+        .packages
+        .iter()
+        .filter(|package| package.local)
+        .collect::<Vec<_>>();
+    packages.sort_by(|left, right| left.id.cmp(&right.id));
+    for package in packages {
+        if covered(&walked_roots, &package.root) {
+            continue;
+        }
+        hash_tree(
+            hasher,
+            &package.root,
+            &format!("path-dependency:{}", package.id),
             target,
             action_log,
         )?;

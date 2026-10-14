@@ -10,6 +10,7 @@ mod gate;
 mod hermetic;
 mod invocation;
 mod maintenance;
+mod project;
 mod proof;
 mod query;
 mod reclient;
@@ -37,9 +38,9 @@ use crate::gate::GateSnapshot;
 use crate::hermetic::SnapshotPolicy;
 use crate::invocation::RustcInvocation;
 use crate::maintenance::{GcOptions, cache_stats, collect_garbage};
+use crate::project::Project;
 use crate::reclient::{ReclientOptions, execute_reapi, validate_platform_template};
 use crate::resource::ResourceCapacity;
-use crate::selection::Selection;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Backend {
@@ -419,7 +420,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         executable,
         workspace_root,
         target_root,
-        selection,
+        project,
     } = resolve_driver_context(cli)?;
     // Compiles run in their package's directory, so a relative log would
     // land beside each package rather than where the caller asked.
@@ -429,13 +430,14 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     );
     let action_log_for_snapshot = action_log.clone();
     let cache_dir = cli.cache_dir.clone();
-    let snapshot_policy: SnapshotPolicy = cli.snapshot_policy.into();
-    let snapshots_enabled = snapshot_policy == SnapshotPolicy::Strict;
-    let mut gate_snapshot = if snapshots_enabled {
-        prepare_gate(cli, &workspace_root, &target_root, &action_log_for_snapshot)?
-    } else {
-        None
-    };
+    // The project is resolved exactly when the strict sandbox is used.
+    let mut gate_snapshot = prepare_gate(
+        cli,
+        &workspace_root,
+        &target_root,
+        &action_log_for_snapshot,
+        project.as_ref(),
+    )?;
     if let Some(snapshot) = gate_snapshot.as_ref()
         && snapshot.is_restored()
     {
@@ -449,9 +451,9 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         drop(gate_snapshot);
         return restart_installed(&executable);
     }
-    let hermetic = if matches!(cli.backend, Backend::Cache) && snapshots_enabled {
+    let hermetic = if project.is_some() {
         crate::hermetic::cargo_command(
-            snapshot_policy,
+            SnapshotPolicy::Strict,
             &workspace_root,
             &target_root,
             cache_dir
@@ -459,7 +461,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
                 .context("cache directory is required")?,
             &action_log_for_snapshot,
             &cli.declared_inputs,
-            &selection.metadata_arguments,
+            project.as_ref(),
         )?
     } else {
         crate::hermetic::cargo_command(
@@ -469,7 +471,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
             cache_dir.as_deref().unwrap_or(&target_root),
             &action_log_for_snapshot,
             &[],
-            &selection.metadata_arguments,
+            None,
         )?
     };
     let mut cargo = hermetic.command;
@@ -477,7 +479,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         ResourceCapacity::from_env()?.apply_to(&mut cargo);
     }
     cargo.args(&cli.cargo_args);
-    describe_compile_environment(&mut cargo, &workspace_root, &selection.expanded);
+    describe_compile_environment(&mut cargo, &workspace_root, &cli.cargo_args);
     cargo
         .env("RUSTC_WRAPPER", executable)
         .env(
@@ -526,10 +528,12 @@ fn prepare_gate(
     workspace_root: &Path,
     target_root: &Path,
     action_log: &Path,
+    project: Option<&Project>,
 ) -> Result<Option<GateSnapshot>> {
-    if !matches!(cli.backend, Backend::Cache)
-        || env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_some()
-    {
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    if env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_some() {
         return Ok(None);
     }
 
@@ -544,6 +548,7 @@ fn prepare_gate(
         action_log,
         &cli.cargo_args,
         &cli.declared_inputs,
+        project,
     )
     .map(Some)
 }
@@ -569,7 +574,8 @@ struct DriverContext {
     executable: PathBuf,
     workspace_root: PathBuf,
     target_root: PathBuf,
-    selection: Selection,
+    /// The selected project, resolved for the strict sandbox and its gate.
+    project: Option<Project>,
 }
 
 fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
@@ -577,136 +583,56 @@ fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
         .context("locating cargo-reapi executable")?
         .canonicalize()
         .context("resolving cargo-reapi executable")?;
-    let workspace_root = env::current_dir().context("locating Cargo workspace root")?;
+    let workspace_root =
+        crate::project::canonical(&env::current_dir().context("locating Cargo workspace root")?)?;
     let selection = crate::selection::select(&workspace_root, &cli.cargo_args)?;
 
-    let layout = ProjectLayout::describe(&workspace_root, &selection.metadata_arguments);
+    let snapshots: SnapshotPolicy = cli.snapshot_policy.into();
+    let project = if matches!(cli.backend, Backend::Cache) && snapshots == SnapshotPolicy::Strict {
+        let cache_dir = cli
+            .cache_dir
+            .as_deref()
+            .context("cache directory is required")?;
+        Some(Project::resolve(
+            &workspace_root,
+            cache_dir,
+            &selection.metadata_arguments,
+        )?)
+    } else {
+        None
+    };
+
+    let cargo_target = match &project {
+        Some(project) => Some(project.target_directory.clone()),
+        None => crate::project::target_directory(&workspace_root, &selection.metadata_arguments),
+    };
     let configured = selection
         .target_dir
-        .clone()
         .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
-        .or_else(|| {
-            layout
-                .as_ref()
-                .map(|layout| layout.target_directory.clone())
-        });
+        .or(cargo_target);
     let target_root = resolve_target_root_from(&workspace_root, configured)?;
 
     validate_driver_paths(&executable, &target_root)?;
-    let snapshots: SnapshotPolicy = cli.snapshot_policy.into();
-    if matches!(cli.backend, Backend::Cache) && snapshots == SnapshotPolicy::Strict {
-        validate_gate_target(&workspace_root, &target_root, layout, &cli.declared_inputs)?;
+    if let Some(project) = &project {
+        project.validate_target(&workspace_root, &target_root, &cli.declared_inputs)?;
     }
 
     Ok(DriverContext {
         executable,
         workspace_root,
         target_root,
-        selection,
+        project,
     })
 }
 
-/// Refuses a target directory that is, or contains, a source: the working
-/// directory, the selected workspace, a package or a declared input. Cargo
-/// treats the target as disposable output, the gate excludes it from the
-/// inputs it hashes, and a snapshot restores it whole, so a configured
-/// `build.target-dir = "."` would let a gate hit overwrite edited source.
-fn validate_gate_target(
-    workspace_root: &Path,
-    target_root: &Path,
-    layout: Option<ProjectLayout>,
-    declared_inputs: &[PathBuf],
-) -> Result<()> {
-    let mut sources = vec![workspace_root.to_path_buf()];
-    if let Some(layout) = layout {
-        sources.push(layout.workspace_root);
-        sources.extend(layout.package_roots);
-    }
-    sources.extend(
-        declared_inputs
-            .iter()
-            .map(|input| workspace_root.join(input)),
-    );
-    validate_target_holds_no_sources(target_root, &sources)
-}
-
-/// Where Cargo puts the selected project, from `cargo metadata --no-deps`.
-struct ProjectLayout {
-    /// Cargo's own target directory for the project: beside a
-    /// `--manifest-path` workspace, or wherever `build.target-dir` puts it.
-    target_directory: PathBuf,
-    workspace_root: PathBuf,
-    package_roots: Vec<PathBuf>,
-}
-
-impl ProjectLayout {
-    /// `None` when Cargo cannot describe a project there, as for commands
-    /// that run outside one.
-    fn describe(workspace_root: &Path, metadata_arguments: &[OsString]) -> Option<Self> {
-        let output = Command::new("cargo")
-            .args(["metadata", "--no-deps", "--format-version", "1"])
-            .args(metadata_arguments)
-            .current_dir(workspace_root)
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        let package_roots = metadata["packages"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|package| package["manifest_path"].as_str())
-            .filter_map(|manifest| Path::new(manifest).parent().map(Path::to_path_buf))
-            .collect();
-        Some(Self {
-            target_directory: PathBuf::from(metadata["target_directory"].as_str()?),
-            workspace_root: PathBuf::from(metadata["workspace_root"].as_str()?),
-            package_roots,
-        })
-    }
-}
-
-fn validate_target_holds_no_sources(target_root: &Path, sources: &[PathBuf]) -> Result<()> {
-    let target = target_root
-        .canonicalize()
-        .unwrap_or_else(|_| target_root.to_path_buf());
-    for source in sources {
-        let source = source.canonicalize().unwrap_or_else(|_| source.clone());
-        if source.starts_with(&target) {
-            bail!(
-                "Cargo's target directory {} contains source {}; cargo-reapi treats the target as \
-                 disposable output it may restore whole, so choose a target directory outside every \
-                 package and input",
-                target.display(),
-                source.display()
-            );
-        }
-    }
-    Ok(())
-}
-
+/// Cargo's target directory, canonical even before Cargo creates it.
 fn resolve_target_root_from(workspace_root: &Path, configured: Option<PathBuf>) -> Result<PathBuf> {
     let target_root = configured.map_or_else(
         || workspace_root.join("target"),
-        |path| {
-            if path.is_absolute() {
-                path
-            } else {
-                workspace_root.join(path)
-            }
-        },
+        |path| workspace_root.join(path),
     );
-    if target_root.exists() {
-        target_root
-            .canonicalize()
-            .with_context(|| format!("resolving Cargo target directory {}", target_root.display()))
-    } else {
-        Ok(target_root)
-    }
+    crate::project::canonical(&target_root)
+        .with_context(|| format!("resolving Cargo target directory {}", target_root.display()))
 }
 
 fn validate_driver_paths(executable: &Path, target_root: &Path) -> Result<()> {

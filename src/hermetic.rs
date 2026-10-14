@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
+
+use crate::project::Project;
 
 pub const SRT_REQUIRED_PACKAGE: &str = "@anthropic-ai/sandbox-runtime";
 pub const SRT_REQUIRED_VERSION: &str = "0.0.66";
@@ -95,7 +96,7 @@ pub fn cargo_command(
     cache: &Path,
     action_log: &Path,
     explicit_inputs: &[PathBuf],
-    selection: &[OsString],
+    project: Option<&Project>,
 ) -> Result<HermeticCargo> {
     match policy {
         SnapshotPolicy::Off => Ok(HermeticCargo {
@@ -107,7 +108,7 @@ pub fn cargo_command(
             cache,
             action_log,
             explicit_inputs,
-            selection,
+            project.context("the strict sandbox needs the selected project")?,
         ),
     }
 }
@@ -119,7 +120,7 @@ fn strict_cargo_command(
     cache: &Path,
     action_log: &Path,
     explicit_inputs: &[PathBuf],
-    selection: &[OsString],
+    project: &Project,
 ) -> Result<HermeticCargo> {
     let workspace = canonical_or_absolute(workspace)?;
     let target = create_and_canonicalize(target, "target")?;
@@ -137,7 +138,7 @@ fn strict_cargo_command(
         cache: &cache,
         action_log: &action_log,
         temporary: &temporary,
-        selection,
+        project,
     };
     let policy = build_policy(&paths, &control_temporary, explicit_inputs)?;
     let policy_path = target.join("cargo-reapi/srt-policy-v1.json");
@@ -196,7 +197,7 @@ fn strict_cargo_command(
     _cache: &Path,
     _action_log: &Path,
     _explicit_inputs: &[PathBuf],
-    _selection: &[OsString],
+    _project: &Project,
 ) -> Result<HermeticCargo> {
     bail!(
         "strict whole-gate snapshots support macOS and Linux through pinned Anthropic Sandbox Runtime {SRT_REQUIRED_VERSION}; use --snapshot-policy off to run without whole-gate restoration"
@@ -258,7 +259,7 @@ pub fn policy_identity_bytes(
     cache: &Path,
     action_log: &Path,
     explicit_inputs: &[PathBuf],
-    selection: &[OsString],
+    project: &Project,
 ) -> Result<Vec<u8>> {
     let workspace = canonical_or_absolute(workspace)?;
     let target = absolute(target)?;
@@ -272,7 +273,7 @@ pub fn policy_identity_bytes(
         cache: &cache,
         action_log: &action_log,
         temporary: &temporary,
-        selection,
+        project,
     };
     let policy = build_policy(&paths, &control_temporary, explicit_inputs)?;
     normalize_policy_identity_bytes(
@@ -343,9 +344,8 @@ struct PolicyPaths<'a> {
     cache: &'a Path,
     action_log: &'a Path,
     temporary: &'a Path,
-    /// What the Cargo invocation selects; see
-    /// [`crate::selection::Selection::metadata_arguments`].
-    selection: &'a [OsString],
+    /// The project the Cargo invocation selects.
+    project: &'a Project,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -388,7 +388,16 @@ fn readable_paths(
     paths: &PolicyPaths<'_>,
     explicit_inputs: &[PathBuf],
 ) -> Result<BTreeSet<PathBuf>> {
-    let mut readable = package_roots(paths.workspace, paths.cache, paths.selection)?;
+    // Every package in the resolve, and the selected workspace root, which
+    // for a virtual workspace is no package but holds its manifest and
+    // lockfile.
+    let mut readable = paths
+        .project
+        .packages
+        .iter()
+        .map(|package| package.root.clone())
+        .collect::<BTreeSet<_>>();
+    readable.insert(paths.project.workspace_root.clone());
     #[cfg(target_os = "linux")]
     {
         // A package root containing the target, such as the root package's
@@ -488,7 +497,7 @@ fn extend_system_readable(readable: &mut BTreeSet<PathBuf>) {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn extend_toolchain_readable(readable: &mut BTreeSet<PathBuf>, workspace: &Path) -> Result<()> {
-    if let Some(cargo_home) = cargo_home() {
+    if let Some(cargo_home) = crate::cargo_config::cargo_home() {
         let cargo_home = canonical_or_absolute(&cargo_home)?;
         for relative in ["registry", "git", "config", "config.toml"] {
             let path = cargo_home.join(relative);
@@ -551,7 +560,7 @@ fn writable_paths(paths: &PolicyPaths<'_>) -> Result<BTreeSet<PathBuf>> {
     if let Some(trace) = env::var_os("CARGO_REAPI_RUSTC_TRACE").map(PathBuf::from) {
         writable.insert(canonical_or_absolute(&trace)?);
     }
-    if let Some(cargo_home) = cargo_home() {
+    if let Some(cargo_home) = crate::cargo_config::cargo_home() {
         let cargo_home = canonical_or_absolute(&cargo_home)?;
         writable.insert(cargo_home.join(".package-cache"));
         writable.insert(cargo_home.join(".package-cache-mutate"));
@@ -602,6 +611,11 @@ fn workspace_inputs_excluding_target(workspace: &Path, target: &Path) -> Result<
     let mut readable = BTreeSet::new();
     let mut current = workspace.to_path_buf();
     for component in relative_target.components() {
+        // The rest of the route, such as `artifacts/new` beneath a missing
+        // `artifacts`, does not exist yet and has nothing beside it.
+        if !current.is_dir() {
+            break;
+        }
         let next = current.join(component.as_os_str());
         for entry in fs::read_dir(&current)
             .with_context(|| format!("enumerating workspace input {}", current.display()))?
@@ -754,66 +768,8 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn package_roots(
-    workspace: &Path,
-    cache: &Path,
-    selection: &[OsString],
-) -> Result<BTreeSet<PathBuf>> {
-    // Resolve and acquire the selected project's package sources before
-    // constructing the network-denied transition sandbox. The selection
-    // carries the invocation's `--manifest-path`, so a project outside the
-    // working directory's workspace is acquired too, and its lockfile and
-    // offline options, so Cargo's own policy remains authoritative;
-    // cargo-reapi must not silently impose an operator-managed pre-warm
-    // requirement on otherwise online callers.
-    let output = crate::query::cargo_metadata_output(workspace, cache, selection)
-        .context("running cargo metadata for the strict snapshot policy")?;
-    if !output.status.success() {
-        bail!(
-            "cargo metadata failed for the strict snapshot policy: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let mut roots = BTreeSet::new();
-    for package in metadata["packages"].as_array().into_iter().flatten() {
-        if let Some(manifest) = package["manifest_path"].as_str()
-            && let Some(parent) = Path::new(manifest).parent()
-        {
-            roots.insert(canonical_or_absolute(parent)?);
-        }
-    }
-    Ok(roots)
-}
-
-fn cargo_home() -> Option<PathBuf> {
-    env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".cargo"))
-    })
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn cargo_configuration_files(workspace: &Path) -> BTreeSet<PathBuf> {
-    let mut files = BTreeSet::new();
-    for directory in workspace.ancestors() {
-        for name in ["config", "config.toml"] {
-            let path = directory.join(".cargo").join(name);
-            if path.is_file() {
-                files.insert(path);
-            }
-        }
-    }
-    if let Some(home) = cargo_home() {
-        for name in ["config", "config.toml"] {
-            let path = home.join(name);
-            if path.is_file() {
-                files.insert(path);
-            }
-        }
-    }
-    files
+    crate::cargo_config::files(workspace).into_iter().collect()
 }
 
 fn resolve_toolchain_executable(name: &str) -> Option<PathBuf> {
