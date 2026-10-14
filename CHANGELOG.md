@@ -4,6 +4,8 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-10-14
+
 Three faults below could serve a stale gate hit or lose source.
 
 - A gated build refuses a target directory that is or contains a source:
