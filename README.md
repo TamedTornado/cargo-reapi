@@ -363,7 +363,10 @@ variables removed from it on stderr. The action log records the same list as
 If cargo-reapi cannot determine a compile's environment (the driver did not
 start Cargo, the compile emits no dep-info, or the build script's output is
 unreadable), that compile runs with the whole environment and keys all of it.
-Capture and REAPI modes run compiles with the caller's whole environment.
+Capture mode runs compiles with the caller's whole environment and records
+the key a cached compile would start with. REAPI mode keys actions the same way,
+sends remote actions only Cargo's compiler variables, a subset of that key,
+and runs local fallbacks with the whole environment.
 Build scripts always run under Cargo with its whole environment. Whatever they
 produce reaches a compile only as `OUT_DIR` contents, compiler arguments or
 `rustc-env` values, and all of those are action inputs. So a build script that

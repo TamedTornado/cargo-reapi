@@ -121,7 +121,9 @@ struct CaptureRoots {
 /// would start with.
 pub fn capture_invocation(invocation: &RustcInvocation, options: &CaptureOptions) -> Result<i32> {
     let environment = CompileEnvironment::for_compile(invocation, None);
-    let prepared = prepare_invocation(invocation, &environment)?;
+    let mut prepared = prepare_invocation(invocation, &environment)?;
+    // Capture observes Cargo unchanged: nothing is stripped from the compile.
+    prepared.stripped_environment.clear();
     let exit_code = invocation.execute()?;
     record_invocation(options, &prepared, "local-capture", exit_code)?;
     Ok(exit_code)
