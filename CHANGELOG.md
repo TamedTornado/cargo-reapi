@@ -4,6 +4,20 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+- A compile output has one logical digest, whichever compile reads it and
+  whenever. Cargo starts a pipelined dependent as soon as a dependency's
+  compiler writes its metadata, before cargo-reapi publishes it. The
+  dependent normalized that early `.rmeta` with its own path mappings, which
+  lack the dependency's package root, while publication used the
+  dependency's mappings. The same metadata was keyed under two digests,
+  depending on timing, and a worktree whose dependency was restored missed
+  every dependent compiled early elsewhere, along with everything downstream:
+  82 of 681 compiles in a fresh Moria worktree. A compile now records the
+  mappings its outputs are published with before its compiler starts, and
+  every reader normalizes an output with them. These records replace the
+  logical-digest receipts and are replaced whole, so a reader never sees a
+  partly written one.
+
 ## [0.2.5] - 2026-10-14
 
 - Cached compiles run with, and are keyed on, only the environment they can

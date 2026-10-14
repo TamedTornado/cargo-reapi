@@ -20,8 +20,7 @@ use crate::action::{
 use crate::environment::CompileEnvironment;
 use crate::invocation::RustcInvocation;
 use crate::relocation::{
-    cache_slot, execution_slot, normalize_artifact_slots, record_path_mappings,
-    restored_logical_digest,
+    cache_slot, execution_slot, logical_digest, record_output_mappings, record_path_mappings,
 };
 use crate::resource::ResourceCapacity;
 
@@ -190,6 +189,15 @@ pub fn prepare_invocation(
                 .to_owned(),
         );
     }
+
+    let path_mappings = roots.path_mappings();
+    let output_files = prepare_outputs(
+        invocation,
+        paths.outputs,
+        paths.output_files,
+        &path_mappings,
+    )?;
+
     Ok(PreparedInvocation {
         action_key: key,
         toolchain_sha256: toolchain.sha256.clone(),
@@ -221,16 +229,8 @@ pub fn prepare_invocation(
             .out_dir()
             .as_deref()
             .map(|path| roots.normalize_text(&display(path))),
-        output_files: paths
-            .outputs
-            .into_iter()
-            .zip(paths.output_files)
-            .map(|(logical_path, actual_path)| PreparedOutput {
-                logical_path,
-                actual_path: absolute(&actual_path, &invocation.cwd),
-            })
-            .collect(),
-        path_mappings: roots.path_mappings(),
+        output_files,
+        path_mappings,
     })
 }
 
@@ -262,6 +262,33 @@ fn prepare_paths(
         outputs,
         working_directory,
     })
+}
+
+/// Pairs each output with its logical path and records the mappings it will
+/// be published with. Cargo starts a pipelined dependent as soon as the
+/// compiler writes this compile's metadata, before it is published, so a
+/// reader must find those mappings before the compiler starts.
+fn prepare_outputs(
+    invocation: &RustcInvocation,
+    logical_paths: Vec<String>,
+    actual_paths: Vec<PathBuf>,
+    path_mappings: &[(String, String)],
+) -> Result<Vec<PreparedOutput>> {
+    let outputs: Vec<PreparedOutput> = logical_paths
+        .into_iter()
+        .zip(actual_paths)
+        .map(|(logical_path, actual_path)| PreparedOutput {
+            logical_path,
+            actual_path: absolute(&actual_path, &invocation.cwd),
+        })
+        .collect();
+
+    if should_record_path_mappings(invocation) {
+        for output in &outputs {
+            record_output_mappings(&output.actual_path, path_mappings)?;
+        }
+    }
+    Ok(outputs)
 }
 
 fn should_record_path_mappings(invocation: &RustcInvocation) -> bool {
@@ -492,21 +519,12 @@ fn digest_file(
     cwd: &Path,
     mappings: &[(String, String)],
 ) -> Result<PreparedInput> {
-    if let Some((sha256, size_bytes)) = restored_logical_digest(&absolute(path, cwd))? {
-        return Ok(PreparedInput {
-            logical_path,
-            actual_path: absolute(path, cwd),
-            sha256,
-            size_bytes,
-        });
-    }
-    let bytes = fs::read(path).with_context(|| format!("reading input {}", path.display()))?;
-    let bytes = normalize_artifact_slots(bytes, mappings)?;
-    let size_bytes = u64::try_from(bytes.len()).context("input file is too large")?;
+    let actual_path = absolute(path, cwd);
+    let (sha256, size_bytes) = logical_digest(&actual_path, mappings)?;
     Ok(PreparedInput {
         logical_path,
-        actual_path: absolute(path, cwd),
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        actual_path,
+        sha256,
         size_bytes,
     })
 }

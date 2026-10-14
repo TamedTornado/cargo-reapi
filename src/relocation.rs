@@ -18,16 +18,26 @@ pub struct RecordedPathMapping {
     pub actual: String,
 }
 
+const OUTPUT_RECORD_SCHEMA_VERSION: u32 = 2;
+
+/// What every reader of one compile output in a target needs to compute its
+/// logical digest: the path mappings its producer normalizes it with. The
+/// producer writes the record before the compiler runs, so a pipelined
+/// consumer that reads the output early, before the producer has published
+/// it, normalizes it exactly as publication will.
 #[derive(Debug, Deserialize, Serialize)]
-struct LogicalDigestReceipt {
+struct OutputRecord {
     schema_version: u32,
     actual_path: PathBuf,
+    path_mappings: Vec<(String, String)>,
+    /// The digest of the cached blob this file was published as or restored
+    /// from, valid while the file still has exactly these bytes.
+    verified: Option<VerifiedDigest>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VerifiedDigest {
     actual_size_bytes: u64,
-    modified_unix_ns: u128,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
     actual_sha256: String,
     logical_sha256: String,
     logical_size_bytes: u64,
@@ -53,10 +63,7 @@ fn pad_path(path: &str) -> Result<String> {
     Ok(padded)
 }
 
-pub fn normalize_artifact_slots(
-    mut bytes: Vec<u8>,
-    mappings: &[(String, String)],
-) -> Result<Vec<u8>> {
+fn normalize_artifact_slots(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Result<Vec<u8>> {
     for (label, actual) in mappings {
         bytes = replace_bytes(
             &bytes,
@@ -81,8 +88,49 @@ pub fn materialize_artifact_slots(
     Ok(bytes)
 }
 
-pub fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(needle.len(), replacement.len());
+/// The bytes a file in a worktree is cached and keyed as: its execution
+/// slots become cache slots, and a dependency file's plain root paths become
+/// root labels. `mappings` must be those of the compile that produced the
+/// file; see [`logical_digest`].
+pub fn logical_bytes(
+    actual_path: &Path,
+    bytes: Vec<u8>,
+    mappings: &[(String, String)],
+) -> Result<Vec<u8>> {
+    let bytes = normalize_artifact_slots(bytes, mappings)?;
+    if actual_path
+        .extension()
+        .is_some_and(|extension| extension == "d")
+    {
+        return Ok(rewrite_paths_for_cache(bytes, mappings));
+    }
+    Ok(bytes)
+}
+
+fn rewrite_paths_for_cache(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Vec<u8> {
+    for (label, actual) in mappings {
+        bytes = replace_bytes(
+            &bytes,
+            actual.as_bytes(),
+            format!("/__cargo_reapi__/{label}").as_bytes(),
+        );
+    }
+    bytes
+}
+
+/// Reverses the root labels of [`logical_bytes`] for the consumer's roots.
+pub fn restore_cached_paths(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Vec<u8> {
+    for (label, actual) in mappings.iter().rev() {
+        bytes = replace_bytes(
+            &bytes,
+            format!("/__cargo_reapi__/{label}").as_bytes(),
+            actual.as_bytes(),
+        );
+    }
+    bytes
+}
+
+fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     if needle.is_empty() {
         return haystack.to_vec();
     }
@@ -98,58 +146,101 @@ pub fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<
     result
 }
 
-pub fn record_logical_digest(
-    actual_path: &Path,
-    logical_sha256: &str,
-    logical_size_bytes: u64,
-) -> Result<()> {
-    let Some(target) = std::env::var_os("CARGO_REAPI_TARGET_ROOT").map(PathBuf::from) else {
+/// Records, before a compile runs, the path mappings its output at
+/// `actual_path` is normalized with. Only outputs in the target can be read
+/// by another compile, so only they are recorded.
+pub fn record_output_mappings(actual_path: &Path, mappings: &[(String, String)]) -> Result<()> {
+    let Some(target) = target_root() else {
         return Ok(());
     };
-    record_logical_digest_for_target(&target, actual_path, logical_sha256, logical_size_bytes)
+    record_output_mappings_in(&target, actual_path, mappings)
 }
 
-fn record_logical_digest_for_target(
+fn record_output_mappings_in(
     target: &Path,
     actual_path: &Path,
+    mappings: &[(String, String)],
+) -> Result<()> {
+    let Some(record_path) = output_record_path(target, actual_path) else {
+        return Ok(());
+    };
+    let record = OutputRecord {
+        schema_version: OUTPUT_RECORD_SCHEMA_VERSION,
+        actual_path: actual_path.to_path_buf(),
+        path_mappings: mappings.to_vec(),
+        verified: None,
+    };
+    write_output_record(&record_path, &record)
+}
+
+/// Records that the file at `actual_path` now holds the cached blob
+/// `logical_sha256`, published or restored with `mappings`.
+pub fn record_logical_digest(
+    actual_path: &Path,
+    mappings: &[(String, String)],
     logical_sha256: &str,
     logical_size_bytes: u64,
 ) -> Result<()> {
-    let Some(receipt_path) = receipt_path(target, actual_path) else {
+    let Some(target) = target_root() else {
         return Ok(());
     };
-    let metadata = fs::metadata(actual_path)
-        .with_context(|| format!("reading restored output {}", actual_path.display()))?;
-    if !requires_logical_digest_receipt(&metadata) {
-        return Ok(());
-    }
-    let actual_bytes = fs::read(actual_path)
-        .with_context(|| format!("hashing restored output {}", actual_path.display()))?;
-    let receipt = LogicalDigestReceipt {
-        schema_version: 1,
-        actual_path: actual_path.to_path_buf(),
-        actual_size_bytes: metadata.len(),
-        modified_unix_ns: modified_unix_ns(&metadata)?,
-        #[cfg(unix)]
-        device: unix_device(&metadata),
-        #[cfg(unix)]
-        inode: unix_inode(&metadata),
-        actual_sha256: format!("{:x}", Sha256::digest(actual_bytes)),
-        logical_sha256: logical_sha256.to_owned(),
+    record_logical_digest_in(
+        &target,
+        actual_path,
+        mappings,
+        logical_sha256,
         logical_size_bytes,
-    };
-    if let Some(parent) = receipt_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        &receipt_path,
-        serde_json::to_vec(&receipt).context("serializing logical digest receipt")?,
     )
-    .with_context(|| format!("writing logical digest receipt {}", receipt_path.display()))
+}
+
+fn record_logical_digest_in(
+    target: &Path,
+    actual_path: &Path,
+    mappings: &[(String, String)],
+    logical_sha256: &str,
+    logical_size_bytes: u64,
+) -> Result<()> {
+    let Some(record_path) = output_record_path(target, actual_path) else {
+        return Ok(());
+    };
+    let actual_bytes = fs::read(actual_path)
+        .with_context(|| format!("hashing compile output {}", actual_path.display()))?;
+
+    let record = OutputRecord {
+        schema_version: OUTPUT_RECORD_SCHEMA_VERSION,
+        actual_path: actual_path.to_path_buf(),
+        path_mappings: mappings.to_vec(),
+        verified: Some(VerifiedDigest {
+            actual_size_bytes: u64::try_from(actual_bytes.len())
+                .context("compile output is too large")?,
+            actual_sha256: format!("{:x}", Sha256::digest(&actual_bytes)),
+            logical_sha256: logical_sha256.to_owned(),
+            logical_size_bytes,
+        }),
+    };
+    write_output_record(&record_path, &record)
+}
+
+/// Readers may open the record at any moment, so it is replaced whole.
+fn write_output_record(record_path: &Path, record: &OutputRecord) -> Result<()> {
+    let parent = record_path
+        .parent()
+        .with_context(|| format!("output record has no parent: {}", record_path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating output record directory {}", parent.display()))?;
+
+    let encoded = serde_json::to_vec(record).context("serializing output record")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating output record beside {}", record_path.display()))?;
+    file.write_all(&encoded)
+        .with_context(|| format!("writing output record {}", record_path.display()))?;
+    file.persist(record_path)
+        .with_context(|| format!("installing output record {}", record_path.display()))?;
+    Ok(())
 }
 
 pub fn record_path_mappings(mappings: &[(String, String)]) -> Result<()> {
-    let Some(target) = std::env::var_os("CARGO_REAPI_TARGET_ROOT").map(PathBuf::from) else {
+    let Some(target) = target_root() else {
         return Ok(());
     };
     let root = target.join("cargo-reapi").join("path-mappings");
@@ -177,47 +268,54 @@ pub fn record_path_mappings(mappings: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
-pub fn restored_logical_digest(actual_path: &Path) -> Result<Option<(String, u64)>> {
-    let Some(target) = std::env::var_os("CARGO_REAPI_TARGET_ROOT").map(PathBuf::from) else {
-        return Ok(None);
-    };
-    restored_logical_digest_for_target(&target, actual_path)
+/// The digest and size a file is keyed by.
+///
+/// A compile output in the target is normalized with its producer's path
+/// mappings, so it has one logical digest whichever compile reads it and
+/// whether or not its producer has published it yet. A pipelined consumer
+/// reads a dependency's metadata while the dependency is still compiling;
+/// with its own mappings it would leave the dependency's package slot as a
+/// worktree path and key on a digest no other worktree reproduces. Every
+/// other file is normalized with the reader's `mappings`.
+pub fn logical_digest(actual_path: &Path, mappings: &[(String, String)]) -> Result<(String, u64)> {
+    let record = target_root().and_then(|target| read_output_record(&target, actual_path));
+    logical_digest_with(actual_path, record, mappings)
 }
 
-fn restored_logical_digest_for_target(
-    target: &Path,
+fn logical_digest_with(
     actual_path: &Path,
-) -> Result<Option<(String, u64)>> {
-    let Some(receipt_path) = receipt_path(target, actual_path) else {
-        return Ok(None);
+    record: Option<OutputRecord>,
+    mappings: &[(String, String)],
+) -> Result<(String, u64)> {
+    let bytes = fs::read(actual_path)
+        .with_context(|| format!("reading input {}", actual_path.display()))?;
+
+    let producer_mappings = match record {
+        Some(record) => {
+            if let Some(verified) = &record.verified
+                && verified.actual_size_bytes == u64::try_from(bytes.len())?
+                && verified.actual_sha256 == format!("{:x}", Sha256::digest(&bytes))
+            {
+                return Ok((verified.logical_sha256.clone(), verified.logical_size_bytes));
+            }
+            record.path_mappings
+        }
+        None => mappings.to_vec(),
     };
-    let Ok(encoded) = fs::read(&receipt_path) else {
-        return Ok(None);
-    };
-    let Ok(receipt) = serde_json::from_slice::<LogicalDigestReceipt>(&encoded) else {
-        return Ok(None);
-    };
-    let Ok(metadata) = fs::metadata(actual_path) else {
-        return Ok(None);
-    };
-    if !requires_logical_digest_receipt(&metadata) {
-        return Ok(None);
-    }
-    if receipt.schema_version != 1
-        || receipt.actual_path != actual_path
-        || receipt.actual_size_bytes != metadata.len()
-    {
-        return Ok(None);
-    }
-    let actual_bytes = fs::read(actual_path)
-        .with_context(|| format!("verifying restored output {}", actual_path.display()))?;
-    if format!("{:x}", Sha256::digest(actual_bytes)) != receipt.actual_sha256 {
-        return Ok(None);
-    }
-    Ok(Some((receipt.logical_sha256, receipt.logical_size_bytes)))
+
+    let logical = logical_bytes(actual_path, bytes, &producer_mappings)?;
+    let size_bytes = u64::try_from(logical.len()).context("input file is too large")?;
+    Ok((format!("{:x}", Sha256::digest(&logical)), size_bytes))
 }
 
-fn receipt_path(target: &Path, actual_path: &Path) -> Option<PathBuf> {
+fn read_output_record(target: &Path, actual_path: &Path) -> Option<OutputRecord> {
+    let encoded = fs::read(output_record_path(target, actual_path)?).ok()?;
+    let record = serde_json::from_slice::<OutputRecord>(&encoded).ok()?;
+    (record.schema_version == OUTPUT_RECORD_SCHEMA_VERSION && record.actual_path == actual_path)
+        .then_some(record)
+}
+
+fn output_record_path(target: &Path, actual_path: &Path) -> Option<PathBuf> {
     if !actual_path.starts_with(target) {
         return None;
     }
@@ -228,33 +326,13 @@ fn receipt_path(target: &Path, actual_path: &Path) -> Option<PathBuf> {
     Some(
         target
             .join("cargo-reapi")
-            .join("logical-digests")
+            .join("output-records")
             .join(format!("{key}.json")),
     )
 }
 
-fn modified_unix_ns(metadata: &fs::Metadata) -> Result<u128> {
-    Ok(metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("output modification time predates Unix epoch")?
-        .as_nanos())
-}
-
-#[cfg(unix)]
-fn unix_device(metadata: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.dev()
-}
-
-#[cfg(unix)]
-fn unix_inode(metadata: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.ino()
-}
-
-fn requires_logical_digest_receipt(metadata: &fs::Metadata) -> bool {
-    metadata.is_file()
+fn target_root() -> Option<PathBuf> {
+    std::env::var_os("CARGO_REAPI_TARGET_ROOT").map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -289,14 +367,22 @@ mod tests {
         assert!(restored.contains(&execution_slot(&consumer[0].1).unwrap()));
     }
 
+    fn digest_in(target: &Path, artifact: &Path, mappings: &[(String, String)]) -> (String, u64) {
+        logical_digest_with(artifact, read_output_record(target, artifact), mappings).unwrap()
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
     #[test]
-    fn logical_receipt_for_non_executable_survives_touch_but_rejects_mutation() {
+    fn verified_digest_survives_touch_but_rejects_mutation() {
         let fixture = tempfile::tempdir().unwrap();
         let target = fixture.path().join("target");
         let artifact = target.join("debug/deps/libfixture.rlib");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, b"relocated artifact").unwrap();
-        record_logical_digest_for_target(&target, &artifact, "logical-digest", 17).unwrap();
+        record_logical_digest_in(&target, &artifact, &[], "logical-digest", 17).unwrap();
 
         let touched = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         OpenOptions::new()
@@ -306,14 +392,53 @@ mod tests {
             .set_times(fs::FileTimes::new().set_modified(touched))
             .unwrap();
         assert_eq!(
-            restored_logical_digest_for_target(&target, &artifact).unwrap(),
-            Some(("logical-digest".to_owned(), 17))
+            digest_in(&target, &artifact, &[]),
+            ("logical-digest".to_owned(), 17)
         );
 
         fs::write(&artifact, b"poisoned artifact!").unwrap();
         assert_eq!(
-            restored_logical_digest_for_target(&target, &artifact).unwrap(),
-            None
+            digest_in(&target, &artifact, &[]),
+            (sha256(b"poisoned artifact!"), 18)
         );
+    }
+
+    #[test]
+    fn unpublished_output_is_digested_with_its_producers_mappings() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let artifact = target.join("debug/deps/libproducer.rmeta");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+
+        let producer = vec![
+            ("target".to_owned(), target.to_string_lossy().into_owned()),
+            ("package".to_owned(), "/worktree/producer".to_owned()),
+        ];
+        let consumer = vec![
+            ("target".to_owned(), target.to_string_lossy().into_owned()),
+            ("package".to_owned(), "/worktree/consumer".to_owned()),
+        ];
+        let metadata = format!(
+            "source:{}/src/lib.rs",
+            execution_slot("/worktree/producer").unwrap()
+        );
+        fs::write(&artifact, &metadata).unwrap();
+
+        // What the producer will publish once it finishes.
+        let published = logical_bytes(&artifact, metadata.clone().into_bytes(), &producer).unwrap();
+        let published = (sha256(&published), published.len() as u64);
+
+        // The producer records its mappings before the compiler runs, so a
+        // pipelined consumer reading the output early agrees with it.
+        record_output_mappings_in(&target, &artifact, &producer).unwrap();
+        assert_eq!(digest_in(&target, &artifact, &consumer), published);
+
+        record_logical_digest_in(&target, &artifact, &producer, &published.0, published.1).unwrap();
+        assert_eq!(digest_in(&target, &artifact, &consumer), published);
+
+        // Without the record the consumer's own mappings leave the
+        // producer's package slot as a worktree path.
+        fs::remove_dir_all(target.join("cargo-reapi")).unwrap();
+        assert_ne!(digest_in(&target, &artifact, &consumer), published);
     }
 }

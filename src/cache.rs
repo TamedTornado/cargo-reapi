@@ -14,8 +14,8 @@ use crate::environment::{CompileEnvironment, EnvironmentHints, tracked_environme
 use crate::invocation::RustcInvocation;
 use crate::maintenance::{AccessKind, acquire_shared, record_access};
 use crate::relocation::{
-    materialize_artifact_slots, normalize_artifact_slots, record_logical_digest,
-    restored_logical_digest,
+    logical_bytes, logical_digest, materialize_artifact_slots, record_logical_digest,
+    restore_cached_paths,
 };
 use crate::resource::ResourceLease;
 
@@ -609,27 +609,12 @@ fn discover_link_inputs(
 fn digest_relocatable_file(path: &Path, mappings: &[(String, String)]) -> Result<FileDigestMemo> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("reading relocatable linker input {}", path.display()))?;
-    if let Some((sha256, size_bytes)) = restored_logical_digest(path)? {
-        return Ok(FileDigestMemo {
-            schema_version: 1,
-            actual_path: path.to_path_buf(),
-            sha256,
-            size_bytes,
-            modified_unix_ns: modified_unix_ns(&metadata)?,
-            #[cfg(unix)]
-            device: unix_device(&metadata),
-            #[cfg(unix)]
-            inode: unix_inode(&metadata),
-        });
-    }
-    let bytes = fs::read(path)
-        .with_context(|| format!("reading relocatable linker input {}", path.display()))?;
-    let bytes = normalize_artifact_slots(bytes, mappings)?;
+    let (sha256, size_bytes) = logical_digest(path, mappings)?;
     Ok(FileDigestMemo {
         schema_version: 1,
         actual_path: path.to_path_buf(),
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
-        size_bytes: u64::try_from(bytes.len()).context("linker input is too large")?,
+        sha256,
+        size_bytes,
         modified_unix_ns: modified_unix_ns(&metadata)?,
         #[cfg(unix)]
         device: unix_device(&metadata),
@@ -960,19 +945,11 @@ fn relocatable_file_matches(
     size: u64,
     mappings: &[(String, String)],
 ) -> Result<bool> {
-    let Ok(metadata) = fs::metadata(path) else {
-        return Ok(false);
-    };
-    if metadata.len() != size {
+    if !path.is_file() {
         return Ok(false);
     }
-    if let Some((logical_sha256, logical_size)) = restored_logical_digest(path)? {
-        return Ok(logical_size == size && logical_sha256 == digest);
-    }
-    let bytes = fs::read(path)
-        .with_context(|| format!("validating relocatable input {}", path.display()))?;
-    let bytes = normalize_artifact_slots(bytes, mappings)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)) == digest)
+    let (logical_sha256, logical_size) = logical_digest(path, mappings)?;
+    Ok(logical_size == size && logical_sha256 == digest)
 }
 
 fn resolve_link_input(input: &LinkInput, mappings: &[(String, String)]) -> PathBuf {
@@ -1087,20 +1064,18 @@ fn publish(options: &CacheOptions, prepared: &PreparedInvocation) -> Result<bool
             .with_context(|| format!("reading output metadata {}", output.actual_path.display()))?;
         let original = fs::read(&output.actual_path)
             .with_context(|| format!("reading output {}", output.actual_path.display()))?;
-        let mut bytes = normalize_artifact_slots(original.clone(), &prepared.path_mappings)?;
-        let dependency_file = output
-            .actual_path
-            .extension()
-            .is_some_and(|extension| extension == "d");
-        if dependency_file {
-            bytes = rewrite_paths_for_cache(bytes, &prepared.path_mappings);
-        }
+        let bytes = logical_bytes(
+            &output.actual_path,
+            original.clone(),
+            &prepared.path_mappings,
+        )?;
         let path_rewritten = bytes != original;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         publish_blob(options, &sha256, &bytes)?;
         if path_rewritten {
             record_logical_digest(
                 &output.actual_path,
+                &prepared.path_mappings,
                 &sha256,
                 u64::try_from(bytes.len()).context("cached output is too large")?,
             )?;
@@ -1194,50 +1169,14 @@ fn materialize_blob(
     fs::rename(&temporary, output)
         .with_context(|| format!("installing cached output {}", output.display()))?;
     if cached.path_rewritten {
-        record_logical_digest(output, &cached.sha256, cached.size_bytes)?;
+        record_logical_digest(
+            output,
+            &prepared.path_mappings,
+            &cached.sha256,
+            cached.size_bytes,
+        )?;
     }
     Ok(())
-}
-
-fn rewrite_paths_for_cache(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Vec<u8> {
-    for (label, actual) in mappings {
-        bytes = replace_bytes(
-            &bytes,
-            actual.as_bytes(),
-            format!("/__cargo_reapi__/{label}").as_bytes(),
-        );
-    }
-    bytes
-}
-
-fn restore_cached_paths(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Vec<u8> {
-    for (label, actual) in mappings.iter().rev() {
-        bytes = replace_bytes(
-            &bytes,
-            format!("/__cargo_reapi__/{label}").as_bytes(),
-            actual.as_bytes(),
-        );
-    }
-    bytes
-}
-
-fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if needle.is_empty() {
-        return haystack.to_vec();
-    }
-    let mut result = Vec::with_capacity(haystack.len());
-    let mut offset = 0;
-    while let Some(found) = haystack[offset..]
-        .windows(needle.len())
-        .position(|window| window == needle)
-    {
-        let position = offset + found;
-        result.extend_from_slice(&haystack[offset..position]);
-        result.extend_from_slice(replacement);
-        offset = position + needle.len();
-    }
-    result.extend_from_slice(&haystack[offset..]);
-    result
 }
 
 fn blob_matches(path: &Path, digest: &str, size: u64) -> Result<bool> {
