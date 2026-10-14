@@ -20,7 +20,7 @@ use crate::action::{
 use crate::environment::CompileEnvironment;
 use crate::invocation::RustcInvocation;
 use crate::relocation::{
-    cache_slot, execution_slot, logical_digest, record_output_mappings, record_path_mappings,
+    logical_digest, logical_text, record_output_mappings, record_path_mappings,
 };
 use crate::resource::ResourceCapacity;
 
@@ -69,7 +69,10 @@ pub struct PreparedInvocation {
     pub remote_eligibility: RemoteEligibility,
     pub cache_eligibility: RemoteEligibility,
     pub output_files: Vec<PreparedOutput>,
+    /// Roots that name inputs and outputs by logical path.
     pub path_mappings: Vec<(String, String)>,
+    /// Roots that artifacts are relocated against.
+    pub relocation_mappings: Vec<(String, String)>,
     pub arguments: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub keyed_environment: BTreeMap<String, String>,
@@ -190,12 +193,12 @@ pub fn prepare_invocation(
         );
     }
 
-    let path_mappings = roots.path_mappings();
+    let relocation_mappings = roots.relocation_mappings();
     let output_files = prepare_outputs(
         invocation,
         paths.outputs,
         paths.output_files,
-        &path_mappings,
+        &relocation_mappings,
     )?;
 
     Ok(PreparedInvocation {
@@ -230,7 +233,8 @@ pub fn prepare_invocation(
             .as_deref()
             .map(|path| roots.normalize_text(&display(path))),
         output_files,
-        path_mappings,
+        path_mappings: roots.path_mappings(),
+        relocation_mappings,
     })
 }
 
@@ -400,27 +404,31 @@ impl CaptureRoots {
         )
     }
 
+    /// Arguments and environment values as keyed: paths beneath the target,
+    /// workspace and toolchain roots become those roots' labels, exactly as
+    /// artifacts are relocated. A package outside the workspace keeps its
+    /// absolute path, because its artifacts keep it too.
     fn normalize_text(&self, value: &str) -> String {
-        let mut normalized = value.to_owned();
-        let mut mappings = vec![(&self.target, "target")];
-        if let Some(package) = &self.package {
-            mappings.push((package, "package"));
-        }
-        mappings.push((&self.workspace, "workspace"));
-        mappings.push((&self.toolchain, "toolchain"));
-        for (root, label) in &mappings {
-            if let Some(root) = root.to_str()
-                && let (Ok(execution), Ok(cached)) = (execution_slot(root), cache_slot(label))
-            {
-                normalized = normalized.replace(&execution, &cached);
-            }
-        }
-        for (root, label) in mappings {
-            if let Some(root) = root.to_str() {
-                normalized = normalized.replace(root, label);
-            }
-        }
-        normalized
+        logical_text(value, &self.relocation_mappings())
+    }
+
+    /// The roots artifacts are relocated against. The compile's own package
+    /// is not among them: inside the workspace it is a path beneath the
+    /// workspace root, like every workspace dependency whose paths reach
+    /// this compile's artifacts, and outside it, it is the same path in
+    /// every worktree.
+    fn relocation_mappings(&self) -> Vec<(String, String)> {
+        [
+            (&self.target, "target"),
+            (&self.workspace, "workspace"),
+            (&self.toolchain, "toolchain"),
+        ]
+        .into_iter()
+        .filter_map(|(root, label)| {
+            root.to_str()
+                .map(|root| (label.to_owned(), root.to_owned()))
+        })
+        .collect()
     }
 
     fn path_mappings(&self) -> Vec<(String, String)> {
@@ -494,7 +502,7 @@ fn discover_inputs(
                 &path,
                 logical_path,
                 &invocation.cwd,
-                &roots.path_mappings(),
+                &roots.relocation_mappings(),
             )?),
             Err(error) => reasons.push(error.to_string()),
         }

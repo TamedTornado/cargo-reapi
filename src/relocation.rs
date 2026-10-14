@@ -18,7 +18,7 @@ pub struct RecordedPathMapping {
     pub actual: String,
 }
 
-const OUTPUT_RECORD_SCHEMA_VERSION: u32 = 2;
+const OUTPUT_RECORD_SCHEMA_VERSION: u32 = 3;
 
 /// What every reader of one compile output in a target needs to compute its
 /// logical digest: the path mappings its producer normalizes it with. The
@@ -63,29 +63,150 @@ fn pad_path(path: &str) -> Result<String> {
     Ok(padded)
 }
 
+/// Replaces every execution slot for a root, or for any path beneath it,
+/// with the cache slot of the root's label and the same relative path.
+///
+/// A compile's own package slot is one such path, and so is every slot its
+/// dependencies' metadata carries into its artifacts. Covering every path
+/// beneath the workspace, rather than the compile's own package alone, is
+/// what lets a restored artifact name the consumer's copy of each workspace
+/// dependency. A slot outside every root stays as it is and stays in the
+/// key, so it can only cause a miss.
+///
+/// Slots are only ever made for directories (package, workspace, target
+/// and toolchain roots), so a candidate beneath a root must name an
+/// existing directory. That rejects other text that happens to start with
+/// a root and end in `/`. Its cache slot keeps at least one byte of padding
+/// so that restoration can find where its path ends.
+///
+/// Deeper roots go first, so a target inside the workspace keeps its own
+/// label.
 fn normalize_artifact_slots(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Result<Vec<u8>> {
-    for (label, actual) in mappings {
-        bytes = replace_bytes(
-            &bytes,
-            execution_slot(actual)?.as_bytes(),
-            cache_slot(label)?.as_bytes(),
-        );
+    for (label, actual) in by_specificity(mappings) {
+        execution_slot(actual)?;
+        let root = actual.trim_end_matches('/');
+        let prefix = format!("{root}/");
+        bytes = rewrite_slots(bytes, prefix.as_bytes(), |relative| {
+            if !relative.is_empty() && !is_directory_beneath(root, relative) {
+                return Ok(None);
+            }
+            let slot = cache_slot(&labelled(label, relative)).ok();
+            Ok(slot.filter(|slot| slot.ends_with('/')))
+        })?;
     }
     Ok(bytes)
 }
 
+/// Reverses [`normalize_artifact_slots`] for the consumer's roots.
 pub fn materialize_artifact_slots(
     mut bytes: Vec<u8>,
     mappings: &[(String, String)],
 ) -> Result<Vec<u8>> {
-    for (label, actual) in mappings.iter().rev() {
-        bytes = replace_bytes(
-            &bytes,
-            cache_slot(label)?.as_bytes(),
-            execution_slot(actual)?.as_bytes(),
-        );
+    for (label, actual) in by_specificity(mappings) {
+        let prefix = format!("{}/", cache_slot(label)?.trim_end_matches('/'));
+        bytes = rewrite_slots(bytes, prefix.as_bytes(), |relative| {
+            let path = labelled(actual.trim_end_matches('/'), relative);
+            execution_slot(&path).map(Some)
+        })?;
     }
     Ok(bytes)
+}
+
+/// Text as keyed: execution slots become cache slots, as in artifacts, and
+/// plain paths beneath a root start with the root's label instead.
+pub fn logical_text(value: &str, mappings: &[(String, String)]) -> String {
+    let slots = normalize_artifact_slots(value.as_bytes().to_vec(), mappings)
+        .unwrap_or_else(|_| value.as_bytes().to_vec());
+    let mut text = String::from_utf8(slots).unwrap_or_else(|_| value.to_owned());
+    for (label, actual) in by_specificity(mappings) {
+        text = text.replace(actual, label);
+    }
+    text
+}
+
+fn by_specificity(mappings: &[(String, String)]) -> Vec<(&str, &str)> {
+    let mut ordered = mappings
+        .iter()
+        .map(|(label, actual)| (label.as_str(), actual.as_str()))
+        .collect::<Vec<_>>();
+    ordered.sort_by(|(left_label, left), (right_label, right)| {
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| left_label.cmp(right_label))
+    });
+    ordered
+}
+
+fn is_directory_beneath(root: &str, relative: &str) -> bool {
+    let relative = Path::new(relative);
+    relative
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && Path::new(root).join(relative).is_dir()
+}
+
+fn labelled(root: &str, relative: &str) -> String {
+    if relative.is_empty() {
+        root.to_owned()
+    } else {
+        format!("{root}/{relative}")
+    }
+}
+
+/// Rewrites each slot that names `prefix` without its final `/`, or a path
+/// beneath it. A slot is the path padded with `/` to exactly
+/// [`RELOCATION_SLOT_BYTES`]; `replacement` receives the path relative to
+/// the root and returns the slot to write, or `None` to leave it.
+fn rewrite_slots(
+    bytes: Vec<u8>,
+    prefix: &[u8],
+    replacement: impl Fn(&str) -> Result<Option<String>>,
+) -> Result<Vec<u8>> {
+    let root_length = prefix.len() - 1;
+    let mut output: Option<Vec<u8>> = None;
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(found) = memchr::memmem::find(&bytes[search..], prefix) {
+        let start = search + found;
+        search = start + 1;
+        let Some(window) = bytes.get(start..start + RELOCATION_SLOT_BYTES) else {
+            break;
+        };
+        if window.last() != Some(&b'/') {
+            continue;
+        }
+        let path_length = window
+            .iter()
+            .rposition(|byte| *byte != b'/')
+            .map_or(0, |last| last + 1);
+        let relative = match path_length.cmp(&root_length) {
+            std::cmp::Ordering::Less => continue,
+            std::cmp::Ordering::Equal => "",
+            std::cmp::Ordering::Greater => {
+                match std::str::from_utf8(&window[prefix.len()..path_length]) {
+                    Ok(relative) => relative,
+                    Err(_) => continue,
+                }
+            }
+        };
+        let Some(slot) = replacement(relative)? else {
+            continue;
+        };
+
+        let output = output.get_or_insert_with(|| Vec::with_capacity(bytes.len()));
+        output.extend_from_slice(&bytes[copied..start]);
+        output.extend_from_slice(slot.as_bytes());
+        copied = start + RELOCATION_SLOT_BYTES;
+        search = copied;
+    }
+    Ok(match output {
+        Some(mut output) => {
+            output.extend_from_slice(&bytes[copied..]);
+            output
+        }
+        None => bytes,
+    })
 }
 
 /// The bytes a file in a worktree is cached and keyed as: its execution
@@ -108,7 +229,7 @@ pub fn logical_bytes(
 }
 
 fn rewrite_paths_for_cache(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Vec<u8> {
-    for (label, actual) in mappings {
+    for (label, actual) in by_specificity(mappings) {
         bytes = replace_bytes(
             &bytes,
             actual.as_bytes(),

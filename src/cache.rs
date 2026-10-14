@@ -586,7 +586,7 @@ fn discover_link_inputs(
             || logical_path.starts_with("package/")
             || logical_path.starts_with("workspace/");
         let memo = if content_addressed_root {
-            digest_relocatable_file(&path, &prepared.path_mappings)?
+            digest_relocatable_file(&path, &prepared.relocation_mappings)?
         } else {
             digest_file_memoized(cache_options, &path)?
         };
@@ -933,7 +933,7 @@ fn load_link_discovery(
                 &actual,
                 &input.sha256,
                 input.size_bytes,
-                &prepared.path_mappings,
+                &prepared.relocation_mappings,
             )? {
                 return Ok(None);
             }
@@ -1072,7 +1072,7 @@ fn publish(options: &CacheOptions, prepared: &PreparedInvocation) -> Result<bool
         let bytes = logical_bytes(
             &output.actual_path,
             original.clone(),
-            &prepared.path_mappings,
+            &prepared.relocation_mappings,
         )?;
         let path_rewritten = bytes != original;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -1080,7 +1080,7 @@ fn publish(options: &CacheOptions, prepared: &PreparedInvocation) -> Result<bool
         if path_rewritten {
             record_logical_digest(
                 &output.actual_path,
-                &prepared.path_mappings,
+                &prepared.relocation_mappings,
                 &sha256,
                 u64::try_from(bytes.len()).context("cached output is too large")?,
             )?;
@@ -1136,8 +1136,8 @@ fn materialize_blob(
     if cached.path_rewritten {
         let bytes = fs::read(&blob)
             .with_context(|| format!("reading path-normalized blob {}", cached.sha256))?;
-        let bytes = restore_cached_paths(bytes, &prepared.path_mappings);
-        let bytes = materialize_artifact_slots(bytes, &prepared.path_mappings)?;
+        let bytes = restore_cached_paths(bytes, &prepared.relocation_mappings);
+        let bytes = materialize_artifact_slots(bytes, &prepared.relocation_mappings)?;
         fs::write(&temporary, bytes).with_context(|| {
             format!(
                 "materializing path-normalized blob {} to {}",
@@ -1176,7 +1176,7 @@ fn materialize_blob(
     if cached.path_rewritten {
         record_logical_digest(
             output,
-            &prepared.path_mappings,
+            &prepared.relocation_mappings,
             &cached.sha256,
             cached.size_bytes,
         )?;
