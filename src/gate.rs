@@ -405,7 +405,7 @@ fn gate_key(
     hash_field(&mut hasher, b"sandbox-policy");
     // Building the policy acquires the selected project's sources and
     // settles its lockfile, so the tree hashed below is the one Cargo builds.
-    let selection = crate::query::metadata_selection(cargo_args);
+    let selection = crate::selection::select(workspace, cargo_args)?.metadata_arguments;
     let policy_identity = crate::hermetic::policy_identity_bytes(
         workspace,
         target,
@@ -536,6 +536,26 @@ fn hash_declared_inputs(
     Ok(())
 }
 
+/// Whether [`hash_tree`] skips `path`, and everything beneath it, when it
+/// meets it below the root it walks.
+fn excluded_from_tree(path: &Path, target: &Path, action_log: &Path) -> bool {
+    path.starts_with(target)
+        || path == action_log
+        || path
+            .file_name()
+            .is_some_and(|name| name == ".git" || name == "target")
+}
+
+/// Whether hashing the tree at `root` already hashed everything at `path`:
+/// it lies beneath `root` and no directory on the way is skipped.
+fn hashed_within(path: &Path, root: &Path, target: &Path, action_log: &Path) -> bool {
+    path.starts_with(root)
+        && path
+            .ancestors()
+            .take_while(|ancestor| *ancestor != root)
+            .all(|ancestor| !excluded_from_tree(ancestor, target, action_log))
+}
+
 fn hash_tree(
     hasher: &mut Sha256,
     root: &Path,
@@ -547,11 +567,7 @@ fn hash_tree(
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            entry.path() == root
-                || !(entry.path().starts_with(target)
-                    || entry.path() == action_log
-                    || entry.file_name() == ".git"
-                    || entry.file_name() == "target")
+            entry.path() == root || !excluded_from_tree(entry.path(), target, action_log)
         })
         .collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path().to_path_buf());
@@ -735,7 +751,9 @@ fn hash_external_path_dependencies(
         .filter_map(|package| {
             let manifest = PathBuf::from(package["manifest_path"].as_str()?);
             let root = manifest.parent()?.to_path_buf();
-            (!root.starts_with(workspace)).then(|| {
+            // Hash every selected package the workspace walk did not reach,
+            // such as one beneath a directory named `target`.
+            (!hashed_within(&root, workspace, target, action_log)).then(|| {
                 (
                     package["id"].as_str().unwrap_or("local-package").to_owned(),
                     root,

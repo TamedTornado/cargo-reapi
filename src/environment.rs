@@ -611,85 +611,18 @@ pub fn config_record(cwd: &Path, cargo_args: &[OsString]) -> OsString {
     OsString::from(record)
 }
 
-/// Cargo reads `.cargo/config.toml` (or the older `.cargo/config`) in the
-/// working directory and each ancestor, then in `CARGO_HOME`, then every
-/// `--config` argument.
+/// Every name an `[env]` table in Cargo's configuration defines.
 fn configured_names(cwd: &Path, cargo_args: &[OsString]) -> Result<BTreeSet<String>> {
-    let mut directories = cwd
-        .ancestors()
-        .map(|directory| directory.join(".cargo"))
-        .collect::<Vec<_>>();
-    if let Some(cargo_home) = crate::gate::cargo_home() {
-        directories.push(cargo_home);
-    }
-
     let mut names = BTreeSet::new();
-    for directory in directories {
-        for file in ["config", "config.toml"] {
-            let path = directory.join(file);
-            if path.is_file() {
-                read_config_file(&path, &mut names)?;
-            }
-        }
-    }
-    for argument in config_arguments(cargo_args) {
-        let path = cwd.join(&argument);
-        if path.is_file() {
-            read_config_file(&path, &mut names)?;
-        } else {
-            read_config_text(
-                &argument.to_string_lossy(),
-                "a --config argument",
-                &mut names,
-            )?;
+    for layer in crate::cargo_config::layers(cwd, cargo_args)? {
+        if let Some(environment) = layer.table.get("env") {
+            let environment = environment
+                .as_table()
+                .with_context(|| format!("[env] in {} is not a table", layer.origin))?;
+            names.extend(environment.keys().cloned());
         }
     }
     Ok(names)
-}
-
-fn read_config_file(path: &Path, names: &mut BTreeSet<String>) -> Result<()> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading Cargo configuration {}", path.display()))?;
-    read_config_text(&text, &path.display().to_string(), names)
-}
-
-fn read_config_text(text: &str, origin: &str, names: &mut BTreeSet<String>) -> Result<()> {
-    let table: toml::Table = text
-        .parse()
-        .with_context(|| format!("parsing Cargo configuration from {origin}"))?;
-    if table.contains_key("include") {
-        anyhow::bail!("{origin} includes further configuration, which cargo-reapi does not follow");
-    }
-    if let Some(environment) = table.get("env") {
-        let environment = environment
-            .as_table()
-            .with_context(|| format!("[env] in {origin} is not a table"))?;
-        names.extend(environment.keys().cloned());
-    }
-    Ok(())
-}
-
-/// The values of Cargo's `--config` options. Arguments after `--` belong to
-/// the program Cargo runs.
-fn config_arguments(cargo_args: &[OsString]) -> Vec<OsString> {
-    let mut values = Vec::new();
-    let mut arguments = cargo_args.iter();
-    while let Some(argument) = arguments.next() {
-        if argument == "--" {
-            break;
-        }
-        if argument == "--config" {
-            if let Some(value) = arguments.next() {
-                values.push(value.clone());
-            }
-        } else if let Some(value) = argument
-            .to_str()
-            .and_then(|text| text.strip_prefix("--config="))
-        {
-            values.push(OsString::from(value));
-        }
-    }
-    values
 }
 
 #[cfg(test)]

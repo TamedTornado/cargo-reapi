@@ -344,7 +344,7 @@ struct PolicyPaths<'a> {
     action_log: &'a Path,
     temporary: &'a Path,
     /// What the Cargo invocation selects; see
-    /// [`crate::query::metadata_selection`].
+    /// [`crate::selection::Selection::metadata_arguments`].
     selection: &'a [OsString],
 }
 
@@ -391,15 +391,21 @@ fn readable_paths(
     let mut readable = package_roots(paths.workspace, paths.cache, paths.selection)?;
     #[cfg(target_os = "linux")]
     {
-        // A root package contributes `workspace` through cargo metadata. Do
-        // not let that broad read-only bind undo the target exclusion below.
-        // Nested workspace packages that are not ancestors of target remain
-        // independently readable.
+        // A package root containing the target, such as the root package's
+        // `workspace` or a `--manifest-path` workspace elsewhere, must not
+        // become a broad read-only bind that undoes the target exclusion:
+        // each is replaced by its contents beside the route to the target.
+        // Packages that are not ancestors of the target stay readable whole.
+        let mut containing_target = readable
+            .iter()
+            .filter(|path| paths.target.starts_with(path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        containing_target.insert(paths.workspace.to_path_buf());
         remove_readonly_ancestors_of_writable_path(&mut readable, paths.target);
-        readable.extend(workspace_inputs_excluding_target(
-            paths.workspace,
-            paths.target,
-        )?);
+        for root in &containing_target {
+            readable.extend(workspace_inputs_excluding_target(root, paths.target)?);
+        }
     }
     #[cfg(not(target_os = "linux"))]
     readable.insert(paths.workspace.to_path_buf());

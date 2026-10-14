@@ -2,6 +2,7 @@ mod acceptance;
 mod action;
 mod cache;
 mod capture;
+mod cargo_config;
 mod environment;
 mod evidence;
 mod footprint;
@@ -14,6 +15,7 @@ mod query;
 mod reclient;
 mod relocation;
 mod resource;
+mod selection;
 
 use std::env;
 use std::ffi::OsString;
@@ -37,6 +39,7 @@ use crate::invocation::RustcInvocation;
 use crate::maintenance::{GcOptions, cache_stats, collect_garbage};
 use crate::reclient::{ReclientOptions, execute_reapi, validate_platform_template};
 use crate::resource::ResourceCapacity;
+use crate::selection::Selection;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Backend {
@@ -412,8 +415,12 @@ fn describe_compile_environment(
 }
 
 fn run_cli(cli: &Cli) -> Result<i32> {
-    let selection = crate::query::metadata_selection(&cli.cargo_args);
-    let (executable, workspace_root, target_root) = resolve_driver_context(&selection)?;
+    let DriverContext {
+        executable,
+        workspace_root,
+        target_root,
+        selection,
+    } = resolve_driver_context(cli)?;
     // Compiles run in their package's directory, so a relative log would
     // land beside each package rather than where the caller asked.
     let action_log = cli.action_log.as_ref().map_or_else(
@@ -452,7 +459,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
                 .context("cache directory is required")?,
             &action_log_for_snapshot,
             &cli.declared_inputs,
-            &selection,
+            &selection.metadata_arguments,
         )?
     } else {
         crate::hermetic::cargo_command(
@@ -462,7 +469,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
             cache_dir.as_deref().unwrap_or(&target_root),
             &action_log_for_snapshot,
             &[],
-            &selection,
+            &selection.metadata_arguments,
         )?
     };
     let mut cargo = hermetic.command;
@@ -470,7 +477,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         ResourceCapacity::from_env()?.apply_to(&mut cargo);
     }
     cargo.args(&cli.cargo_args);
-    describe_compile_environment(&mut cargo, &workspace_root, &cli.cargo_args);
+    describe_compile_environment(&mut cargo, &workspace_root, &selection.expanded);
     cargo
         .env("RUSTC_WRAPPER", executable)
         .env(
@@ -558,42 +565,128 @@ fn restart_installed(executable: &Path) -> Result<i32> {
     )
 }
 
-fn resolve_driver_context(selection: &[OsString]) -> Result<(PathBuf, PathBuf, PathBuf)> {
+struct DriverContext {
+    executable: PathBuf,
+    workspace_root: PathBuf,
+    target_root: PathBuf,
+    selection: Selection,
+}
+
+fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
     let executable = env::current_exe()
         .context("locating cargo-reapi executable")?
         .canonicalize()
         .context("resolving cargo-reapi executable")?;
     let workspace_root = env::current_dir().context("locating Cargo workspace root")?;
-    let target_root = resolve_target_root(&workspace_root, selection)?;
+    let selection = crate::selection::select(&workspace_root, &cli.cargo_args)?;
+
+    let layout = ProjectLayout::describe(&workspace_root, &selection.metadata_arguments);
+    let configured = selection
+        .target_dir
+        .clone()
+        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
+        .or_else(|| {
+            layout
+                .as_ref()
+                .map(|layout| layout.target_directory.clone())
+        });
+    let target_root = resolve_target_root_from(&workspace_root, configured)?;
+
     validate_driver_paths(&executable, &target_root)?;
-    Ok((executable, workspace_root, target_root))
-}
-
-fn resolve_target_root(workspace_root: &Path, selection: &[OsString]) -> Result<PathBuf> {
-    let configured = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .or_else(|| cargo_target_directory(workspace_root, selection));
-    resolve_target_root_from(workspace_root, configured)
-}
-
-/// The target directory Cargo itself uses for the selected project: beside
-/// a `--manifest-path` workspace, or wherever `build.target-dir` puts it.
-/// `None` when Cargo cannot describe a project there, as for commands that
-/// run outside one.
-fn cargo_target_directory(workspace_root: &Path, selection: &[OsString]) -> Option<PathBuf> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version", "1"])
-        .args(selection)
-        .current_dir(workspace_root)
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    let snapshots: SnapshotPolicy = cli.snapshot_policy.into();
+    if matches!(cli.backend, Backend::Cache) && snapshots == SnapshotPolicy::Strict {
+        validate_gate_target(&workspace_root, &target_root, layout, &cli.declared_inputs)?;
     }
 
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    metadata["target_directory"].as_str().map(PathBuf::from)
+    Ok(DriverContext {
+        executable,
+        workspace_root,
+        target_root,
+        selection,
+    })
+}
+
+/// Refuses a target directory that is, or contains, a source: the working
+/// directory, the selected workspace, a package or a declared input. Cargo
+/// treats the target as disposable output, the gate excludes it from the
+/// inputs it hashes, and a snapshot restores it whole, so a configured
+/// `build.target-dir = "."` would let a gate hit overwrite edited source.
+fn validate_gate_target(
+    workspace_root: &Path,
+    target_root: &Path,
+    layout: Option<ProjectLayout>,
+    declared_inputs: &[PathBuf],
+) -> Result<()> {
+    let mut sources = vec![workspace_root.to_path_buf()];
+    if let Some(layout) = layout {
+        sources.push(layout.workspace_root);
+        sources.extend(layout.package_roots);
+    }
+    sources.extend(
+        declared_inputs
+            .iter()
+            .map(|input| workspace_root.join(input)),
+    );
+    validate_target_holds_no_sources(target_root, &sources)
+}
+
+/// Where Cargo puts the selected project, from `cargo metadata --no-deps`.
+struct ProjectLayout {
+    /// Cargo's own target directory for the project: beside a
+    /// `--manifest-path` workspace, or wherever `build.target-dir` puts it.
+    target_directory: PathBuf,
+    workspace_root: PathBuf,
+    package_roots: Vec<PathBuf>,
+}
+
+impl ProjectLayout {
+    /// `None` when Cargo cannot describe a project there, as for commands
+    /// that run outside one.
+    fn describe(workspace_root: &Path, metadata_arguments: &[OsString]) -> Option<Self> {
+        let output = Command::new("cargo")
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .args(metadata_arguments)
+            .current_dir(workspace_root)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        let package_roots = metadata["packages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|package| package["manifest_path"].as_str())
+            .filter_map(|manifest| Path::new(manifest).parent().map(Path::to_path_buf))
+            .collect();
+        Some(Self {
+            target_directory: PathBuf::from(metadata["target_directory"].as_str()?),
+            workspace_root: PathBuf::from(metadata["workspace_root"].as_str()?),
+            package_roots,
+        })
+    }
+}
+
+fn validate_target_holds_no_sources(target_root: &Path, sources: &[PathBuf]) -> Result<()> {
+    let target = target_root
+        .canonicalize()
+        .unwrap_or_else(|_| target_root.to_path_buf());
+    for source in sources {
+        let source = source.canonicalize().unwrap_or_else(|_| source.clone());
+        if source.starts_with(&target) {
+            bail!(
+                "Cargo's target directory {} contains source {}; cargo-reapi treats the target as \
+                 disposable output it may restore whole, so choose a target directory outside every \
+                 package and input",
+                target.display(),
+                source.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve_target_root_from(workspace_root: &Path, configured: Option<PathBuf>) -> Result<PathBuf> {

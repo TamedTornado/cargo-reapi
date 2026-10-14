@@ -4,6 +4,33 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+Three faults below could serve a stale gate hit or lose source.
+
+- A gated build refuses a target directory that is or contains a source:
+  the working directory, the selected workspace, a package or a declared
+  input. With `build.target-dir = "."`, which 0.2.8 began honoring, the
+  source tree was the snapshotted target and was excluded from the gate key,
+  so a gate hit restored the original source over an edit.
+- Every selected package is hashed into the gate key. One beneath a directory
+  named `target`, such as `--manifest-path target/tool/Cargo.toml`, was
+  skipped by the workspace scan and, lying beneath the working directory, by
+  the path-dependency scan too, so an edit to it got a stale gate hit.
+- Aliases are expanded as Cargo expands them before the invocation's
+  selection is read. `[alias] ci = "build --locked"` hid `--locked` from the
+  metadata run, which wrote a lockfile that plain `cargo ci` refuses to
+  create. A command whose alias cannot be read is refused.
+- Feature selections (`--features`, `-F`, `--all-features`) resolve every
+  feature in the metadata run, so an optional path dependency they activate
+  is acquired and readable in the sandbox. It was missing, and the build
+  failed to read its manifest.
+- A selected workspace beside the working directory
+  (`--manifest-path ../other/Cargo.toml`) stays readable. The sandbox dropped
+  it because it contains its target and rebuilt the readable inputs from the
+  working directory alone, so its manifest did not exist inside.
+- `-m`, Cargo's short form of `--manifest-path`, is read separated, attached
+  and in clusters (`-m path`, `-mpath`, `-qm path`), as is `-F`, and
+  `--target-dir` chooses the target directory. Cargo's `-C` is refused.
+
 ## [0.2.9] - 2026-10-14
 
 - Reinstalling cargo-reapi no longer breaks builds already running. `cargo

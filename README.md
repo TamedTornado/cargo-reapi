@@ -309,14 +309,28 @@ degrades when the provider or an OS primitive is unavailable.
 
 Because the sandboxed Cargo runs offline, cargo-reapi acquires dependency
 sources first, outside the sandbox: it runs `cargo metadata` for the project
-the invocation selects, with its `--manifest-path`, `--locked`, `--frozen`,
-`--offline`, `--config` and `-Z` options, so Cargo downloads every package and
-git checkout it resolves and writes the lockfile only when the invocation
-would. A dependency newly added to the selected project, including a
-separate workspace built with `--manifest-path`, is fetched before the build,
-and `cargo reapi fetch` works the same way. Without `CARGO_TARGET_DIR`, the
-target directory is the one Cargo reports for that project, so a
-`--manifest-path` workspace builds into its own `target` as under plain Cargo.
+the invocation selects, so Cargo downloads every package and git checkout it
+resolves and writes the lockfile only when the invocation would. It reads the
+invocation as Cargo does: an alias is expanded first (`[alias]`,
+`CARGO_ALIAS_<NAME>` and Cargo's built-in aliases), and the manifest
+(`--manifest-path`, `-m`), lockfile and network policy (`--locked`, `--frozen`,
+`--offline`), configuration (`--config`, `-Z`) and target directory
+(`--target-dir`) are taken in long, short, attached and clustered forms. Any
+feature selection (`--features`, `-F`, `--all-features`) resolves every
+feature, so each optional dependency it may activate is acquired and readable.
+A command whose alias cannot be read, because a configuration file `include`s
+another, is refused, and so is Cargo's `-C`. A dependency newly added to the
+selected project, including a separate workspace built with `--manifest-path`,
+is fetched before the build, and `cargo reapi fetch` works the same way.
+
+The target directory is `--target-dir`, else `CARGO_TARGET_DIR`, else the one
+Cargo reports for the selected project, so a `--manifest-path` workspace
+builds into its own `target` as under plain Cargo. A whole-gate snapshot
+restores the target whole, so a gated build refuses a target directory that
+is or contains the working directory, the selected workspace, a package or a
+declared input (`build.target-dir = "."`, for example). Every selected package
+the workspace scan does not reach, such as one beneath a directory named
+`target`, is hashed into the gate key.
 
 ### Compile environment
 
