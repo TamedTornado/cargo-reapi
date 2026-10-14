@@ -4,6 +4,8 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-14
+
 - Reinstalling cargo-reapi no longer breaks builds already running. `cargo
   install` renames a new file over the old one; a strict-sandbox build keeps
   running the file it bound when it started, whose `/proc/self/exe` then reads
