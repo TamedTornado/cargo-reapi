@@ -54,7 +54,7 @@ plain Cargo" and `CHANGELOG.md` `[Unreleased]`.
   `CARGO_TARGET_DIR=$checkout/target` and stays cached.
 - Hashing has no exclusions by name (`excluded_from_tree`, and the same rule in
   `capture.rs` `is_ignored`): only the canonical target and the action log.
-  `.git` is hashed except `objects` and `logs` (also under `.git/modules/**`),
+  `.git` is hashed except `objects`, `logs` and `info/refs` (also under `.git/modules/**`; `git repack` rewrites `info/refs`),
   `is_git_bulk`. Rationale in the README.
 - A marker is `TargetMarker`: the snapshot key plus each restored file's
   identity (size, mtime, ctime, inode). A hit needs every identity to match;
@@ -82,7 +82,28 @@ the `srt` in `node_modules/.bin` is a different package and is refused.
 Every regression drives real Cargo in `tests/project_selection.rs` and was
 mutation-checked: disabling the fix makes it fail.
 
-MUTATION_TABLE
+| # | Finding | Fix | Regression (mutation that makes it fail) |
+|---|---------|-----|-------------------------------------------|
+| 1 | Target in an `include_str!` data directory overwrote edits | Target disjoint from every project directory, both directions; only `<workspace root>/target` exempt | `a_target_directory_that_is_an_include_str_data_directory_never_overwrites_it` (drop the workspace, cwd, package-root and input checks) |
+| 2 | Alternate lockfile neither hashed nor protected | Decline on `CARGO_RESOLVER_LOCKFILE_PATH` and `resolver.lockfile-path` | `an_alternate_lockfile_is_never_cached` (remove either check) |
+| 3 | Source directory named `target` skipped by the key | No exclusion by name in the gate key or rustc input discovery | `a_source_directory_named_target_is_hashed` (re-add the name rule in `gate.rs`, or in `capture.rs`) |
+| 4 | Marker alone accepted as a hit | Marker carries each output's identity; mismatch restores | `a_gate_hit_restores_outputs_that_another_cargo_run_replaced` (compare the key only) |
+| 5 | `--ignore-rust-version` dropped by preflight | Decline | `ignoring_the_rust_version_is_never_cached` (remove the refusal) |
+| 6 | Metadata ran for help/version/non-build commands | Decide from the command before any metadata run | `commands_that_do_not_build_are_never_prepared_or_cached` (treat every command as cacheable) |
+| 7 | Offline build needed unrelated dev-dependency sources | Metadata failure declines to plain Cargo | `offline_builds_do_not_need_unrelated_dependency_sources` (make the failure an error) |
+| 8 | Refusals were errors, also in local/capture | Declines run Cargo; selection runs only where caching would | `an_alias_works_without_caching_and_in_the_local_backend` (propagate `select`'s error in the local path) |
+| 2' | Preflight could write `Cargo.lock` | `cargo metadata --locked` | `a_missing_or_outdated_lockfile_is_never_written_by_preparation` (stop adding `--locked`) |
+| git | `.git` unconditionally skipped | Hash all but `objects`, `logs`, `info/refs` | `git_state_read_by_a_build_script_is_keyed_but_repacking_objects_is_not` (skip `.git` wholesale: stale hit; hash objects: no hit after `git repack`) |
+| moria | Ordinary `moria_cargo` invocations stay cached | `<workspace root>/target` exemption | `the_ordinary_moria_cargo_invocations_still_hit` (ten invocations hit on their second run), `cargos_default_target_directory_is_cached` (drop the exemption) |
+
+Decline reasons each have a stderr assertion (`assert_declined`): non-build
+command, `--help`/`--version`, alias, `--config`/`-Z`/`--` option, include,
+`--ignore-rust-version`, alternate lockfile (both forms), missing declared
+input, missing or outdated lockfile, metadata failure, target overlap
+(`.`, `src`, `src/out/new`, a symlink to `src`, a data directory, a path
+dependency, a nested `--target-dir`), `-p` with features offline, `-qm`.
+Unit tests cover `clear_destinations` (never writes through a symlink) and
+`is_git_bulk`. A release build contains no `COALESCE_SIGNAL` string.
 
 ## Next steps
 

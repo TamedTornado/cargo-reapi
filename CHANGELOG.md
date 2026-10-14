@@ -35,8 +35,8 @@ source.
 - Hashing has no exclusions by name. A source directory named `target`
   (`include_str!("target/message.txt")`) was skipped by the gate key and by
   rustc input discovery, so an edit returned the old binary. Only the
-  canonical target directory is left out. `.git` is hashed except `objects`
-  and `logs`, also under `.git/modules/*`, so a build script reading
+  canonical target directory is left out. `.git` is hashed except `objects`,
+  `logs` and `info/refs`, also under `.git/modules/*`, so a build script reading
   `git rev-parse HEAD` misses after a new commit and hits after repacking.
 - A marker alone never proves a hit. A restore records each written file's
   size, times and inode with the marker, and a mismatch restores again; a

@@ -389,11 +389,13 @@ named `target` inside a source tree is hashed, and so is a package reached
 through a symlink or a virtual workspace beside the working directory.
 
 `.git` is hashed too, in full, except its `objects` and `logs` directories and
-the same two inside each submodule's gitdir under `.git/modules`. Build scripts
+`info/refs`, and the same three inside each submodule's gitdir under
+`.git/modules`. Build scripts
 that run `git describe` or `git rev-parse HEAD` read repository state; `HEAD`,
 refs, `packed-refs`, the index, `config` and `.git/worktrees` pin what any
-object read returns, because objects are named by their content, and logs only
-record history. A new commit therefore misses, and repacking objects
+object read returns, because objects are named by their content, logs only
+record history, and `info/refs` is derived from the refs and rewritten when
+objects are repacked. A new commit therefore misses, and repacking objects
 (`git repack -ad`) does not. A `.git` that is a file, as in a linked worktree,
 is hashed as an ordinary file; the real gitdir lies outside the workspace,
 which the sandbox does not make readable. The cost is spurious misses in a

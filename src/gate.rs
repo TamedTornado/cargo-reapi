@@ -682,21 +682,30 @@ fn excluded_from_tree(path: &Path, target: &Path, action_log: &Path) -> bool {
     path.starts_with(target) || path == action_log || is_git_bulk(path)
 }
 
-/// Whether `path` is the `objects` or `logs` directory of a Git directory:
-/// `.git`, or a submodule's under `.git/modules`. Build scripts that run
-/// `git describe` or `git rev-parse` read repository state, so everything
-/// else in `.git`, including `HEAD`, refs, `packed-refs`, the index,
-/// `config` and `worktrees`, is hashed. Objects are named by their content,
-/// so those refs and the index fix what any object read returns, and logs
-/// only record history; repacking or collecting objects changes neither.
+/// Whether `path` is bulk the key leaves out of a Git directory: its
+/// `objects` and `logs` directories and the `info/refs` file, in `.git` or in
+/// a submodule's under `.git/modules`. Build scripts that run `git describe`
+/// or `git rev-parse` read repository state, so everything else in `.git`,
+/// including `HEAD`, refs, `packed-refs`, the index, `config` and
+/// `worktrees`, is hashed. Objects are named by their content, so those refs
+/// and the index fix what any object read returns; logs only record history;
+/// `info/refs` is derived from the refs and written whenever objects are
+/// repacked. Repacking or collecting objects changes none of what is hashed.
 pub fn is_git_bulk(path: &Path) -> bool {
-    let is_bulk_name = path
-        .file_name()
-        .is_some_and(|name| name == "objects" || name == "logs");
-    if !is_bulk_name {
-        return false;
-    }
-    let Some(git_directory) = path.parent() else {
+    let named = |path: &Path, wanted: &[&str]| {
+        path.file_name()
+            .is_some_and(|name| wanted.iter().any(|wanted| name == *wanted))
+    };
+    let git_directory = if named(path, &["objects", "logs"]) {
+        path.parent()
+    } else if named(path, &["refs"]) {
+        path.parent()
+            .filter(|info| named(info, &["info"]))
+            .and_then(Path::parent)
+    } else {
+        None
+    };
+    let Some(git_directory) = git_directory else {
         return false;
     };
     git_directory.join("HEAD").is_file()
@@ -1740,7 +1749,12 @@ mod tests {
             assert!(super::is_git_bulk(&git.join(bulk)));
             assert!(super::is_git_bulk(&submodule.join(bulk)));
         }
+        for directory in [&git, &submodule] {
+            fs::create_dir_all(directory.join("info")).expect("info");
+            assert!(super::is_git_bulk(&directory.join("info/refs")));
+        }
         for kept in [
+            git.join("info/exclude"),
             git.join("refs"),
             git.join("HEAD"),
             git.join("modules"),

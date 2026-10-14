@@ -785,6 +785,14 @@ fn a_missing_or_outdated_lockfile_is_never_written_by_preparation() {
     assert_declined(&output, "cargo metadata failed");
     assert!(!project.join("Cargo.lock").exists());
 
+    // Without `--locked` preparation still runs with it, so it declines
+    // and Cargo, not cargo-reapi, writes the lockfile.
+    let output = fixture.cargo_reapi(&project, &["build"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_declined(&output, "cargo metadata failed");
+    assert!(!cache_holds_a_snapshot(&fixture));
+    fs::remove_file(project.join("Cargo.lock")).expect("remove the lockfile Cargo wrote");
+
     fixture.lock(&project);
     let lock = fs::read(project.join("Cargo.lock")).expect("lockfile");
     fs::write(
@@ -795,8 +803,10 @@ fn a_missing_or_outdated_lockfile_is_never_written_by_preparation() {
     let output = fixture.cargo_reapi(&project, &["build", "--locked"]);
     assert_declined(&output, "cargo metadata failed");
     assert!(!cache_holds_a_snapshot(&fixture));
-    assert_ne!(fs::read(project.join("Cargo.lock")).expect("lockfile"), b"");
-    let _ = lock;
+    assert_eq!(
+        fs::read(project.join("Cargo.lock")).expect("lockfile"),
+        lock
+    );
 }
 
 #[test]
@@ -1245,13 +1255,37 @@ fn git_state_read_by_a_build_script_is_keyed_but_repacking_objects_is_not() {
     assert_eq!(gate_hits(&project.join("target")), hits, "a stale hit");
     assert_eq!(run(&binary), head(&project));
 
-    // Repacking objects changes nothing it can read.
+    // Repacking objects changes nothing it can read: the very next build hits.
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    let hits = gate_hits(&project.join("target"));
     git(&["repack", "-a", "-d", "-q"]);
     assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
-    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
-    assert!(
-        gate_hits(&project.join("target")) > hits,
+    assert_eq!(
+        gate_hits(&project.join("target")),
+        hits + 1,
         "no hit after repacking"
     );
     assert_eq!(run(&binary), head(&project));
+}
+
+#[test]
+fn a_missing_declared_input_runs_uncached() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "project", "");
+    fixture.lock(&project);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(&project)
+        .env("CARGO_HOME", &fixture.cargo_home)
+        .env_remove("CARGO_TARGET_DIR")
+        .args(["--backend", "cache", "--cache-dir"])
+        .arg(&fixture.cache)
+        .args(["--declared-input", "missing", "--", "build"])
+        .output()
+        .expect("run cargo-reapi");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_declined(&output, "declared input does not exist");
+    assert!(!cache_holds_a_snapshot(&fixture));
 }
