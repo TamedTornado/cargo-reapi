@@ -14,7 +14,7 @@ use tempfile::tempdir;
 /// A project whose own workspace sits inside another one's directory, as a
 /// vendored tool does, and depends on a crate never fetched before.
 struct Fixture {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     outer: PathBuf,
     cargo_home: PathBuf,
     cache: PathBuf,
@@ -32,7 +32,7 @@ impl Fixture {
         fs::create_dir_all(&cargo_home).expect("private CARGO_HOME");
 
         Self {
-            _root: root,
+            root: root,
             outer,
             cargo_home,
             cache,
@@ -79,7 +79,7 @@ impl Fixture {
         let status = Command::new("cargo")
             .arg("generate-lockfile")
             .current_dir(self.outer.join("tool"))
-            .env("CARGO_HOME", self._root.path().join("lock-home"))
+            .env("CARGO_HOME", self.root.path().join("lock-home"))
             .status()
             .expect("run cargo generate-lockfile");
         assert!(status.success(), "generate-lockfile failed");
