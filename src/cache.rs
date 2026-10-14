@@ -410,7 +410,9 @@ fn execute_cached_link(
     fs::create_dir_all(&capture_root)?;
     let capture_file = tempfile::NamedTempFile::new_in(&capture_root)?;
     let capture_path = capture_file.path();
-    let wrapper = std::env::current_exe().context("locating cargo-reapi linker wrapper")?;
+    // rustc runs the linker while this process waits for it, so the linker
+    // wrapper is this very executable, whatever has been installed since.
+    let wrapper = running_executable()?;
     let real_linker = resolve_real_linker(invocation)?;
     let _lease = ResourceLease::acquire(true)?;
     remove_stale_dep_info(&prepared)?;
@@ -481,6 +483,44 @@ fn resolve_real_linker(invocation: &RustcInvocation) -> Result<PathBuf> {
         return Ok(PathBuf::from(linker));
     }
     default_linker_for_sandbox()
+}
+
+/// A path that executes, and reads as, this process's own executable for as
+/// long as the process runs.
+///
+/// `cargo install` replaces the installed file while builds are running. A
+/// process started before that keeps running the old file, but on Linux
+/// [`std::env::current_exe`] then names the installed path with
+/// " (deleted)" appended, which nothing can execute, and the installed path
+/// itself holds a different version. The strict sandbox binds the file that
+/// was installed when it started, so a whole sandboxed build runs the old
+/// one. `/proc/<pid>/exe` always opens the running file.
+pub(crate) fn running_executable() -> Result<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return Ok(PathBuf::from(format!("/proc/{}/exe", std::process::id())));
+    }
+    std::env::current_exe().context("locating the running cargo-reapi executable")
+}
+
+/// Whether the file at `installed`, from which this process started, has
+/// since been replaced, as `cargo install` does.
+pub(crate) fn replaced_since_start(installed: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(running) = running_executable().and_then(|path| Ok(fs::metadata(path)?)) else {
+            return false;
+        };
+        fs::metadata(installed).map_or(true, |current| {
+            (current.dev(), current.ino()) != (running.dev(), running.ino())
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = installed;
+        false
+    }
 }
 
 pub fn default_linker_for_sandbox() -> Result<PathBuf> {

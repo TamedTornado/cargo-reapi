@@ -392,7 +392,8 @@ fn gate_key(
     hash_field(&mut hasher, learned_environment.as_bytes());
     hash_field(&mut hasher, std::env::consts::OS.as_bytes());
     hash_field(&mut hasher, std::env::consts::ARCH.as_bytes());
-    let current_executable = std::env::current_exe()?.canonicalize()?;
+    // The code computing this key, not whatever has been installed since.
+    let current_executable = crate::cache::running_executable()?;
     hash_field(&mut hasher, b"cargo-reapi-executable");
     hash_field(&mut hasher, &fs::read(&current_executable)?);
     hash_host_tools(&mut hasher)?;

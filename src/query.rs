@@ -33,7 +33,7 @@ pub fn cargo_metadata_output(
     cache: &Path,
     selection: &[OsString],
 ) -> Result<std::process::Output> {
-    let executable = env::current_exe().context("locating cargo-reapi query shim")?;
+    let executable = crate::cache::running_executable()?;
     let compiler = env::var_os("RUSTC")
         .map(PathBuf::from)
         .or_else(|| resolve_executable("rustc"))

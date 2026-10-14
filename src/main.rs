@@ -424,20 +424,8 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     let cache_dir = cli.cache_dir.clone();
     let snapshot_policy: SnapshotPolicy = cli.snapshot_policy.into();
     let snapshots_enabled = snapshot_policy == SnapshotPolicy::Strict;
-    let mut gate_snapshot = if matches!(cli.backend, Backend::Cache)
-        && snapshots_enabled
-        && env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_none()
-    {
-        Some(GateSnapshot::prepare(
-            cache_dir
-                .as_deref()
-                .context("cache directory is required")?,
-            &workspace_root,
-            &target_root,
-            &action_log_for_snapshot,
-            &cli.cargo_args,
-            &cli.declared_inputs,
-        )?)
+    let mut gate_snapshot = if snapshots_enabled {
+        prepare_gate(cli, &workspace_root, &target_root, &action_log_for_snapshot)?
     } else {
         None
     };
@@ -446,6 +434,13 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     {
         snapshot.record_successful_hit(&action_log_for_snapshot)?;
         return Ok(0);
+    }
+    // A gate can wait a long time for another producer. If cargo-reapi was
+    // reinstalled meanwhile, Cargo would run the new version as the compiler
+    // wrapper under this driver; the new version takes the command instead.
+    if cache::replaced_since_start(&executable) {
+        drop(gate_snapshot);
+        return restart_installed(&executable);
     }
     let hermetic = if matches!(cli.backend, Backend::Cache) && snapshots_enabled {
         crate::hermetic::cargo_command(
@@ -516,6 +511,51 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         &action_log_for_snapshot,
     )?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// The whole-gate snapshot for a cache build in the strict sandbox.
+fn prepare_gate(
+    cli: &Cli,
+    workspace_root: &Path,
+    target_root: &Path,
+    action_log: &Path,
+) -> Result<Option<GateSnapshot>> {
+    if !matches!(cli.backend, Backend::Cache)
+        || env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_some()
+    {
+        return Ok(None);
+    }
+
+    let cache_dir = cli
+        .cache_dir
+        .as_deref()
+        .context("cache directory is required")?;
+    GateSnapshot::prepare(
+        cache_dir,
+        workspace_root,
+        target_root,
+        action_log,
+        &cli.cargo_args,
+        &cli.declared_inputs,
+    )
+    .map(Some)
+}
+
+/// Runs this command with the cargo-reapi now installed at `executable`.
+#[cfg(unix)]
+fn restart_installed(executable: &Path) -> Result<i32> {
+    use std::os::unix::process::CommandExt;
+
+    let error = Command::new(executable).args(env::args_os().skip(1)).exec();
+    Err(error).with_context(|| format!("restarting the reinstalled {}", executable.display()))
+}
+
+#[cfg(not(unix))]
+fn restart_installed(executable: &Path) -> Result<i32> {
+    bail!(
+        "{} was replaced while this command ran",
+        executable.display()
+    )
 }
 
 fn resolve_driver_context(selection: &[OsString]) -> Result<(PathBuf, PathBuf, PathBuf)> {

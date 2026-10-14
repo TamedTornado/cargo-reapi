@@ -4,6 +4,22 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+- Reinstalling cargo-reapi no longer breaks builds already running. `cargo
+  install` renames a new file over the old one; a strict-sandbox build keeps
+  running the file it bound when it started, whose `/proc/self/exe` then reads
+  `… (deleted)`. Every compile that linked afterwards passed rustc that
+  unrunnable path as its linker wrapper and failed with "linker
+  `…/cargo-reapi (deleted)` not found". Compiles now give rustc
+  `/proc/<pid>/exe`, which runs the very executable that is waiting for the
+  link. The query shim Cargo runs for metadata is named the same way, and the
+  gate key hashes the running executable's bytes rather than whatever is
+  installed by then.
+- A driver whose executable is reinstalled while it waits to start Cargo, for
+  cache admission or another gate's producer, hands the command to the newly
+  installed version. Cargo would otherwise run the new version as the
+  compiler wrapper of the old driver, or, in the strict sandbox, fail to run
+  any compiler wrapper at all.
+
 ## [0.2.8] - 2026-10-14
 
 - A new dependency of a project selected with `--manifest-path` is fetched
