@@ -13,12 +13,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::environment::learned_environment_digest;
 use crate::maintenance::{AccessKind, GATE_STAGING_PREFIX, acquire_shared, record_access};
 use crate::relocation::{RecordedPathMapping, execution_slot};
 #[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 16;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct GateSnapshotManifest {
@@ -64,6 +65,10 @@ pub struct GateSnapshot {
     clone_method: &'static str,
     relocation_ms: u128,
     marker_hit: bool,
+    /// The learned environment when the gate started. Compiles run
+    /// differently once it changes, so the gate is keyed on it and is not
+    /// published if it changed while the gate ran.
+    learned_environment: String,
 }
 
 impl GateSnapshot {
@@ -81,11 +86,13 @@ impl GateSnapshot {
         } else {
             workspace.join(action_log)
         };
+        let learned_environment = learned_environment_digest(cache_root)?;
         let key = gate_key(
             cache_root,
             workspace,
             target,
             &action_log,
+            &learned_environment,
             cargo_args,
             declared_inputs,
         )?;
@@ -107,6 +114,7 @@ impl GateSnapshot {
             clone_method: "none",
             relocation_ms: 0,
             marker_hit: false,
+            learned_environment,
         };
         if gate.is_published() && gate.observed_inputs_match()? {
             gate.restore_exact()?;
@@ -158,6 +166,11 @@ impl GateSnapshot {
     pub fn publish_after_success(&mut self) -> Result<()> {
         let _maintenance = acquire_shared(&self.cache_root)?;
         if self.restored || self.lock.is_none() || self.is_published() {
+            return self.unlock();
+        }
+        // A compile learned a variable during this gate, so some of the
+        // target was built under the previous environment.
+        if learned_environment_digest(&self.cache_root)? != self.learned_environment {
             return self.unlock();
         }
         let parent = self
@@ -369,11 +382,14 @@ fn gate_key(
     workspace: &Path,
     target: &Path,
     action_log: &Path,
+    learned_environment: &str,
     cargo_args: &[OsString],
     declared_inputs: &[PathBuf],
 ) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"cargo-reapi-gate-state-v16\0");
+    hasher.update(b"cargo-reapi-gate-state-v17\0");
+    hash_field(&mut hasher, b"learned-environment");
+    hash_field(&mut hasher, learned_environment.as_bytes());
     hash_field(&mut hasher, std::env::consts::OS.as_bytes());
     hash_field(&mut hasher, std::env::consts::ARCH.as_bytes());
     let current_executable = std::env::current_exe()?.canonicalize()?;
@@ -622,7 +638,7 @@ fn hash_config_file(hasher: &mut Sha256, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cargo_home() -> Option<PathBuf> {
+pub(crate) fn cargo_home() -> Option<PathBuf> {
     std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| {

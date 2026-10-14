@@ -144,7 +144,12 @@ pub fn execute_cached(
                     report_withheld_after_success(invocation, &names);
                     return Ok(1);
                 }
-                environment.pass(&names);
+                // `withheld` names only variables this environment can pass,
+                // so every retry runs the compiler with more of them.
+                anyhow::ensure!(
+                    environment.pass(&names),
+                    "cargo-reapi: retrying a compile without changing its environment"
+                );
             }
         }
     }

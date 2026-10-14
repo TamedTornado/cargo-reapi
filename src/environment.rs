@@ -10,8 +10,9 @@
 //! - the families rustc, Cargo, Clippy, the C toolchain and the native linker
 //!   are documented to read ([`is_toolchain_environment`]);
 //! - every variable Cargo or the sandbox added or changed relative to the
-//!   driver's caller: Cargo's crate variables, `[env]` configuration and
-//!   build-script `rustc-env` values;
+//!   driver's caller: Cargo's crate variables and build-script `rustc-env`
+//!   values;
+//! - every name Cargo's `[env]` configuration defines, whatever its value;
 //! - the build script's `rustc-env` and `rerun-if-env-changed` declarations;
 //! - the names listed in `CARGO_REAPI_DECLARED_ENV`;
 //! - variables rustc recorded as `# env-dep:` dependencies of earlier compiles
@@ -42,6 +43,14 @@ pub const DECLARED_ENVIRONMENT: &str = "CARGO_REAPI_DECLARED_ENV";
 /// When set, each cached compile reports the variables removed from it.
 pub const REPORT_STRIPPED_ENVIRONMENT: &str = "CARGO_REAPI_REPORT_STRIPPED_ENV";
 
+/// The names Cargo's `[env]` configuration defines, which the driver reads
+/// from the configuration Cargo loads: see [`config_record`].
+pub const CONFIG_ENVIRONMENT: &str = "CARGO_REAPI_CONFIG_ENVIRONMENT";
+
+/// Where the cache keeps the names compiles learned they read, one directory
+/// per crate and one file per name.
+const LEARNED_ENVIRONMENT_DIRECTORY: &str = "learned-environment";
+
 /// Per-invocation plumbing that agent and container runtimes synthesize.
 /// The driver removes it before Cargo starts, so build scripts never see it.
 pub const RUNTIME_PLUMBING_ENVIRONMENT: [&str; 5] = [
@@ -60,8 +69,9 @@ const OBSERVER_ENVIRONMENT: [&str; 2] = ["CARGO_REAPI_REAL_RUSTC", "CARGO_REAPI_
 /// Settings and records only the wrapper reads: where to log and cache,
 /// scheduling capacity, and this module's own inputs. They never reach a
 /// compiler and are never keyed.
-const WRAPPER_PRIVATE: [&str; 10] = [
+const WRAPPER_PRIVATE: [&str; 11] = [
     CALLER_ENVIRONMENT,
+    CONFIG_ENVIRONMENT,
     REPORT_STRIPPED_ENVIRONMENT,
     "CARGO_REAPI_ACTION_LOG",
     "CARGO_REAPI_BACKEND",
@@ -117,7 +127,8 @@ const TOOLCHAIN_NAMES: [&str; 30] = [
 ];
 
 /// Executable and library search lists. Only the directories they resolve
-/// through matter, so they are keyed by their canonical existing directories.
+/// through matter, so compiles receive, and are keyed by, their canonical
+/// existing directories.
 const SEARCH_PATH_ENVIRONMENT: [&str; 6] = [
     "PATH",
     "LD_LIBRARY_PATH",
@@ -158,6 +169,10 @@ impl CompileEnvironment {
             },
             None => BTreeSet::new(),
         };
+        let configured = match ConfigEnvironment::from_env() {
+            ConfigEnvironment::Known(names) => names,
+            ConfigEnvironment::Unknown(reason) => return Self::whole(&reason),
+        };
         let declared = declared_environment();
         let learned = hints.map(EnvironmentHints::load).unwrap_or_default();
 
@@ -171,6 +186,7 @@ impl CompileEnvironment {
             }
             if is_toolchain_environment(name)
                 || caller.changed(name, &value)
+                || configured.contains(name)
                 || build_script.contains(name)
                 || declared.contains(name)
                 || learned.contains(name)
@@ -211,20 +227,49 @@ impl CompileEnvironment {
         }
     }
 
-    /// Passes more variables to later executions of this compile.
-    pub fn pass(&mut self, extra: &BTreeSet<String>) {
-        if let Self::Keyed(names) = self {
-            names.extend(extra.iter().cloned());
-        }
+    /// Passes more variables to later executions of this compile. Returns
+    /// whether the compiler's environment changed.
+    pub fn pass(&mut self, extra: &BTreeSet<String>) -> bool {
+        let Self::Keyed(names) = self else {
+            return false;
+        };
+        let before = names.len();
+        names.extend(
+            extra
+                .iter()
+                .filter(|name| !WRAPPER_PRIVATE.contains(&name.as_str()))
+                .cloned(),
+        );
+        names.len() != before
     }
 
-    /// Tracked variables the caller set but this environment withholds.
+    /// Tracked variables the caller set that this environment withholds but
+    /// could pass. Wrapper settings are never the caller's to give a
+    /// compile, so a compile that reads one sees it unset, as under Cargo.
     pub fn withheld(&self, tracked: &BTreeSet<String>) -> BTreeSet<String> {
         tracked
             .iter()
-            .filter(|name| env::var_os(name).is_some() && !self.passes(OsStr::new(name)))
+            .filter(|name| {
+                env::var_os(name).is_some()
+                    && !WRAPPER_PRIVATE.contains(&name.as_str())
+                    && !self.passes(OsStr::new(name))
+            })
             .cloned()
             .collect()
+    }
+
+    /// The value the compiler receives for a variable it is passed. A search
+    /// list is reduced to the directories it resolves through, which is also
+    /// what its key covers.
+    pub fn compiler_value(name: &OsStr, value: &OsStr) -> OsString {
+        if name
+            .to_str()
+            .is_some_and(|name| SEARCH_PATH_ENVIRONMENT.contains(&name))
+        {
+            canonical_search_path(value)
+        } else {
+            value.to_owned()
+        }
     }
 
     /// Variables present in this process that the compiler does not receive.
@@ -243,15 +288,11 @@ impl CompileEnvironment {
     pub fn keyed_values(&self, normalize: impl Fn(&str) -> String) -> BTreeMap<String, String> {
         env::vars_os()
             .filter_map(|(name, value)| {
+                let value = Self::compiler_value(&name, &value);
                 let name = name.to_string_lossy().into_owned();
                 if !self.keys(&name) {
                     return None;
                 }
-                let value = if SEARCH_PATH_ENVIRONMENT.contains(&name.as_str()) {
-                    canonical_search_path(&value)
-                } else {
-                    value
-                };
                 let normalized = normalize(&value.to_string_lossy());
                 Some((name, format!("sha256:{:x}", Sha256::digest(normalized))))
             })
@@ -399,6 +440,9 @@ fn unescape_dep_info(text: &str) -> String {
 /// takes the first match, so the result finds exactly the same files.
 /// Relative and empty entries resolve against the working directory, which
 /// the action key already covers, and stay as written.
+///
+/// The compiler receives this value, not the caller's spelling, so whatever
+/// reads the variable sees exactly what the key covers.
 fn canonical_search_path(value: &OsStr) -> OsString {
     let mut seen = BTreeSet::new();
     let mut directories = Vec::new();
@@ -421,8 +465,12 @@ fn canonical_search_path(value: &OsStr) -> OsString {
 
 /// Tracked variables learned from earlier compiles of one crate, shared
 /// through the cache so later compiles pass them from the start.
+///
+/// Each learned name is its own file, created once and never rewritten, so
+/// compiles learning different names at the same time cannot lose each
+/// other's.
 pub struct EnvironmentHints {
-    path: PathBuf,
+    directory: PathBuf,
 }
 
 impl EnvironmentHints {
@@ -438,29 +486,210 @@ impl EnvironmentHints {
             identity.update([0]);
         }
         Some(Self {
-            path: cache_root
-                .join("environment-hints")
+            directory: cache_root
+                .join(LEARNED_ENVIRONMENT_DIRECTORY)
                 .join(format!("{:x}", identity.finalize())),
         })
     }
 
     fn load(&self) -> BTreeSet<String> {
-        fs::read_to_string(&self.path)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return BTreeSet::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| decode_name(&entry.file_name()))
             .collect()
     }
 
     pub fn record(&self, names: &BTreeSet<String>) -> Result<()> {
-        let mut known = self.load();
-        if names.is_subset(&known) {
-            return Ok(());
+        fs::create_dir_all(&self.directory).with_context(|| {
+            format!(
+                "creating learned environment directory {}",
+                self.directory.display()
+            )
+        })?;
+        for name in names {
+            let path = self.directory.join(encode_name(name));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("recording learned name {}", path.display()));
+                }
+            }
         }
-        known.extend(names.iter().cloned());
-        let text = known.into_iter().collect::<Vec<_>>().join("\n");
-        crate::cache::write_atomic(&self.path, text.as_bytes())
+        Ok(())
     }
+}
+
+/// A digest of every name learned for every crate. Learning changes how
+/// later compiles run, so state built before it must not be reused after.
+pub fn learned_environment_digest(cache_root: &Path) -> Result<String> {
+    let root = cache_root.join(LEARNED_ENVIRONMENT_DIRECTORY);
+    let mut entries = Vec::new();
+    if root.is_dir() {
+        for entry in walkdir::WalkDir::new(&root).min_depth(2).max_depth(2) {
+            let entry = entry.context("listing learned environment")?;
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .context("learned name outside its directory")?;
+            entries.push(relative.to_string_lossy().into_owned());
+        }
+    }
+    entries.sort();
+    Ok(format!("{:x}", Sha256::digest(entries.join("\n"))))
+}
+
+/// File names are hex, since a variable name may hold any character but `=`.
+fn encode_name(name: &str) -> String {
+    use std::fmt::Write;
+
+    name.bytes().fold(String::new(), |mut encoded, byte| {
+        let _ = write!(encoded, "{byte:02x}");
+        encoded
+    })
+}
+
+fn decode_name(file_name: &OsStr) -> Option<String> {
+    let text = file_name.to_str()?;
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The names Cargo's `[env]` configuration defines, or why they could not be
+/// determined.
+enum ConfigEnvironment {
+    Known(BTreeSet<String>),
+    Unknown(String),
+}
+
+impl ConfigEnvironment {
+    fn from_env() -> Self {
+        let Some(record) = env::var_os(CONFIG_ENVIRONMENT) else {
+            return Self::Unknown(
+                "the cargo-reapi driver did not record Cargo's [env] configuration".to_owned(),
+            );
+        };
+        let record = record.to_string_lossy();
+        let mut lines = record.lines();
+        match lines.next() {
+            Some("known") => Self::Known(lines.map(str::to_owned).collect()),
+            _ => Self::Unknown(lines.collect::<Vec<_>>().join(" ")),
+        }
+    }
+}
+
+/// Encodes, for [`CONFIG_ENVIRONMENT`], the names that Cargo's `[env]`
+/// configuration defines for a Cargo run in `cwd` with `cargo_args`.
+///
+/// Cargo sets those variables for every compile, or leaves the caller's
+/// value when the entry is not forced. Either way plain Cargo's compile
+/// receives them, so a cached compile must too, whatever their values. When
+/// the configuration cannot be read completely, compiles receive the whole
+/// environment instead.
+pub fn config_record(cwd: &Path, cargo_args: &[OsString]) -> OsString {
+    let record = match configured_names(cwd, cargo_args) {
+        Ok(names) => std::iter::once("known".to_owned())
+            .chain(names)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(error) => format!("unknown\nCargo's [env] configuration is unreadable: {error:#}"),
+    };
+    OsString::from(record)
+}
+
+/// Cargo reads `.cargo/config.toml` (or the older `.cargo/config`) in the
+/// working directory and each ancestor, then in `CARGO_HOME`, then every
+/// `--config` argument.
+fn configured_names(cwd: &Path, cargo_args: &[OsString]) -> Result<BTreeSet<String>> {
+    let mut directories = cwd
+        .ancestors()
+        .map(|directory| directory.join(".cargo"))
+        .collect::<Vec<_>>();
+    if let Some(cargo_home) = crate::gate::cargo_home() {
+        directories.push(cargo_home);
+    }
+
+    let mut names = BTreeSet::new();
+    for directory in directories {
+        for file in ["config", "config.toml"] {
+            let path = directory.join(file);
+            if path.is_file() {
+                read_config_file(&path, &mut names)?;
+            }
+        }
+    }
+    for argument in config_arguments(cargo_args) {
+        let path = cwd.join(&argument);
+        if path.is_file() {
+            read_config_file(&path, &mut names)?;
+        } else {
+            read_config_text(
+                &argument.to_string_lossy(),
+                "a --config argument",
+                &mut names,
+            )?;
+        }
+    }
+    Ok(names)
+}
+
+fn read_config_file(path: &Path, names: &mut BTreeSet<String>) -> Result<()> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading Cargo configuration {}", path.display()))?;
+    read_config_text(&text, &path.display().to_string(), names)
+}
+
+fn read_config_text(text: &str, origin: &str, names: &mut BTreeSet<String>) -> Result<()> {
+    let table: toml::Table = text
+        .parse()
+        .with_context(|| format!("parsing Cargo configuration from {origin}"))?;
+    if table.contains_key("include") {
+        anyhow::bail!("{origin} includes further configuration, which cargo-reapi does not follow");
+    }
+    if let Some(environment) = table.get("env") {
+        let environment = environment
+            .as_table()
+            .with_context(|| format!("[env] in {origin} is not a table"))?;
+        names.extend(environment.keys().cloned());
+    }
+    Ok(())
+}
+
+/// The values of Cargo's `--config` options. Arguments after `--` belong to
+/// the program Cargo runs.
+fn config_arguments(cargo_args: &[OsString]) -> Vec<OsString> {
+    let mut values = Vec::new();
+    let mut arguments = cargo_args.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--config" {
+            if let Some(value) = arguments.next() {
+                values.push(value.clone());
+            }
+        } else if let Some(value) = argument
+            .to_str()
+            .and_then(|text| text.strip_prefix("--config="))
+        {
+            values.push(OsString::from(value));
+        }
+    }
+    values
 }
 
 #[cfg(test)]

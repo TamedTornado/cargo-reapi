@@ -27,7 +27,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::cache::{CacheOptions, LinkerCaptureRecord, execute_cached};
 use crate::capture::{CaptureOptions, capture_invocation};
-use crate::environment::{CALLER_ENVIRONMENT, RUNTIME_PLUMBING_ENVIRONMENT, caller_record};
+use crate::environment::{
+    CALLER_ENVIRONMENT, CONFIG_ENVIRONMENT, RUNTIME_PLUMBING_ENVIRONMENT, caller_record,
+    config_record,
+};
 use crate::gate::GateSnapshot;
 use crate::hermetic::SnapshotPolicy;
 use crate::invocation::RustcInvocation;
@@ -383,6 +386,31 @@ fn run_doctor(mut args: Vec<OsString>) -> Result<i32> {
     Ok(0)
 }
 
+/// Gives compiles what they need to work out their keyed environment.
+fn describe_compile_environment(
+    cargo: &mut Command,
+    workspace_root: &Path,
+    cargo_args: &[OsString],
+) {
+    // Agent and container runtimes synthesize per-invocation plumbing. Letting
+    // it reach build scripts would make otherwise identical worktrees
+    // semantically different; omitting it from a key without scrubbing it
+    // would be unsound.
+    for name in RUNTIME_PLUMBING_ENVIRONMENT {
+        cargo.env_remove(name);
+    }
+    cargo
+        // Compiles compare against the caller's environment to find what
+        // Cargo itself defined for them.
+        .env(CALLER_ENVIRONMENT, caller_record())
+        // Cargo's [env] configuration may define a variable with the value
+        // the caller already has, which that comparison cannot see.
+        .env(
+            CONFIG_ENVIRONMENT,
+            config_record(workspace_root, cargo_args),
+        );
+}
+
 fn run_cli(cli: &Cli) -> Result<i32> {
     let (executable, workspace_root, target_root) = resolve_driver_context()?;
     let action_log = cli
@@ -442,17 +470,8 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         ResourceCapacity::from_env()?.apply_to(&mut cargo);
     }
     cargo.args(&cli.cargo_args);
-    // Agent and container runtimes synthesize per-invocation plumbing. Letting
-    // it reach build scripts would make otherwise identical worktrees
-    // semantically different; omitting it from a key without scrubbing it
-    // would be unsound.
-    for name in RUNTIME_PLUMBING_ENVIRONMENT {
-        cargo.env_remove(name);
-    }
+    describe_compile_environment(&mut cargo, &workspace_root, &cli.cargo_args);
     cargo
-        // Compiles compare against the caller's environment to find what
-        // Cargo itself defined for them.
-        .env(CALLER_ENVIRONMENT, caller_record())
         .env("RUSTC_WRAPPER", executable)
         .env(
             "CARGO_REAPI_BACKEND",

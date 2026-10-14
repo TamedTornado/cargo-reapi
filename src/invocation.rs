@@ -318,7 +318,14 @@ fn apply_compiler_environment(
 ) -> Result<()> {
     if let Some(environment) = environment {
         command.env_clear();
-        command.envs(std::env::vars_os().filter(|(name, _)| environment.passes(name)));
+        command.envs(
+            std::env::vars_os()
+                .filter(|(name, _)| environment.passes(name))
+                .map(|(name, value)| {
+                    let value = CompileEnvironment::compiler_value(&name, &value);
+                    (name, value)
+                }),
+        );
     }
     apply_relocation_environment(command, compiler, environment)
 }
@@ -345,9 +352,11 @@ fn apply_relocation_environment(
     roots.dedup();
 
     for (name, value) in std::env::vars_os() {
-        if environment.is_some_and(|environment| !environment.passes(&name)) {
-            continue;
-        }
+        let value = match environment {
+            Some(environment) if !environment.passes(&name) => continue,
+            Some(_) => CompileEnvironment::compiler_value(&name, &value),
+            None => value,
+        };
         if let Some(relocated) = relocated_environment_value(&value, &roots)? {
             command.env(name, relocated);
         }
