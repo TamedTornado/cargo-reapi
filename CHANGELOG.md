@@ -4,6 +4,8 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-10-14
+
 - A new dependency of a project selected with `--manifest-path` is fetched
   before the strict sandbox starts. Sources were acquired for the workspace in
   the working directory only, so building or fetching a separate workspace,
