@@ -4,6 +4,8 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-14
+
 - A compile output has one logical digest, whichever compile reads it and
   whenever. Cargo starts a pipelined dependent as soon as a dependency's
   compiler writes its metadata, before cargo-reapi publishes it. The
