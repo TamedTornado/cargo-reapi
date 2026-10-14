@@ -32,7 +32,7 @@ impl Fixture {
         fs::create_dir_all(&cargo_home).expect("private CARGO_HOME");
 
         Self {
-            root: root,
+            root,
             outer,
             cargo_home,
             cache,
