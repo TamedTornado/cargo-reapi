@@ -4,6 +4,37 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+Three faults below could serve a wrong cache hit. Earlier entries cannot be
+reused: every action key and the gate snapshot schema changed.
+
+- A dependent restored in another worktree names that worktree's copy of each
+  workspace dependency. Its artifacts can embed a dependency's package path,
+  for example a constant built from `env!("CARGO_MANIFEST_DIR")`, but
+  publication relocated only the compile's own package, so the restored
+  program named the first worktree's dependency. Every slot for a directory
+  beneath the workspace is now relocated. A package outside the workspace,
+  such as a registry crate, keeps its absolute path in its artifacts and its
+  key.
+- A compile receives search lists such as `PATH` as the canonical directories
+  it is keyed on. It received the caller's spelling, so two shells with
+  different symlinks to one directory shared a key, and a program embedding
+  `env!("PATH")` restored the other shell's value.
+- Whole-gate snapshots are keyed on the environment names compiles have
+  learned, and a gate that learns a name while it runs is not published. A
+  snapshot built while a proc macro's read was withheld was restored after
+  the crate learned the variable, although a fresh build would pass it.
+- Every name Cargo's `[env]` configuration defines reaches the compile. A
+  forced entry whose value equaled the caller's, or an unforced entry the
+  caller had already set, looked unchanged to the wrapper and was stripped,
+  so a proc macro reading it saw it unset.
+- Concurrently learned names are all kept. Each is now its own file under
+  `learned-environment/` in the cache; compiles that learned different names
+  for one crate at once overwrote each other's list.
+- A compile that reads one of cargo-reapi's own settings, such as
+  `CARGO_REAPI_BACKEND`, sees it unset and fails as it would under plain
+  Cargo. It was retried without end, because the wrapper never passes those
+  settings.
+
 ## [0.2.6] - 2026-10-14
 
 - A compile output has one logical digest, whichever compile reads it and

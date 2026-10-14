@@ -24,6 +24,15 @@ converts cache slots to the consumer's execution slots. Values outside those
 declared roots remain unchanged and remain part of the action key, so a
 different external path produces a miss rather than an unsafe hit.
 
+Since 0.2.7 a slot for any directory beneath the workspace, target or
+toolchain root becomes that root's cache slot plus the relative path. A
+dependent's artifacts can carry its workspace dependencies' package slots,
+for example through a constant built from `env!("CARGO_MANIFEST_DIR")`, and
+those are restored beneath the consumer's workspace too
+(`restored_dependent_names_the_consumers_dependency`). A package outside the
+workspace, such as a registry crate, keeps its absolute path in its artifacts
+and in its key.
+
 Non-UTF-8 values cannot be consumed by Rust's `env!` macro. cargo-reapi still
 relocates one when the entire value is a path under a declared root; otherwise
 it remains unchanged and keyed.

@@ -324,15 +324,22 @@ shells. A compile receives:
   `DEVELOPER_DIR`, `ZERO_AR_DATE`, `MAKEFLAGS`, `MFLAGS`, `OUT_DIR`, `TARGET`,
   `HOST`, `PROFILE`, `DEBUG`, `OPT_LEVEL` and `NUM_JOBS`;
 - everything Cargo defined for the compile beyond the caller's environment,
-  including `.cargo/config.toml` `[env]` entries and build-script `rustc-env`
-  values;
+  such as build-script `rustc-env` values;
+- every name Cargo's `[env]` configuration defines, read from the
+  `.cargo/config.toml` (or `.cargo/config`) files Cargo loads and any
+  `--config` arguments, even when the value equals the caller's. A
+  configuration file with an `include` makes compiles run with the whole
+  environment instead;
 - the build script's `cargo::rerun-if-env-changed` variables;
 - variables rustc recorded as `# env-dep:` dependencies (`env!`, `option_env!`
   and tracked proc-macro reads). The first compile that tracks a set variable
   it was not given is repeated with it, and the cache remembers the name for
   that crate. If such a compile had already succeeded, it fails once with an
   explanation instead, because Cargo may already have used its artifacts; the
-  next build passes the variable;
+  next build passes the variable. Whole-gate snapshots are keyed on every
+  name remembered, so a snapshot built before a crate learned a variable is
+  never restored after. A compile that reads one of cargo-reapi's own
+  settings sees it unset, as under plain Cargo;
 - every name in `CARGO_REAPI_DECLARED_ENV`, a comma-separated list.
 
 cargo-reapi's own settings (action log, cache directory, backend, worktree
@@ -341,9 +348,11 @@ compile and are not keyed. The audit observer's `CARGO_REAPI_REAL_RUSTC` and
 `CARGO_REAPI_RUSTC_TRACE` reach the compiler unkeyed.
 
 Search lists (`PATH`, `LD_LIBRARY_PATH`, `LIBRARY_PATH`, `COMPILER_PATH` and
-the `DYLD_*` library paths) are keyed by the canonical directories they
-resolve through, so a per-shell symlink to the same directory does not change
-the key. Their values are passed unchanged. The compiler's binary digest,
+the `DYLD_*` library paths) reach the compile as the canonical directories
+they resolve through, and are keyed by that value, so a per-shell symlink to
+the same directory does not change the key. Lookups find the same files, and
+a compile that reads the list sees exactly what its key covers. The
+compiler's binary digest,
 version, host and arguments, including `--target`, stay in the key, so
 different toolchains never share an entry.
 
