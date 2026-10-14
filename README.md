@@ -310,27 +310,58 @@ degrades when the provider or an OS primitive is unavailable.
 Because the sandboxed Cargo runs offline, cargo-reapi acquires dependency
 sources first, outside the sandbox: it runs `cargo metadata` for the project
 the invocation selects, so Cargo downloads every package and git checkout it
-resolves and writes the lockfile only when the invocation would. It reads the
-invocation as Cargo does: an alias is expanded first (`[alias]`,
-`CARGO_ALIAS_<NAME>` and Cargo's built-in aliases), and the manifest
-(`--manifest-path`, `-m`), lockfile and network policy (`--locked`, `--frozen`,
-`--offline`), configuration (`--config`, `-Z`) and target directory
-(`--target-dir`) are taken in long, short, attached and clustered forms. Any
-feature selection (`--features`, `-F`, `--all-features`) resolves every
-feature, so each optional dependency it may activate is acquired and readable.
-A command whose alias cannot be read, because a configuration file `include`s
-another, is refused, and so is Cargo's `-C`. A dependency newly added to the
-selected project, including a separate workspace built with `--manifest-path`,
-is fetched before the build, and `cargo reapi fetch` works the same way.
+resolves and writes the lockfile only when the invocation would. A dependency
+newly added to the selected project, including a separate workspace built with
+`--manifest-path`, is fetched before the build, and `cargo reapi fetch` works
+the same way.
+
+cargo-reapi does not emulate Cargo's command line or configuration. It reads
+the plain option forms Cargo documents, separated or attached: the manifest
+(`--manifest-path`, `-m`), the lockfile and network policy (`--locked`,
+`--frozen`, `--offline`, each passed to `cargo metadata` once), the features
+(`--features`, `-F`, including an empty `-F=`, `--all-features`,
+`--no-default-features`), the package selection (`-p`, `--workspace`,
+`--exclude`) and the target directory (`--target-dir`). Features without a
+package selection reach `cargo metadata` as given, so an offline build
+acquires only what its features need. With a package selection `cargo
+metadata` cannot apply them as Cargo does, so it resolves every feature, and
+such an invocation with `--offline` or `--frozen` is refused.
+
+Whatever it cannot read exactly is refused, with a message saying what to
+spell out instead:
+
+- a user-defined alias, from `[alias]` in any Cargo configuration file or a
+  `CARGO_ALIAS_<NAME>` variable, including one that redefines a built-in alias
+  such as `b`. Cargo's own commands and its unredefined built-in aliases
+  (`b`, `c`, `d`, `r`, `rm`, `t`) run as usual;
+- a command that is not one of Cargo's own, such as `b` or `clippy`, when a
+  configuration file that could define it as an alias cannot be read
+  completely, as when it `include`s another file, which cargo-reapi does not
+  follow;
+- `--config`, except `KEY=VALUE` overrides of `profile.*`, `term.*` and
+  `build.jobs`, which cannot change the project, sources, lockfile or target
+  directory;
+- `-Z` flags and `-C`;
+- options before the subcommand other than `-v`, `-q`, `--verbose`,
+  `--quiet`, `--locked`, `--frozen`, `--offline`, `--color`, `--config` as
+  above, `--version`, `--help` and `--list`, and `--` before the subcommand;
+- a cluster of short options that holds one taking a value, such as `-qm`.
 
 The target directory is `--target-dir`, else `CARGO_TARGET_DIR`, else the one
 Cargo reports for the selected project, so a `--manifest-path` workspace
 builds into its own `target` as under plain Cargo. A whole-gate snapshot
-restores the target whole, so a gated build refuses a target directory that
-is or contains the working directory, the selected workspace, a package or a
-declared input (`build.target-dir = "."`, for example). Every selected package
-the workspace scan does not reach, such as one beneath a directory named
-`target`, is hashed into the gate key.
+restores the target whole, so a gated build compares the target with every
+source after resolving symlinks, including the target's deepest existing
+ancestor when it does not exist yet. It refuses a target that is or contains
+the working directory, the selected workspace, any package in the resolve
+(path dependencies outside the workspace included), any directory holding a
+package's target sources (`src`, `src/bin`, `examples`, `tests`, `benches`)
+or a declared input, and one that lies inside such a source directory or a
+declared input. The gate key hashes the selected workspace root and every
+local package by its real directory, so a package reached through a symlink,
+one beneath a directory named `target`, or a virtual workspace beside the
+working directory is hashed even though the working directory's scan does not
+reach it.
 
 ### Compile environment
 

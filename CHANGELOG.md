@@ -4,6 +4,46 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+cargo-reapi no longer emulates Cargo's command line or configuration; what it
+cannot read exactly is refused. Two faults below could serve a stale gate hit
+or overwrite source.
+
+- A gated build compares its target directory with every source after
+  resolving symlinks, from Cargo's full metadata. It refuses a target inside a
+  directory holding target sources (`build.target-dir = "src"`), one that is a
+  path dependency outside the workspace, and one reached through a symlink to
+  either. A gate hit restored the snapshotted source over an edit in each case.
+- Selected packages are hashed by their real directories. A package selected
+  through a symlink (`--manifest-path link/Cargo.toml`, `link -> ../real`)
+  counted as hashed by the working directory's scan, which does not follow
+  symlinks, so an edit to it got a stale gate hit. The root of a selected
+  virtual workspace, holding its manifest and lockfile, is hashed too.
+- User-defined aliases are refused instead of expanded, wherever they are
+  defined: `[alias]` in any configuration file, including `.cargo/config`
+  beside `.cargo/config.toml` and Cargo's home, or `CARGO_ALIAS_<NAME>`. The
+  expansion disagreed with Cargo's for `--config` alias overrides, legacy and
+  TOML files together, array aliases merged across files, and aliases
+  expanding to global options, and could select another project unseen.
+- `--config` is refused except `KEY=VALUE` overrides of `profile.*`, `term.*`
+  and `build.jobs`; `-Z`, `--` before the subcommand, unknown global options
+  and short-option clusters holding an option that takes a value are refused.
+- `-F=` is an explicitly empty feature list. It took the next option as its
+  value, so `build -F= --locked --offline` wrote the lockfile Cargo refuses to.
+- A lockfile or network flag given twice (`--locked build --locked`) reaches
+  `cargo metadata` once; metadata refused the repeat.
+- A selected virtual workspace beside the working directory is readable in the
+  sandbox; Cargo could not find its manifest.
+- Features without a package selection reach `cargo metadata` as given, so an
+  offline build with `-F` no longer needs every optional dependency's source.
+  With `-p`, `--workspace` or `--exclude` every feature is still resolved,
+  and such an invocation offline is refused.
+- A target directory whose parent does not exist yet (`--target-dir
+  artifacts/new`) works; preparing the sandbox listed the missing parent.
+- An empty `CARGO_HOME` falls back to `$HOME/.cargo`, as in Cargo.
+- Tests: the coalescing test synchronizes the two builds through the action
+  lock instead of holding it for a fixed time, and the collection test detects
+  a lock cycle in the kernel's lock table instead of a 60 second deadline.
+
 ## [0.2.10] - 2026-10-14
 
 Three faults below could serve a stale gate hit or lose source.

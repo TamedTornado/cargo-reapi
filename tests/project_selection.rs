@@ -127,9 +127,19 @@ fn cargo_has_short_manifest_option() -> bool {
 /// `source`, and runs it again: both runs must refuse the target, and the
 /// edit must survive.
 fn assert_target_refused_around_an_edit(fixture: &Fixture, project: &Path, source: &Path) {
-    let first = fixture.cargo_reapi(project, &["fetch"]);
+    assert_refused_around_an_edit(fixture, project, source, &["fetch"]);
+}
+
+/// As [`assert_target_refused_around_an_edit`], running `cargo_args`.
+fn assert_refused_around_an_edit(
+    fixture: &Fixture,
+    project: &Path,
+    source: &Path,
+    cargo_args: &[&str],
+) {
+    let first = fixture.cargo_reapi(project, cargo_args);
     fs::write(source, "fn main() { println!(\"edited\"); }\n").expect("edit source");
-    let second = fixture.cargo_reapi(project, &["fetch"]);
+    let second = fixture.cargo_reapi(project, cargo_args);
 
     let text = fs::read_to_string(source).expect("source");
     assert!(text.contains("edited"), "a gate restored over the edit");
@@ -163,6 +173,17 @@ fn a_target_directory_at_inside_or_linked_to_a_source_directory_is_refused() {
         );
 
         assert_target_refused_around_an_edit(&fixture, &project, &project.join("src/main.rs"));
+    }
+
+    // The same targets given on the command line.
+    for target in ["src", "src/out/new", "link"] {
+        let fixture = Fixture::new();
+        let project = fixture.path("project");
+        write_package(&project, "project", "original", "");
+        std::os::unix::fs::symlink("src", project.join("link")).expect("link to src");
+        let arguments = ["fetch", "--target-dir", target];
+
+        assert_refused_around_an_edit(&fixture, &project, &project.join("src/main.rs"), &arguments);
     }
 }
 
@@ -211,6 +232,47 @@ fn a_package_selected_through_a_symlink_is_hashed_by_its_real_directory() {
     assert_succeeded(&fixture.cargo_reapi(&outer, &arguments));
 
     assert_eq!(run(&real.join("target/debug/real")), "second");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_dependency_reached_through_a_symlink_is_hashed_by_its_real_directory() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    let real = fixture.path("real");
+    write_package(
+        &project,
+        "project",
+        "unused",
+        "\n[dependencies]\nword={path='link'}\n",
+    );
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"{}\", word::WORD); }\n",
+    )
+    .expect("main source");
+    fs::create_dir_all(real.join("src")).expect("dependency source directory");
+    fs::write(
+        real.join("Cargo.toml"),
+        "[package]\nname='word'\nversion='0.0.0'\nedition='2024'\n",
+    )
+    .expect("dependency manifest");
+    let write_word = |word: &str| {
+        fs::write(
+            real.join("src/lib.rs"),
+            format!("pub const WORD: &str = \"{word}\";\n"),
+        )
+        .expect("dependency source");
+    };
+    write_word("first");
+    std::os::unix::fs::symlink("../real", project.join("link")).expect("link to real");
+
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    assert_eq!(run(&project.join("target/debug/project")), "first");
+    write_word("second");
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+
+    assert_eq!(run(&project.join("target/debug/project")), "second");
 }
 
 #[test]
@@ -361,6 +423,10 @@ fn an_explicitly_empty_feature_value_keeps_the_lockfile_policy() {
         "a --locked build wrote a lockfile"
     );
     assert!(!project.join("Cargo.lock").exists());
+
+    // With the lockfile in place plain Cargo accepts the same invocation.
+    assert_succeeded(&fixture.cargo_reapi(&project, &["generate-lockfile"]));
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build", "-F=", "--locked"]));
 }
 
 #[test]
