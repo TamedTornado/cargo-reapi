@@ -4,6 +4,8 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-14
+
 Three faults below could serve a wrong cache hit. Earlier entries cannot be
 reused: every action key and the gate snapshot schema changed.
 
