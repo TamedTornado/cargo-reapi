@@ -79,7 +79,31 @@ pub struct Selection {
     pub metadata_arguments: Vec<OsString>,
     /// A `--target-dir` option, which overrides every other setting.
     pub target_dir: Option<PathBuf>,
+    /// The subcommand, as given.
+    pub command: Option<String>,
+    /// `--help`, `-h`, `--version`, `-V` or `--list` was given: Cargo answers
+    /// without building anything.
+    pub informational: bool,
 }
+
+impl Selection {
+    /// Whether the invocation builds or runs the selected project, the only
+    /// commands cargo-reapi caches. Everything else, and `--help` and
+    /// `--version`, is Cargo's alone.
+    pub fn is_cacheable(&self) -> bool {
+        !self.informational
+            && self
+                .command
+                .as_deref()
+                .is_some_and(|command| CACHEABLE_COMMANDS.contains(&command))
+    }
+}
+
+/// The commands whose builds cargo-reapi caches, with Cargo's built-in
+/// aliases for them.
+const CACHEABLE_COMMANDS: [&str; 12] = [
+    "bench", "build", "b", "check", "c", "clippy", "doc", "d", "run", "r", "test", "t",
+];
 
 /// Reads what `cargo_args`, run in `cwd`, select, or explains why
 /// cargo-reapi cannot tell exactly.
@@ -91,6 +115,7 @@ pub fn select(cwd: &Path, cargo_args: &[OsString]) -> Result<Selection> {
         return reader.finish();
     };
     refuse_user_alias(cwd, &command)?;
+    reader.command = Some(command);
 
     while let Some(argument) = remaining.next() {
         if argument == "--" {
@@ -131,6 +156,13 @@ fn refuse_user_alias(cwd: &Path, command: &str) -> Result<()> {
 
 type Remaining<'a> = std::iter::Peekable<std::slice::Iter<'a, OsString>>;
 
+/// `--all-features` and `--no-default-features`.
+#[derive(Default)]
+struct FeatureFlags {
+    all: bool,
+    no_default: bool,
+}
+
 struct Reader<'a> {
     cwd: &'a Path,
     manifest_path: Option<OsString>,
@@ -138,10 +170,11 @@ struct Reader<'a> {
     /// given, since `cargo metadata` refuses a repeated flag.
     lockfile_policy: BTreeSet<&'static str>,
     features: Vec<OsString>,
-    all_features: bool,
-    no_default_features: bool,
+    features_flags: FeatureFlags,
     selects_packages: bool,
     target_dir: Option<PathBuf>,
+    command: Option<String>,
+    informational: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -151,10 +184,11 @@ impl<'a> Reader<'a> {
             manifest_path: None,
             lockfile_policy: BTreeSet::new(),
             features: Vec::new(),
-            all_features: false,
-            no_default_features: false,
+            features_flags: FeatureFlags::default(),
             selects_packages: false,
             target_dir: None,
+            command: None,
+            informational: false,
         }
     }
 
@@ -175,6 +209,7 @@ impl<'a> Reader<'a> {
                          put the subcommand first and spell the command out"
                     );
                 }
+                self.informational |= shorts.contains(['V', 'h']);
             } else {
                 return Ok(Some(text.to_owned()));
             }
@@ -185,7 +220,8 @@ impl<'a> Reader<'a> {
     fn global_long(&mut self, long: &str, remaining: &mut Remaining<'_>) -> Result<()> {
         let (name, attached) = split_long(long);
         match name {
-            "verbose" | "quiet" | "version" | "help" | "list" => {}
+            "verbose" | "quiet" => {}
+            "version" | "help" | "list" => self.informational = true,
             "locked" | "frozen" | "offline" => self.lockfile_flag(name),
             "color" => {
                 if attached.is_none() {
@@ -227,10 +263,15 @@ impl<'a> Reader<'a> {
 
         match name {
             "locked" | "frozen" | "offline" => self.lockfile_flag(name),
+            "help" | "version" => self.informational = true,
+            "ignore-rust-version" => bail!(
+                "cargo-reapi does not cache `--ignore-rust-version`, which changes how Cargo \
+                 selects dependencies"
+            ),
             "manifest-path" => self.manifest_path(attached_or_next(remaining))?,
             "features" => self.features.extend(attached_or_next(remaining)),
-            "all-features" => self.all_features = true,
-            "no-default-features" => self.no_default_features = true,
+            "all-features" => self.features_flags.all = true,
+            "no-default-features" => self.features_flags.no_default = true,
             "package" => {
                 if attached.is_none() {
                     remaining.next_if(|next| !is_option(next));
@@ -258,6 +299,8 @@ impl<'a> Reader<'a> {
         let rest = characters.as_str();
 
         if !VALUE_SHORTS.contains(&first) {
+            self.informational |=
+                shorts.chars().all(|short| "vqVh".contains(short)) && shorts.contains(['V', 'h']);
             if let Some(short) = rest.chars().find(|short| VALUE_SHORTS.contains(short)) {
                 bail!(
                     "cargo-reapi cannot read `-{shorts}` exactly; give `-{short}` as its own \
@@ -337,7 +380,14 @@ impl<'a> Reader<'a> {
         if let Some(manifest_path) = self.manifest_path {
             arguments.extend([OsString::from("--manifest-path"), manifest_path]);
         }
-        arguments.extend(self.lockfile_policy.iter().map(OsString::from));
+        // Preparing the project must never write the lockfile: with
+        // `--locked`, a missing or outdated one fails metadata instead.
+        // `--frozen` implies it.
+        let mut policy = self.lockfile_policy.clone();
+        if !policy.contains("--frozen") {
+            policy.insert("--locked");
+        }
+        arguments.extend(policy.iter().map(OsString::from));
         let offline = ["--frozen", "--offline"]
             .iter()
             .any(|flag| self.lockfile_policy.contains(flag));
@@ -348,7 +398,7 @@ impl<'a> Reader<'a> {
             .filter(|value| !value.is_empty())
             .collect();
         let selects_features =
-            !features.is_empty() || self.all_features || self.no_default_features;
+            !features.is_empty() || self.features_flags.all || self.features_flags.no_default;
         if selects_features && self.selects_packages {
             // `cargo metadata` has no package selection, so it cannot apply
             // features to the packages selected with -p, --workspace or
@@ -369,10 +419,10 @@ impl<'a> Reader<'a> {
             for value in features {
                 arguments.extend([OsString::from("--features"), value]);
             }
-            if self.all_features {
+            if self.features_flags.all {
                 arguments.push(OsString::from("--all-features"));
             }
-            if self.no_default_features {
+            if self.features_flags.no_default {
                 arguments.push(OsString::from("--no-default-features"));
             }
         }
@@ -380,6 +430,8 @@ impl<'a> Reader<'a> {
         Ok(Selection {
             metadata_arguments: arguments,
             target_dir: self.target_dir,
+            command: self.command,
+            informational: self.informational,
         })
     }
 }
@@ -450,7 +502,7 @@ mod tests {
 
     #[test]
     fn manifest_short_options_are_read_separated_and_attached() {
-        let manifest = arguments(&["--manifest-path", "tool/Cargo.toml"]);
+        let manifest = arguments(&["--manifest-path", "tool/Cargo.toml", "--locked"]);
         for words in [
             &["build", "-m", "tool/Cargo.toml"][..],
             &["build", "-mtool/Cargo.toml"],
@@ -462,7 +514,10 @@ mod tests {
         }
 
         // `-p`'s value is a package, not a manifest.
-        assert!(metadata_arguments(&["build", "-p", "m"]).is_empty());
+        assert_eq!(
+            metadata_arguments(&["build", "-p", "m"]),
+            arguments(&["--locked"])
+        );
     }
 
     #[test]
@@ -479,7 +534,7 @@ mod tests {
         }
         assert_eq!(
             metadata_arguments(&["build", "-F=", "--manifest-path", "tool/Cargo.toml"]),
-            arguments(&["--manifest-path", "tool/Cargo.toml"])
+            arguments(&["--manifest-path", "tool/Cargo.toml", "--locked"])
         );
     }
 
@@ -586,6 +641,53 @@ mod tests {
         ] {
             refusal(words);
         }
+    }
+
+    #[test]
+    fn metadata_never_writes_the_lockfile() {
+        assert_eq!(metadata_arguments(&["build"]), arguments(&["--locked"]));
+        assert_eq!(
+            metadata_arguments(&["build", "--frozen"]),
+            arguments(&["--frozen"])
+        );
+    }
+
+    #[test]
+    fn only_builds_that_are_not_asking_for_help_are_cacheable() {
+        let cacheable = |words: &[&str]| {
+            select(Path::new("/"), &arguments(words))
+                .unwrap_or_else(|error| panic!("{words:?}: {error:#}"))
+                .is_cacheable()
+        };
+        for words in [
+            &["build"][..],
+            &["check", "--workspace"],
+            &["test", "--", "--help"],
+            &["--locked", "run", "--", "--version"],
+            &["doc"],
+            &["bench"],
+        ] {
+            assert!(cacheable(words), "{words:?}");
+        }
+        for words in [
+            &["build", "--help"][..],
+            &["build", "-h"],
+            &["--version"],
+            &["-V"],
+            &["--list"],
+            &["metadata", "--no-deps"],
+            &["fetch"],
+            &["install", "--path", "../tool"],
+            &["help", "build"],
+            &["update"],
+        ] {
+            assert!(!cacheable(words), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn ignoring_the_rust_version_changes_dependency_selection_and_is_refused() {
+        assert!(refusal(&["build", "--ignore-rust-version"]).contains("--ignore-rust-version"));
     }
 
     #[test]

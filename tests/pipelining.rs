@@ -5,6 +5,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -129,6 +131,7 @@ fn write_worktree(root: &Path, dependency: &Path) {
 }
 
 fn pipelined_build(root: &Path, cache: &Path, shim: &Path, real_rustc: &Path) -> Build {
+    common::ensure_lockfile(root);
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(root)

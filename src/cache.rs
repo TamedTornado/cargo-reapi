@@ -180,6 +180,7 @@ fn execute_cached_regular(
     environment: &CompileEnvironment,
 ) -> Result<Resolution> {
     let (lock, coalesced) = lock_action(cache_options, &prepared.action_key)?;
+    #[cfg(feature = "test-hooks")]
     hold_test_producer_lock(coalesced);
 
     let result = finish_cached_execution(
@@ -211,6 +212,7 @@ fn lock_action(options: &CacheOptions, action_key: &str) -> Result<(File, bool)>
     let coalesced = match lock.try_lock_exclusive() {
         Ok(()) => false,
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            #[cfg(feature = "test-hooks")]
             if let Some(signal) = test_coalesce_signal() {
                 fs::write(&signal, b"")
                     .with_context(|| format!("signalling {}", signal.display()))?;
@@ -227,18 +229,20 @@ fn lock_action(options: &CacheOptions, action_key: &str) -> Result<(File, bool)>
     Ok((lock, coalesced))
 }
 
-/// Test synchronization for coalescing, only under
-/// `CARGO_REAPI_ACTION_CACHE_TEST_MODE`: a file that a process finding an
-/// action's lock held creates before it waits, and that the action's
-/// producer waits for before it executes. Two identical builds then
-/// coalesce however their processes are scheduled.
+/// Test synchronization for coalescing, compiled only with the
+/// `test-hooks` feature, which only the integration tests enable: a file
+/// named by `CARGO_REAPI_ACTION_CACHE_TEST_COALESCE_SIGNAL` that a process
+/// finding an action's lock held creates before it waits, and that the
+/// action's producer waits for before it executes. Two identical builds
+/// then coalesce however their processes are scheduled.
+#[cfg(feature = "test-hooks")]
 fn test_coalesce_signal() -> Option<PathBuf> {
-    std::env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE")?;
     std::env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_COALESCE_SIGNAL").map(PathBuf::from)
 }
 
 /// Holds a producer's action lock until another process waits on it; see
 /// [`test_coalesce_signal`].
+#[cfg(feature = "test-hooks")]
 fn hold_test_producer_lock(coalesced: bool) {
     if coalesced {
         return;

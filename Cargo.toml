@@ -37,6 +37,16 @@ walkdir = "2.5"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+[features]
+# Test synchronization hooks. Only the integration tests that need them
+# enable it (`cargo test --features test-hooks`); a release build never has it.
+test-hooks = []
+
+[[test]]
+name = "coalescing"
+path = "tests/coalescing.rs"
+required-features = ["test-hooks"]
+
 [lints.clippy]
 all = "warn"
 pedantic = "warn"

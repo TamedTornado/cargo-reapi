@@ -307,13 +307,34 @@ fail the gate and publish no snapshot. `--snapshot-policy off` is an explicit
 uncached compatibility mode, not a fallback: strict mode never silently
 degrades when the provider or an OS primitive is unavailable.
 
+#### What is cached, and what runs as plain Cargo
+
+cargo-reapi caches only what it can prove safe. Everything else runs the
+exact Cargo command you typed, uncached: nothing is restored, recorded or
+wrapped, and cargo-reapi prints one stderr line, `cargo-reapi: not caching
+(<reason>); running Cargo uncached`. A decline is never an error. The checks
+apply only when caching would happen, so `--backend local`, `--backend
+capture` and `--snapshot-policy off` never inherit them. When the invocation
+was resolved far enough for the strict sandbox, the uncached run stays inside
+it; a decline reached before or without a resolved project, or because the
+target overlaps the project, runs Cargo plainly, since nothing is cached there
+and the sandbox exists only to keep cache keys sound.
+
+Only `build`, `check`, `clippy`, `test`, `run`, `bench` and `doc` (and Cargo's
+`b`, `c`, `d`, `r`, `t`) are cached. Any other command, and `--help`,
+`-h`, `--version`, `-V` and `--list`, run as plain Cargo before any metadata
+run, so they never fetch, resolve or write a lockfile.
+
 Because the sandboxed Cargo runs offline, cargo-reapi acquires dependency
-sources first, outside the sandbox: it runs `cargo metadata` for the project
-the invocation selects, so Cargo downloads every package and git checkout it
-resolves and writes the lockfile only when the invocation would. A dependency
-newly added to the selected project, including a separate workspace built with
-`--manifest-path`, is fetched before the build, and `cargo reapi fetch` works
-the same way.
+sources first, outside the sandbox, with `cargo metadata --locked` for the
+project the invocation selects. Preparation never changes the project: with
+`--locked` Cargo cannot write `Cargo.lock`, so a missing lockfile, one that
+would change, or any metadata failure (an offline build whose unrelated
+dev-dependency sources are not cached, say) declines. Create the lockfile
+first (`cargo generate-lockfile`, or any ordinary build), and a cached build
+finds it. An alternate lockfile (`CARGO_RESOLVER_LOCKFILE_PATH` or
+`resolver.lockfile-path`) and `--ignore-rust-version`, which changes how
+dependencies are selected, also decline.
 
 cargo-reapi does not emulate Cargo's command line or configuration. It reads
 the plain option forms Cargo documents, separated or attached: the manifest
@@ -325,19 +346,16 @@ the plain option forms Cargo documents, separated or attached: the manifest
 package selection reach `cargo metadata` as given, so an offline build
 acquires only what its features need. With a package selection `cargo
 metadata` cannot apply them as Cargo does, so it resolves every feature, and
-such an invocation with `--offline` or `--frozen` is refused.
+such an invocation with `--offline` or `--frozen` declines.
 
-Whatever it cannot read exactly is refused, with a message saying what to
-spell out instead:
+Whatever it cannot read exactly declines, with the reason in the line above:
 
 - a user-defined alias, from `[alias]` in any Cargo configuration file or a
   `CARGO_ALIAS_<NAME>` variable, including one that redefines a built-in alias
   such as `b`. Cargo's own commands and its unredefined built-in aliases
-  (`b`, `c`, `d`, `r`, `rm`, `t`) run as usual;
-- a command that is not one of Cargo's own, such as `b` or `clippy`, when a
-  configuration file that could define it as an alias cannot be read
-  completely, as when it `include`s another file, which cargo-reapi does not
-  follow;
+  (`b`, `c`, `d`, `r`, `rm`, `t`) are read as usual;
+- any invocation when a configuration file cannot be read completely, as when
+  it `include`s another file, which cargo-reapi does not follow;
 - `--config`, except `KEY=VALUE` overrides of `profile.*`, `term.*` and
   `build.jobs`, which cannot change the project, sources, lockfile or target
   directory;
@@ -348,20 +366,47 @@ spell out instead:
 - a cluster of short options that holds one taking a value, such as `-qm`.
 
 The target directory is `--target-dir`, else `CARGO_TARGET_DIR`, else the one
-Cargo reports for the selected project, so a `--manifest-path` workspace
-builds into its own `target` as under plain Cargo. A whole-gate snapshot
-restores the target whole, so a gated build compares the target with every
-source after resolving symlinks, including the target's deepest existing
-ancestor when it does not exist yet. It refuses a target that is or contains
-the working directory, the selected workspace, any package in the resolve
-(path dependencies outside the workspace included), any directory holding a
-package's target sources (`src`, `src/bin`, `examples`, `tests`, `benches`)
-or a declared input, and one that lies inside such a source directory or a
-declared input. The gate key hashes the selected workspace root and every
-local package by its real directory, so a package reached through a symlink,
-one beneath a directory named `target`, or a virtual workspace beside the
-working directory is hashed even though the working directory's scan does not
-reach it.
+Cargo reports for the selected project. A whole-gate snapshot restores the
+target, which the gate does not hash, so its canonical path (symlinks
+resolved, the deepest existing ancestor for a directory not created yet) must
+be disjoint, in both directions, from the working directory, the selected
+workspace, every package in the resolve (path dependencies outside the
+workspace included), every directory holding a package's target sources
+(`src`, `src/bin`, `examples`, `tests`, `benches`) and every declared input.
+Anything else declines. The one exception is Cargo's own default,
+`<workspace root>/target`, which Cargo owns: `moria_cargo`'s
+`CARGO_TARGET_DIR=<checkout>/target` is exactly that. A directory named
+`target` anywhere else is ordinary source. This means a root package that
+wants an overlapping layout (`target-dir = "."` or `"data"`) must use an
+external target directory to be cached.
+
+#### What the gate key hashes
+
+The gate key hashes the selected workspace root, the working directory and
+every local package by its real directory, with no exclusion by name: only the
+canonical target directory itself and the action log are left out. A directory
+named `target` inside a source tree is hashed, and so is a package reached
+through a symlink or a virtual workspace beside the working directory.
+
+`.git` is hashed too, in full, except its `objects` and `logs` directories and
+the same two inside each submodule's gitdir under `.git/modules`. Build scripts
+that run `git describe` or `git rev-parse HEAD` read repository state; `HEAD`,
+refs, `packed-refs`, the index, `config` and `.git/worktrees` pin what any
+object read returns, because objects are named by their content, and logs only
+record history. A new commit therefore misses, and repacking objects
+(`git repack -ad`) does not. A `.git` that is a file, as in a linked worktree,
+is hashed as an ordinary file; the real gitdir lies outside the workspace,
+which the sandbox does not make readable. The cost is spurious misses in a
+main clone when `git status` refreshes the index, which is sound.
+
+A gate hit never trusts its marker alone. Restoring a snapshot records the
+identity (size, modification and change time, inode) of every file it wrote.
+The next gate checks them all; any output another Cargo run in the same target
+directory replaced, changed or deleted, such as a plain `cargo build
+--features extra`, fails the check and restores the snapshot again.
+Restoration writes only the paths the snapshot holds, removes what stands
+there first, and fails, declining the build, if a symlinked directory would
+send a write outside the target.
 
 ### Compile environment
 

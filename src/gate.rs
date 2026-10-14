@@ -20,7 +20,7 @@ use crate::relocation::{RecordedPathMapping, execution_slot};
 #[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 17;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 18;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct GateSnapshotManifest {
@@ -46,6 +46,108 @@ struct ObservedGateInput {
     kind: String,
     name: String,
     sha256: String,
+}
+
+/// What a gate restored into the target: the snapshot key and the identity
+/// of every file it wrote.
+#[derive(Debug, Deserialize, Serialize)]
+struct TargetMarker {
+    key: String,
+    outputs: BTreeMap<PathBuf, FileIdentity>,
+}
+
+/// What identifies one file or link as the one a restore wrote: replacing
+/// it, even with the same bytes and timestamps, changes its inode or change
+/// time.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+    inode: u64,
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            mtime_ns: i128::from(metadata.mtime()) * 1_000_000_000
+                + i128::from(metadata.mtime_nsec()),
+            ctime_ns: i128::from(metadata.ctime()) * 1_000_000_000
+                + i128::from(metadata.ctime_nsec()),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn of(metadata: &fs::Metadata) -> Self {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| i128::try_from(elapsed.as_nanos()).unwrap_or(0));
+        Self {
+            len: metadata.len(),
+            mtime_ns: modified,
+            ctime_ns: 0,
+            inode: 0,
+        }
+    }
+}
+
+/// The files and links a snapshot holds, relative to its target tree: the
+/// only paths restoring it may write.
+fn produced_paths(snapshot_target: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(snapshot_target).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_dir() {
+            paths.push(entry.path().strip_prefix(snapshot_target)?.to_path_buf());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Removes what stands at each produced path in `target`, so the restore
+/// replaces those paths and nothing else. A symlinked directory on the way
+/// would send a write outside the target, so it fails the restore.
+fn clear_destinations(target: &Path, produced: &[PathBuf]) -> Result<()> {
+    for path in produced {
+        let mut current = target.to_path_buf();
+        let mut exists = true;
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            current.push(component);
+            let is_last = components.peek().is_none();
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if is_last => {
+                    if metadata.is_dir() {
+                        fs::remove_dir_all(&current)?;
+                    } else {
+                        fs::remove_file(&current)?;
+                    }
+                }
+                Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                    "{} is a symlink inside the target directory; restoring would write through it",
+                    current.display()
+                ),
+                Ok(metadata) if !metadata.is_dir() => {
+                    fs::remove_file(&current)?;
+                    exists = false;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => exists = false,
+                Err(error) => return Err(error).with_context(|| current.display().to_string()),
+            }
+            if !exists {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A durable snapshot of Cargo's complete target state for one exact logical gate.
@@ -285,7 +387,7 @@ impl GateSnapshot {
             .file_name()
             .and_then(|name| name.to_str())
             .context("selected gate snapshot has no key")?;
-        if self.target_marker_matches(selected_key) {
+        if self.target_matches_marker(selected_key) {
             self.restored = true;
             self.marker_hit = true;
             return Ok(());
@@ -301,6 +403,8 @@ impl GateSnapshot {
             );
         }
         fs::create_dir_all(&self.target)?;
+        let produced = produced_paths(&selected.join("target"))?;
+        clear_destinations(&self.target, &produced)?;
         let clone_started = Instant::now();
         self.clone_method = clone_tree(&selected.join("target"), &self.target)?.name();
         self.clone_ms = clone_started.elapsed().as_millis();
@@ -313,13 +417,13 @@ impl GateSnapshot {
             &self.resource_ledger,
         )?;
         self.relocation_ms = relocation_started.elapsed().as_millis();
-        self.write_target_marker(&manifest.key)?;
+        self.write_target_marker(&manifest.key, &produced)?;
         self.restored = true;
         Ok(())
     }
 
     fn target_marker(&self) -> PathBuf {
-        self.target.join("cargo-reapi/gate-state-v16")
+        self.target.join("cargo-reapi/gate-state-v18")
     }
 
     fn invalidate_target_freshness(&self) -> Result<()> {
@@ -353,16 +457,42 @@ impl GateSnapshot {
         Ok(())
     }
 
-    fn target_marker_matches(&self, selected_key: &str) -> bool {
-        fs::read_to_string(self.target_marker()).is_ok_and(|key| key.trim() == selected_key)
+    /// Whether the target still holds exactly what the marker says this
+    /// gate restored. The marker alone proves nothing: another Cargo run in
+    /// the same target directory can replace, change or delete outputs
+    /// without touching it, so every output's recorded identity must match.
+    fn target_matches_marker(&self, selected_key: &str) -> bool {
+        let Ok(bytes) = fs::read(self.target_marker()) else {
+            return false;
+        };
+        let Ok(marker) = serde_json::from_slice::<TargetMarker>(&bytes) else {
+            return false;
+        };
+        marker.key == selected_key
+            && marker.outputs.iter().all(|(path, recorded)| {
+                fs::symlink_metadata(self.target.join(path))
+                    .is_ok_and(|metadata| FileIdentity::of(&metadata) == *recorded)
+            })
     }
 
-    fn write_target_marker(&self, selected_key: &str) -> Result<()> {
+    fn write_target_marker(&self, selected_key: &str, produced: &[PathBuf]) -> Result<()> {
+        let mut outputs = BTreeMap::new();
+        for path in produced {
+            let metadata = fs::symlink_metadata(self.target.join(path))
+                .with_context(|| format!("recording restored output {}", path.display()))?;
+            outputs.insert(path.clone(), FileIdentity::of(&metadata));
+        }
         let marker = self.target_marker();
         if let Some(parent) = marker.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(marker, selected_key)?;
+        fs::write(
+            marker,
+            serde_json::to_vec(&TargetMarker {
+                key: selected_key.to_owned(),
+                outputs,
+            })?,
+        )?;
         Ok(())
     }
 
@@ -403,7 +533,7 @@ fn gate_key(scope: &GateScope<'_>, learned_environment: &str) -> Result<String> 
     } = *scope;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"cargo-reapi-gate-state-v17\0");
+    hasher.update(b"cargo-reapi-gate-state-v18\0");
     hash_field(&mut hasher, b"learned-environment");
     hash_field(&mut hasher, learned_environment.as_bytes());
     hash_field(&mut hasher, std::env::consts::OS.as_bytes());
@@ -545,13 +675,34 @@ fn hash_declared_inputs(
 }
 
 /// Whether [`hash_tree`] skips `path`, and everything beneath it, when it
-/// meets it below the root it walks.
+/// meets it below the root it walks. Nothing is skipped by name: the
+/// target directory itself, the action log and the bulk of a Git directory
+/// only (see [`is_git_bulk`]).
 fn excluded_from_tree(path: &Path, target: &Path, action_log: &Path) -> bool {
-    path.starts_with(target)
-        || path == action_log
-        || path
-            .file_name()
-            .is_some_and(|name| name == ".git" || name == "target")
+    path.starts_with(target) || path == action_log || is_git_bulk(path)
+}
+
+/// Whether `path` is the `objects` or `logs` directory of a Git directory:
+/// `.git`, or a submodule's under `.git/modules`. Build scripts that run
+/// `git describe` or `git rev-parse` read repository state, so everything
+/// else in `.git`, including `HEAD`, refs, `packed-refs`, the index,
+/// `config` and `worktrees`, is hashed. Objects are named by their content,
+/// so those refs and the index fix what any object read returns, and logs
+/// only record history; repacking or collecting objects changes neither.
+pub fn is_git_bulk(path: &Path) -> bool {
+    let is_bulk_name = path
+        .file_name()
+        .is_some_and(|name| name == "objects" || name == "logs");
+    if !is_bulk_name {
+        return false;
+    }
+    let Some(git_directory) = path.parent() else {
+        return false;
+    };
+    git_directory.join("HEAD").is_file()
+        && path
+            .ancestors()
+            .any(|ancestor| ancestor.file_name().is_some_and(|name| name == ".git"))
 }
 
 /// Whether hashing the tree at `root` already hashed everything at `path`:
@@ -1537,6 +1688,70 @@ fn copy_tree_portable(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restoring_replaces_only_produced_paths_and_never_writes_through_a_link() {
+        let root = tempfile::tempdir().expect("root");
+        let target = root.path().join("target");
+        fs::create_dir_all(target.join("debug")).expect("debug");
+        fs::write(target.join("debug/exe"), "other run").expect("exe");
+        fs::write(target.join("debug/unrelated"), "keep").expect("unrelated");
+        let produced = [PathBuf::from("debug/exe"), PathBuf::from("debug/new")];
+
+        super::clear_destinations(&target, &produced).expect("cleared");
+
+        assert!(!target.join("debug/exe").exists());
+        assert_eq!(
+            fs::read(target.join("debug/unrelated")).expect("kept"),
+            b"keep"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = root.path().join("outside");
+            fs::create_dir_all(&outside).expect("outside");
+            fs::write(outside.join("exe"), "user data").expect("outside file");
+            fs::remove_dir_all(target.join("debug")).expect("remove debug");
+            std::os::unix::fs::symlink(&outside, target.join("debug")).expect("link");
+
+            assert!(super::clear_destinations(&target, &produced).is_err());
+            assert_eq!(
+                fs::read(outside.join("exe")).expect("untouched"),
+                b"user data"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_bulk_of_a_git_directory_is_left_out_of_the_hash() {
+        let root = tempfile::tempdir().expect("root");
+        let git = root.path().join(".git");
+        let submodule = git.join("modules/deep/name");
+        for directory in [&git, &submodule] {
+            fs::create_dir_all(directory.join("objects")).expect("objects");
+            fs::create_dir_all(directory.join("logs")).expect("logs");
+            fs::create_dir_all(directory.join("refs")).expect("refs");
+            fs::write(directory.join("HEAD"), "ref: refs/heads/main").expect("HEAD");
+        }
+        fs::create_dir_all(git.join("worktrees/linked/logs")).expect("worktree");
+        let source_objects = root.path().join("src/objects");
+        fs::create_dir_all(&source_objects).expect("source objects");
+
+        for bulk in ["objects", "logs"] {
+            assert!(super::is_git_bulk(&git.join(bulk)));
+            assert!(super::is_git_bulk(&submodule.join(bulk)));
+        }
+        for kept in [
+            git.join("refs"),
+            git.join("HEAD"),
+            git.join("modules"),
+            git.join("worktrees/linked/logs"),
+            source_objects,
+            root.path().join("target"),
+        ] {
+            assert!(!super::is_git_bulk(&kept), "{kept:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

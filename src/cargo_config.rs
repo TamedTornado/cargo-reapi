@@ -86,6 +86,24 @@ pub fn defines_alias(cwd: &Path, name: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// The file setting `resolver.lockfile-path`, if any. Cargo then reads and
+/// writes its lockfile elsewhere, which cargo-reapi neither hashes nor
+/// protects. Fails when a file cannot be read completely.
+pub fn sets_lockfile_path(cwd: &Path) -> Result<Option<String>> {
+    for path in files(cwd) {
+        let layer = read_file(&path)?;
+        let set = layer
+            .table
+            .get("resolver")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|resolver| resolver.contains_key("lockfile-path"));
+        if set {
+            return Ok(Some(layer.origin));
+        }
+    }
+    Ok(None)
+}
+
 fn read_file(path: &Path) -> Result<Layer> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading Cargo configuration {}", path.display()))?;

@@ -416,28 +416,39 @@ fn describe_compile_environment(
 }
 
 fn run_cli(cli: &Cli) -> Result<i32> {
+    let context = resolve_driver_context(cli)?;
+    if let Some(reason) = &context.decline {
+        return run_uncached(cli, &context, reason);
+    }
+    // Compiles run in their package's directory, so a relative log would
+    // land beside each package rather than where the caller asked.
+    let action_log = cli.action_log.as_ref().map_or_else(
+        || context.target_root.join("cargo-reapi/actions.jsonl"),
+        |path| context.workspace_root.join(path),
+    );
+    let action_log_for_snapshot = action_log.clone();
+    let cache_dir = cli.cache_dir.clone();
+    // The project is resolved exactly when the strict sandbox is used. A
+    // gate that cannot be prepared hands the command to Cargo.
+    let mut gate_snapshot = match prepare_gate(
+        cli,
+        &context.workspace_root,
+        &context.target_root,
+        &action_log_for_snapshot,
+        context.project.as_ref(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return run_uncached(cli, &context, &one_line(&format!("{error:#}")));
+        }
+    };
     let DriverContext {
         executable,
         workspace_root,
         target_root,
         project,
-    } = resolve_driver_context(cli)?;
-    // Compiles run in their package's directory, so a relative log would
-    // land beside each package rather than where the caller asked.
-    let action_log = cli.action_log.as_ref().map_or_else(
-        || target_root.join("cargo-reapi/actions.jsonl"),
-        |path| workspace_root.join(path),
-    );
-    let action_log_for_snapshot = action_log.clone();
-    let cache_dir = cli.cache_dir.clone();
-    // The project is resolved exactly when the strict sandbox is used.
-    let mut gate_snapshot = prepare_gate(
-        cli,
-        &workspace_root,
-        &target_root,
-        &action_log_for_snapshot,
-        project.as_ref(),
-    )?;
+        decline: _,
+    } = context;
     if let Some(snapshot) = gate_snapshot.as_ref()
         && snapshot.is_restored()
     {
@@ -451,29 +462,13 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         drop(gate_snapshot);
         return restart_installed(&executable);
     }
-    let hermetic = if project.is_some() {
-        crate::hermetic::cargo_command(
-            SnapshotPolicy::Strict,
-            &workspace_root,
-            &target_root,
-            cache_dir
-                .as_deref()
-                .context("cache directory is required")?,
-            &action_log_for_snapshot,
-            &cli.declared_inputs,
-            project.as_ref(),
-        )?
-    } else {
-        crate::hermetic::cargo_command(
-            SnapshotPolicy::Off,
-            &workspace_root,
-            &target_root,
-            cache_dir.as_deref().unwrap_or(&target_root),
-            &action_log_for_snapshot,
-            &[],
-            None,
-        )?
-    };
+    let hermetic = cached_cargo_command(
+        cli,
+        &workspace_root,
+        &target_root,
+        &action_log_for_snapshot,
+        project.as_ref(),
+    )?;
     let mut cargo = hermetic.command;
     if matches!(cli.backend, Backend::Cache | Backend::Reapi) {
         ResourceCapacity::from_env()?.apply_to(&mut cargo);
@@ -520,6 +515,40 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         &action_log_for_snapshot,
     )?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// The Cargo command for a cached run: inside the strict sandbox when the
+/// project was resolved for it.
+fn cached_cargo_command(
+    cli: &Cli,
+    workspace_root: &Path,
+    target_root: &Path,
+    action_log: &Path,
+    project: Option<&Project>,
+) -> Result<crate::hermetic::HermeticCargo> {
+    if project.is_some() {
+        crate::hermetic::cargo_command(
+            SnapshotPolicy::Strict,
+            workspace_root,
+            target_root,
+            cli.cache_dir
+                .as_deref()
+                .context("cache directory is required")?,
+            action_log,
+            &cli.declared_inputs,
+            project,
+        )
+    } else {
+        crate::hermetic::cargo_command(
+            SnapshotPolicy::Off,
+            workspace_root,
+            target_root,
+            cli.cache_dir.as_deref().unwrap_or(target_root),
+            action_log,
+            &[],
+            None,
+        )
+    }
 }
 
 /// The whole-gate snapshot for a cache build in the strict sandbox.
@@ -576,6 +605,17 @@ struct DriverContext {
     target_root: PathBuf,
     /// The selected project, resolved for the strict sandbox and its gate.
     project: Option<Project>,
+    /// Why this invocation is not cached, when it is not: the invocation
+    /// runs as plain Cargo.
+    decline: Option<String>,
+}
+
+/// What the preflight of a cached invocation learned before it declined or
+/// finished.
+#[derive(Default)]
+struct Preflight {
+    project: Option<Project>,
+    target_root: Option<PathBuf>,
 }
 
 fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
@@ -585,44 +625,139 @@ fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
         .context("resolving cargo-reapi executable")?;
     let workspace_root =
         crate::project::canonical(&env::current_dir().context("locating Cargo workspace root")?)?;
-    let selection = crate::selection::select(&workspace_root, &cli.cargo_args)?;
 
     let snapshots: SnapshotPolicy = cli.snapshot_policy.into();
-    let project = if matches!(cli.backend, Backend::Cache) && snapshots == SnapshotPolicy::Strict {
-        let cache_dir = cli
-            .cache_dir
-            .as_deref()
-            .context("cache directory is required")?;
-        Some(Project::resolve(
-            &workspace_root,
-            cache_dir,
-            &selection.metadata_arguments,
-        )?)
-    } else {
-        None
-    };
-
-    let cargo_target = match &project {
-        Some(project) => Some(project.target_directory.clone()),
-        None => crate::project::target_directory(&workspace_root, &selection.metadata_arguments),
-    };
-    let configured = selection
-        .target_dir
-        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
-        .or(cargo_target);
-    let target_root = resolve_target_root_from(&workspace_root, configured)?;
-
-    validate_driver_paths(&executable, &target_root)?;
-    if let Some(project) = &project {
-        project.validate_target(&workspace_root, &target_root, &cli.declared_inputs)?;
+    if matches!(cli.backend, Backend::Cache) && snapshots == SnapshotPolicy::Strict {
+        let mut preflight = Preflight::default();
+        let decline = prepare_cached_project(cli, &workspace_root, &executable, &mut preflight)
+            .err()
+            .map(|error| one_line(&format!("{error:#}")));
+        let target_root = match preflight.target_root {
+            Some(target_root) => target_root,
+            None => resolve_target_root_from(&workspace_root, None)?,
+        };
+        return Ok(DriverContext {
+            executable,
+            workspace_root,
+            target_root,
+            project: preflight.project,
+            decline,
+        });
     }
+
+    // Local, capture and snapshot-free runs cache nothing at the gate, so
+    // the restrictions that keep it sound do not apply. The selection only
+    // locates the target directory, where Cargo's own answer for the
+    // working directory serves when it cannot be read.
+    let (metadata_arguments, target_dir) =
+        crate::selection::select(&workspace_root, &cli.cargo_args)
+            .map(|selection| (selection.metadata_arguments, selection.target_dir))
+            .unwrap_or_default();
+    let configured = target_dir
+        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
+        .or_else(|| crate::project::target_directory(&workspace_root, &metadata_arguments));
+    let target_root = resolve_target_root_from(&workspace_root, configured)?;
+    validate_driver_paths(&executable, &target_root)?;
 
     Ok(DriverContext {
         executable,
         workspace_root,
         target_root,
-        project,
+        project: None,
+        decline: None,
     })
+}
+
+/// Proves the invocation safe to cache, or says why not. Nothing here
+/// changes the project: metadata runs with `--locked`, so it cannot write
+/// the lockfile.
+fn prepare_cached_project(
+    cli: &Cli,
+    workspace_root: &Path,
+    executable: &Path,
+    preflight: &mut Preflight,
+) -> Result<()> {
+    let selection = crate::selection::select(workspace_root, &cli.cargo_args)?;
+    if !selection.is_cacheable() {
+        bail!(
+            "only build, check, clippy, test, run, bench and doc invocations are cached, and not \
+             --help or --version"
+        );
+    }
+    if env::var_os("CARGO_RESOLVER_LOCKFILE_PATH").is_some() {
+        bail!(
+            "CARGO_RESOLVER_LOCKFILE_PATH moves Cargo's lockfile, which cargo-reapi does not track"
+        );
+    }
+    if let Some(origin) = crate::cargo_config::sets_lockfile_path(workspace_root)? {
+        bail!("{origin} sets resolver.lockfile-path, which moves Cargo's lockfile");
+    }
+
+    if let Some(missing) = cli
+        .declared_inputs
+        .iter()
+        .find(|input| !workspace_root.join(input).exists())
+    {
+        bail!("declared input does not exist: {}", missing.display());
+    }
+
+    let cache_dir = cli
+        .cache_dir
+        .as_deref()
+        .context("cache directory is required")?;
+    let project = Project::resolve(workspace_root, cache_dir, &selection.metadata_arguments)?;
+    let configured = selection
+        .target_dir
+        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| project.target_directory.clone());
+    let target_root = resolve_target_root_from(workspace_root, Some(configured))?;
+    preflight.target_root = Some(target_root.clone());
+
+    // The sandbox policy assumes a target disjoint from the project, so a
+    // project is kept for the uncached run only once its target passes.
+    validate_driver_paths(executable, &target_root)?;
+    project.validate_target(workspace_root, &target_root, &cli.declared_inputs)?;
+    preflight.project = Some(project);
+    Ok(())
+}
+
+/// An error message as one line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Runs the user's exact Cargo command without caching: nothing is
+/// restored, recorded or wrapped. With a resolved project the strict
+/// sandbox still applies; without one no policy can be built and Cargo runs
+/// plainly.
+fn run_uncached(cli: &Cli, context: &DriverContext, reason: &str) -> Result<i32> {
+    eprintln!("cargo-reapi: not caching ({reason}); running Cargo uncached");
+
+    let mut cargo = match &context.project {
+        Some(project) => {
+            let cache_dir = cli
+                .cache_dir
+                .as_deref()
+                .context("cache directory is required")?;
+            let action_log = context.target_root.join("cargo-reapi/actions.jsonl");
+            crate::hermetic::cargo_command(
+                SnapshotPolicy::Strict,
+                &context.workspace_root,
+                &context.target_root,
+                cache_dir,
+                &action_log,
+                &cli.declared_inputs,
+                Some(project),
+            )?
+            .command
+        }
+        None => Command::new("cargo"),
+    };
+    let status = cargo
+        .args(&cli.cargo_args)
+        .status()
+        .context("starting Cargo")?;
+    Ok(status.code().unwrap_or(1))
 }
 
 /// Cargo's target directory, canonical even before Cargo creates it.

@@ -1,4 +1,5 @@
-use std::fmt::Write as _;
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -161,6 +162,7 @@ fn run(
     backend: &str,
     cache_dir: Option<&std::path::Path>,
 ) -> Vec<Value> {
+    common::ensure_lockfile(root);
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
@@ -197,6 +199,7 @@ fn fixture_action(actions: &[Value]) -> &Value {
 }
 
 fn cache_command(root: &Path, cache_dir: &Path) -> (Command, PathBuf) {
+    common::ensure_lockfile(root);
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
@@ -410,6 +413,7 @@ fn run_snapshot_gate_with_inputs(
     trace: Option<&Path>,
     declared_inputs: &[&Path],
 ) -> ExitStatus {
+    common::ensure_lockfile(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
@@ -2362,6 +2366,7 @@ fn restored_action_relocates_integration_test_companion_binary_to_consumer_targe
     assert_eq!(producer_companion["execution"], "local-cache-miss");
     fs::remove_dir_all(&producer).expect("remove producer before consumer");
 
+    common::ensure_lockfile(&consumer);
     let consumer_action_log = consumer.join("target/cargo-reapi/actions.jsonl");
     let consumer_status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(&consumer)
@@ -2526,80 +2531,6 @@ fn shared_cache_restores_identical_action_outputs_across_worktrees() {
     let dep_info = fs::read_to_string(dep_info).expect("read restored dep-info");
     assert!(!dep_info.contains(&first.path().to_string_lossy().to_string()));
     assert!(dep_info.contains(&second.path().to_string_lossy().to_string()));
-}
-
-/// Waits for every child to succeed. A failed child fails the test at once
-/// and stops the others, which may be waiting for it.
-fn wait_for_all(children: &mut [std::process::Child]) {
-    let mut statuses = vec![None; children.len()];
-    while statuses.contains(&None) {
-        for (child, status) in children.iter_mut().zip(&mut statuses) {
-            if status.is_none() {
-                *status = child.try_wait().expect("inspect child");
-            }
-        }
-
-        let failure = statuses
-            .iter()
-            .flatten()
-            .find(|status| !status.success())
-            .copied();
-        if let Some(failure) = failure {
-            for child in children.iter_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            panic!("a cached Cargo action failed: {failure}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-}
-
-#[test]
-fn concurrent_identical_actions_execute_once_and_coalesce_on_the_lock() {
-    let cache = tempdir().expect("shared cache directory");
-    let first = tempdir().expect("first fixture directory");
-    let second = tempdir().expect("second fixture directory");
-    for fixture in [first.path(), second.path()] {
-        write_fixture(fixture, false);
-        let mut source = String::new();
-        for index in 0..8_000 {
-            writeln!(source, "pub fn value_{index}() -> usize {{ {index} }}")
-                .expect("write generated fixture source");
-        }
-        fs::write(fixture.join("src/lib.rs"), source).expect("large fixture source");
-    }
-
-    // Whichever build takes the action's lock holds it until the other
-    // signals that it is waiting on it.
-    let signal = cache.path().join("coalescer-waiting");
-    let (mut first_command, first_log) = cache_command(first.path(), cache.path());
-    let (mut second_command, second_log) = cache_command(second.path(), cache.path());
-    for command in [&mut first_command, &mut second_command] {
-        command.env("CARGO_REAPI_ACTION_CACHE_TEST_COALESCE_SIGNAL", &signal);
-    }
-    let mut builds = [
-        first_command
-            .spawn()
-            .expect("start first cached Cargo action"),
-        second_command
-            .spawn()
-            .expect("start second cached Cargo action"),
-    ];
-    wait_for_all(&mut builds);
-
-    let first_actions = read_actions(&first_log);
-    let second_actions = read_actions(&second_log);
-    let executions = [
-        fixture_action(&first_actions)["execution"]
-            .as_str()
-            .expect("first execution"),
-        fixture_action(&second_actions)["execution"]
-            .as_str()
-            .expect("second execution"),
-    ];
-    assert!(executions.contains(&"local-cache-miss"));
-    assert!(executions.contains(&"coalesced-hit"));
 }
 
 #[test]

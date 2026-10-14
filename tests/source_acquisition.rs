@@ -2,6 +2,8 @@
 //! dependency sources an invocation needs before it starts. These tests
 //! drive real Cargo with a dependency absent from a private `CARGO_HOME`.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -56,6 +58,7 @@ impl Fixture {
     }
 
     fn command(&self, cargo_args: &[&str]) -> Command {
+        common::ensure_lockfile(&self.outer);
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
         command
             .current_dir(&self.outer)
@@ -67,6 +70,19 @@ impl Fixture {
             .arg("--")
             .args(cargo_args);
         command
+    }
+
+    /// Writes the tool's lockfile, which a cached build needs. A throwaway
+    /// `CARGO_HOME` resolves it, so the fixture's own stays without the
+    /// dependency and the invocation still has to acquire it.
+    fn lock_tool(&self) {
+        let status = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(self.outer.join("tool"))
+            .env("CARGO_HOME", self._root.path().join("lock-home"))
+            .status()
+            .expect("run cargo generate-lockfile");
+        assert!(status.success(), "generate-lockfile failed");
     }
 
     fn checkouts(&self) -> PathBuf {
@@ -147,11 +163,14 @@ fn assert_succeeded(output: &Output) {
 #[test]
 fn a_selected_manifest_acquires_its_new_dependencies_before_the_sandbox() {
     let fixture = Fixture::new();
+    fixture.lock_tool();
 
-    let build = fixture.cargo_reapi(&["build", "--manifest-path", "tool/Cargo.toml"]);
+    let build =
+        fixture.cargo_reapi_in_cargos_target(&["build", "--manifest-path", "tool/Cargo.toml"]);
 
     assert_succeeded(&build);
-    let tool = Command::new(fixture.outer.join("target/debug/tool"))
+    assert!(!String::from_utf8_lossy(&build.stderr).contains("not caching"));
+    let tool = Command::new(fixture.outer.join("tool/target/debug/tool"))
         .output()
         .expect("run tool");
     assert_eq!(String::from_utf8_lossy(&tool.stdout).trim(), "42");
@@ -162,12 +181,14 @@ fn a_selected_manifest_acquires_its_new_dependencies_before_the_sandbox() {
 #[test]
 fn a_selected_manifest_builds_into_its_own_target_directory() {
     let fixture = Fixture::new();
+    fixture.lock_tool();
     let tool = fixture.outer.join("tool");
 
     let build =
         fixture.cargo_reapi_in_cargos_target(&["build", "--manifest-path", "tool/Cargo.toml"]);
 
     assert_succeeded(&build);
+    assert!(!String::from_utf8_lossy(&build.stderr).contains("not caching"));
     let binary = Command::new(tool.join("target/debug/tool"))
         .output()
         .expect("run tool from its own target");
@@ -232,6 +253,7 @@ fn the_default_action_log_collects_compiles_run_outside_the_workspace() {
     )
     .expect("app source");
 
+    common::ensure_lockfile(&workspace);
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(&workspace)
         .env_remove("CARGO_TARGET_DIR")

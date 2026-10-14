@@ -73,15 +73,17 @@ impl Project {
         })
     }
 
-    /// Refuses a target directory that overlaps a source. Cargo treats the
-    /// target as disposable output, the gate leaves it out of the inputs it
-    /// hashes, and a gate hit restores it whole, so a target holding or
-    /// inside a source would let a hit overwrite edited source.
+    /// Refuses a target directory that overlaps any project directory. A
+    /// gate hit restores the target whole, and the gate does not hash it, so
+    /// a target holding, or inside, a source would let a hit overwrite edited
+    /// source that plain Cargo never touches.
     ///
-    /// `target` is canonical; see [`canonical`]. It may not contain the
-    /// working directory, the selected workspace, any package (path
-    /// dependencies included) or a declared input, and may not lie inside a
-    /// directory holding target sources or inside a declared input.
+    /// `target` is canonical; see [`canonical`]. Its tree must be disjoint,
+    /// in both directions, from the working directory, the selected
+    /// workspace, every package root, every directory holding target sources
+    /// and every declared input. The one exception is Cargo's own default,
+    /// `<workspace root>/target`, which Cargo owns: a directory named
+    /// `target` anywhere else is ordinary source.
     pub fn validate_target(
         &self,
         cwd: &Path,
@@ -89,38 +91,34 @@ impl Project {
         declared_inputs: &[PathBuf],
     ) -> Result<()> {
         let mut roots = vec![canonical(cwd)?, self.workspace_root.clone()];
-        let mut containers = Vec::new();
         for package in &self.packages {
             roots.push(package.root.clone());
             roots.extend(package.source_directories.iter().cloned());
-            containers.extend(package.source_directories.iter().cloned());
         }
         for input in declared_inputs {
-            let input = canonical(&cwd.join(input))?;
-            roots.push(input.clone());
-            containers.push(input);
+            roots.push(canonical(&cwd.join(input))?);
         }
 
-        if let Some(source) = roots.iter().find(|root| root.starts_with(target)) {
-            bail!(
-                "Cargo's target directory {} contains source {}; cargo-reapi treats the target as \
-                 disposable output it may restore whole, so choose a target directory outside \
-                 every package and input",
-                target.display(),
-                source.display()
-            );
-        }
-        if let Some(source) = containers
-            .iter()
-            .find(|container| target.starts_with(container))
-        {
-            bail!(
-                "Cargo's target directory {} lies inside source {}; cargo-reapi treats the target \
-                 as disposable output it may restore whole, so choose a target directory outside \
-                 every source directory and input",
-                target.display(),
-                source.display()
-            );
+        let cargos_default = target == self.workspace_root.join("target");
+        for root in &roots {
+            if root.starts_with(target) {
+                bail!(
+                    "Cargo's target directory {} contains {}; the target must be disjoint from \
+                     every project directory",
+                    target.display(),
+                    root.display()
+                );
+            }
+            // Cargo owns its default target wherever the workspace sits, so
+            // directories enclosing the workspace do not make it source.
+            if target.starts_with(root) && !cargos_default {
+                bail!(
+                    "Cargo's target directory {} lies inside {}; the target must be disjoint \
+                     from every project directory (only <workspace root>/target, Cargo's own default, is exempt)",
+                    target.display(),
+                    root.display()
+                );
+            }
         }
         Ok(())
     }

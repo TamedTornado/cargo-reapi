@@ -485,7 +485,7 @@ fn discover_inputs(
         for entry in WalkDir::new(input_root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|entry| name == "OUT_DIR" || !is_ignored(entry.path()))
+            .filter_entry(|entry| name == "OUT_DIR" || !is_ignored(entry.path(), &roots.target))
         {
             let entry = entry.context("walking Cargo package inputs")?;
             if entry.file_type().is_file() {
@@ -516,9 +516,11 @@ fn extern_path(value: &OsString) -> Option<PathBuf> {
     text.split_once('=').map(|(_, path)| PathBuf::from(path))
 }
 
-fn is_ignored(path: &Path) -> bool {
-    path.components()
-        .any(|component| matches!(component.as_os_str().to_str(), Some(".git" | "target")))
+/// Whether the walk over a package's files skips `path`: Cargo's target
+/// directory itself, which is output, and the bulk of a Git directory (see
+/// [`crate::gate::is_git_bulk`]). No directory is skipped by its name.
+fn is_ignored(path: &Path, target: &Path) -> bool {
+    path.starts_with(target) || crate::gate::is_git_bulk(path)
 }
 
 fn digest_file(

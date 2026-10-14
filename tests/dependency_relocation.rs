@@ -1,6 +1,8 @@
 //! A dependency's paths embedded in a dependent's artifacts must name the
 //! consumer's copy of that dependency after a cross-worktree cache hit.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,6 +41,7 @@ fn write_workspace(root: &Path) {
 }
 
 fn cached_build(root: &Path, cache: &Path) -> Vec<serde_json::Value> {
+    common::ensure_lockfile(root);
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(root)
