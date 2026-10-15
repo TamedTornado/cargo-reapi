@@ -1,12 +1,15 @@
 # cargo-reapi handoff: per-compile caching (read this first)
 
 State as of 2026-10-15. The narrowing is finished and merged to `main`. The
-native-rule narrowing and scheduling-key fix are merged to `main` at 33892a4
-(see below); the coordinator launched the pre-release review of 33892a4.
-None of it is **released**: the version is still 0.2.10, there is no tag, nothing is
-published and nothing is installed. The whole-gate design and its review
-history are in Git (`main` at 86d3e1c and earlier, including the previous
-version of this file).
+native-rule narrowing and scheduling-key fix are merged to `main` at 33892a4;
+the pre-release review of 33892a4
+(`scratchpad/astra/reapi-0217.md`) found 6 ORDINARY and 5 EDGE findings. The
+fixes for all but finding 9 are on branch `prerelease-0217` (see "Pre-release
+fixes" below), pushed and **awaiting the coordinator's go-ahead to
+fast-forward `main`**. None of it is **released**: the version is still 0.2.10,
+there is no tag, nothing is published and nothing is installed. The
+whole-gate design and its review history are in Git (`main` at 86d3e1c and
+earlier, including the previous version of this file).
 
 ## Jason's decision (via the coordinator)
 
@@ -191,6 +194,88 @@ their dependents). `libspa-sys` has cc-built `static_fns.o` and
 `liblibspa-rs-reexports.a` in `OUT_DIR` whose bytes depend on the checkout
 path, so libspa_sys, libspa, pipewire_sys, pipewire, cpal and moria_sfx miss.
 Each of these is keyed correctly; the inputs really do differ.
+
+## Pre-release fixes (branch `prerelease-0217`, from `main` 16b5b7b)
+
+The coordinator's rule: fail closed (run uncached) rather than add
+mechanisms; each fix has a regression test shown failing under a targeted
+mutation (all 17 mutations failed their test, then were reverted with
+`git apply -R` of the mutation's own diff).
+
+1. Toolchain exemption (`capture::native_inputs`,
+   `toolchain_library_directory`): only `<sysroot>/lib/rustlib/<target>/lib`
+   (target from `--target`, else the host in `rustc -vV`; none when
+   `--sysroot` is given) counts as the toolchain's; `/usr/lib/...` beside
+   `/usr/bin/rustc` follows the inside/outside rule.
+   `a_library_bundling_an_archive_from_the_compilers_installation_prefix_runs_uncached`.
+2. Relocation boundaries (`relocation::find_whole_root`, used by the
+   environment relocation, `logical_text` keys and the dep-info rewrite): a
+   root matches only at the start of a value or after a delimiter
+   (` \t\n\r=:;,"'\x1f`) and only when followed by the end, `/` or a
+   delimiter. `a_sibling_of_the_package_named_in_a_variable_keeps_its_path`,
+   unit tests `only_whole_roots_in_environment_values_are_relocated` and
+   `keys_and_dep_info_name_only_whole_roots`.
+3. Inputs edited during a compile (`cache::finish_cached_execution` records
+   the start time; `capture::keyed_inputs_unchanged` re-walks and re-hashes
+   the keyed inputs after the compile; `read_dep_inputs` and the re-walk
+   refuse any file with mtime >= the start, read after hashing). Logged
+   `local-input-changed`.
+   `a_file_included_from_outside_the_package_and_modified_during_the_compile_is_not_stored`
+   (dep-info mtime), `a_package_file_modified_during_the_compile_is_not_stored`
+   (keyed mtime), `a_package_file_whose_content_changed_during_the_compile_is_not_stored`
+   (re-hash; a proc macro rewrites a package file and back-dates it).
+4. `-C target-cpu=native` is ineligible (`target-feature` has no native
+   form). `a_compile_for_the_native_cpu_runs_uncached`.
+5. Allowlists (`invocation::unsupported_reason`): emit kinds
+   dep-info/metadata/link; codegen options in `CACHEABLE_CODEGEN_OPTIONS`;
+   split-debuginfo only off/packed (verified on Linux 1.93: packed keeps the
+   `.dwo` inside the rlib, unpacked writes `.dwo` beside it). The `obj` emit
+   arm was removed. Tests (tests/compile_options.rs):
+   `unpacked_split_debuginfo_runs_uncached_and_packed_is_cached`,
+   `an_emit_kind_the_cache_does_not_declare_runs_uncached`,
+   `a_codegen_option_outside_the_supported_list_runs_uncached`.
+   Consequence: Cargo's macOS dev default is `split-debuginfo=unpacked`, so
+   macOS debug compiles now run uncached unless the profile sets `off` or
+   `packed`. Under an outside `-L`, a packed rlib's `.rcgu.dwo` members are
+   not "own" members, so such compiles are not stored (fail closed).
+6. Target directory: `resolve_target_root` forwards `--config` values to
+   `cargo metadata`; the package walk skips directories (below the package
+   root) holding `CACHEDIR.TAG`, which covers `build.build-dir` inside the
+   package. `a_target_directory_set_by_a_config_argument_is_the_target_root`,
+   `a_build_directory_inside_the_package_is_not_among_its_inputs`. A
+   `build.build-dir` outside the workspace makes outputs fall outside the
+   roots, so those compiles are ineligible (not a soundness issue).
+7. Response files (`@file`) are ineligible; the old response-file input
+   hashing was removed. `arguments_from_a_response_file_run_uncached`.
+8. A thin archive (`!<thin>\n`) in an inside `-L` directory makes the
+   compile ineligible. `a_thin_archive_inside_the_workspace_runs_uncached`.
+9. Deferred: computed values from relocated paths, filed as
+   [cargo-reapi#7](https://github.com/TamedTornado/cargo-reapi/issues/7)
+   (label `review-finding`, created for it).
+10. `captured_environment` uses `vars_os`; keyed values that are not UTF-8
+    are hashed as NUL + raw bytes, names as `=non-utf-8:<hex>`.
+    `variables_that_are_not_utf8_neither_stop_the_wrapper_nor_share_a_key`.
+11. GC (`maintenance::action_files`): only `<64 hex>.json` in `actions` are
+    manifests; anything else is an abandoned temporary, removed under the
+    exclusive lease and reported as `removed_temporary_files`. The unit tests'
+    fixture actions now use SHA-256 keys.
+    `gc_removes_the_temporary_file_an_interrupted_publisher_left`.
+
+Suite at the branch head: 132 tests pass with `--features test-hooks`
+(unit 64, action_cache 11, capture 22, coalescing 1, compile_options 5,
+dependency_relocation 1, environment 13, maintenance 4, native_libraries 9,
+pipelining 1, reinstall 1); fmt and clippy `-D warnings` clean on 1.93. The
+native, environment and compile-option tests also pass under
+`cargo +1.97.1`. README and CHANGELOG `[Unreleased]` describe the new rules.
+
+Next: the coordinator reviews the range; after the go-ahead, fast-forward
+`main`, then the release rule below (Astra review of the exact commit before
+any bump).
+
+Unrelated: a `capture` test binary from an earlier run in this worktree
+(`target/debug/deps/capture-21da24fa96b372a7`, started 00:43, its fixture
+build script `network-input-fixture` hung) was still running; killing it was
+denied by the permission system, so it is left for Jason.
 
 ## Deferred (not approved): proc-macro and dylib caching
 
