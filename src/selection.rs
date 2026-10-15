@@ -121,6 +121,8 @@ pub struct Selection {
     pub example: NamedTarget,
     /// `--open`: the invocation opens a viewer after building.
     pub opens_viewer: bool,
+    /// How many `--bin` and `--example` options were given.
+    pub target_options: usize,
     /// `-p`, `--workspace` or `--exclude` was given.
     pub selects_packages: bool,
     /// `--help`, `-h`, `--version`, `-V` or `--list` was given: Cargo answers
@@ -248,6 +250,7 @@ struct Reader<'a> {
     /// `--example`, with its value when it has one.
     example: NamedTarget,
     opens_viewer: bool,
+    target_options: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -267,6 +270,7 @@ impl<'a> Reader<'a> {
             bin: NamedTarget::Absent,
             example: NamedTarget::Absent,
             opens_viewer: false,
+            target_options: 0,
         }
     }
 
@@ -377,8 +381,14 @@ impl<'a> Reader<'a> {
                     NamedTarget::Named(value.to_string_lossy().into_owned())
                 });
                 match name {
-                    "bin" => self.bin = named,
-                    "example" => self.example = named,
+                    "bin" => {
+                        self.bin = named;
+                        self.target_options += 1;
+                    }
+                    "example" => {
+                        self.example = named;
+                        self.target_options += 1;
+                    }
                     _ => {}
                 }
             }
@@ -550,6 +560,7 @@ impl<'a> Reader<'a> {
             bin: self.bin,
             example: self.example,
             opens_viewer: self.opens_viewer,
+            target_options: self.target_options,
             selects_packages: self.selects_packages,
             informational: self.informational,
         })

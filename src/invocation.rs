@@ -327,7 +327,48 @@ fn apply_compiler_environment(
                 }),
         );
     }
-    apply_relocation_environment(command, compiler, environment)
+    apply_relocation_environment(command, compiler, environment)?;
+    apply_observer_environment(command, compiler);
+    Ok(())
+}
+
+/// The marker line the audit observer shim carries.
+const OBSERVER_MARKER: &[u8] = b"cargo-reapi-rustc-observer";
+
+/// The first bytes of a file, where the shim's marker line is.
+fn observer_head(compiler: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut head = Vec::new();
+    std::fs::File::open(compiler)
+        .ok()?
+        .take(1024)
+        .read_to_end(&mut head)
+        .ok()?;
+    Some(head)
+}
+
+/// Gives the audit variables to a compiler that is the observer shim and
+/// removes them from every other: a crate must not read them
+/// (`option_env!`), and they are not keyed. The shim is recognized by its own
+/// marker line, never inferred from the variables being set.
+fn apply_observer_environment(command: &mut Command, compiler: &Path) {
+    let is_shim = observer_head(compiler).is_some_and(|head| {
+        head.starts_with(b"#!")
+            && head
+                .windows(OBSERVER_MARKER.len())
+                .any(|part| part == OBSERVER_MARKER)
+    });
+    for name in crate::environment::OBSERVER_ENVIRONMENT {
+        match std::env::var_os(name) {
+            Some(value) if is_shim => {
+                command.env(name, value);
+            }
+            _ => {
+                command.env_remove(name);
+            }
+        }
+    }
 }
 
 fn apply_relocation_environment(

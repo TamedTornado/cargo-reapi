@@ -125,6 +125,10 @@ fn strict_cargo_command(
     let workspace = canonical_or_absolute(workspace)?;
     let target = create_and_canonicalize(target, "target")?;
     let cache = create_and_canonicalize(cache, "cache")?;
+    for directory in driver_only_cache_paths(&cache) {
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+    }
     let action_log = create_file_and_canonicalize(action_log, "action log")?;
     let temporary = create_and_canonicalize(
         &target.join("cargo-reapi/hermetic-tmp"),
@@ -375,7 +379,7 @@ fn build_policy(
             deny_read: vec!["/".to_owned()],
             allow_read: paths_to_strings(readable),
             allow_write: paths_to_strings(writable),
-            deny_write: Vec::new(),
+            deny_write: paths_to_strings(driver_only_cache_paths(paths.cache)),
         },
         enable_weaker_nested_sandbox: false,
         enable_weaker_network_isolation: false,
@@ -720,6 +724,14 @@ fn workspace_inputs_excluding_target(workspace: &Path, target: &Path) -> Result<
         current = next;
     }
     Ok(readable)
+}
+
+/// The parts of the cache only the driver writes, after a build, outside the
+/// sandbox: the published gate snapshots and the gates' access records. The
+/// cache is writable to a build so its compiler wrapper can fill the action
+/// cache, but nothing it plants in these can be followed by the driver.
+pub fn driver_only_cache_paths(cache: &Path) -> BTreeSet<PathBuf> {
+    BTreeSet::from([cache.join("gate-snapshots"), cache.join("access/gates")])
 }
 
 fn paths_to_strings(paths: BTreeSet<PathBuf>) -> Vec<String> {

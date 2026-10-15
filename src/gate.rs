@@ -32,6 +32,12 @@ struct GateSnapshotManifest {
     relocation_files: Vec<PathBuf>,
     executable_relocations: Vec<ExecutableRelocation>,
     observed_inputs: Vec<ObservedGateInput>,
+    /// Files beneath `cargo-reapi/` that rustc's dep-info lists as read,
+    /// such as a generator's file in the build's temporary directory, with
+    /// their digests. They are not part of the target's identity check, so
+    /// they are checked by content. A snapshot that has any restores nowhere:
+    /// a consumer cannot have them.
+    administrative_inputs: BTreeMap<PathBuf, String>,
     /// The content digest of every file the snapshot holds, taken when it
     /// was published and verified before any restore.
     outputs: BTreeMap<PathBuf, String>,
@@ -57,6 +63,8 @@ struct ObservedGateInput {
 struct TargetMarker {
     key: String,
     outputs: BTreeMap<PathBuf, FileIdentity>,
+    /// See [`GateSnapshotManifest::administrative_inputs`].
+    administrative_inputs: BTreeMap<PathBuf, String>,
 }
 
 /// What identifies one file or link as the one a restore wrote: replacing
@@ -140,28 +148,18 @@ fn remove_beneath_target(target: &Path, relative: &Path) -> Result<()> {
 }
 
 /// Appends a line to the action log. A log inside the target is written
-/// beneath it; any other is opened without following a link at its name.
+/// beneath it, and any other beneath its own directory, so a link or a second
+/// hard link at the name is never written through.
 fn append_line(target: &Path, log: &Path, line: &str) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-
         if let Ok(relative) = log.strip_prefix(target) {
             return crate::beneath::Beneath::open(target)?.append_line(relative, line);
         }
-        if let Some(parent) = log.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(log)
-            .with_context(|| format!("opening action log {}", log.display()))?;
-        file.lock_exclusive()?;
-        writeln!(file, "{line}")?;
-        FileExt::unlock(&file)?;
-        Ok(())
+        let parent = log.parent().context("the action log has no directory")?;
+        let name = log.file_name().context("the action log has no name")?;
+        fs::create_dir_all(parent)?;
+        crate::beneath::Beneath::open(parent)?.append_line(Path::new(name), line)
     }
     #[cfg(not(unix))]
     {
@@ -333,6 +331,42 @@ fn administrative_directory_is_ours(target: &Path) -> bool {
                 .to_str()
                 .is_some_and(|name| ADMINISTRATIVE_ENTRIES.contains(&name))
     })
+}
+
+/// The files beneath `cargo-reapi/` that the dependency files in the target
+/// list, with digests. Everything else the dependency files list is either
+/// hashed in the key or part of the target's identity check.
+fn collect_administrative_inputs(
+    target: &Path,
+    workspace: &Path,
+) -> Result<BTreeMap<PathBuf, String>> {
+    let administrative = target.join(ADMINISTRATIVE_DIRECTORY);
+    let mut inputs = BTreeMap::new();
+    for entry in WalkDir::new(target)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_administrative(target, entry.path()))
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "d") {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&fs::read(entry.path())?).into_owned();
+        for listed in crate::capture::dep_info_paths(&text) {
+            let Ok(resolved) = workspace.join(&listed).canonicalize() else {
+                continue;
+            };
+            if resolved.is_file()
+                && let Ok(relative) = resolved.strip_prefix(&administrative)
+            {
+                inputs.insert(
+                    Path::new(ADMINISTRATIVE_DIRECTORY).join(relative),
+                    digest_file(&resolved)?,
+                );
+            }
+        }
+    }
+    Ok(inputs)
 }
 
 /// The digest of each file or link, a link by what it points to.
@@ -574,6 +608,7 @@ impl GateSnapshot {
         )?;
         let produced = snapshot_files(&temporary.join("target"))?;
         let outputs = digest_files(&temporary.join("target"), &produced)?;
+        let administrative_inputs = collect_administrative_inputs(&self.target, &self.workspace)?;
         let manifest = GateSnapshotManifest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             key: self.key.clone(),
@@ -583,6 +618,7 @@ impl GateSnapshot {
             relocation_files,
             executable_relocations,
             observed_inputs,
+            administrative_inputs: administrative_inputs.clone(),
             outputs,
         };
         fs::write(
@@ -599,7 +635,7 @@ impl GateSnapshot {
         // The producer's target now holds exactly what was published, so the
         // next identical gate finds it and restores nothing.
         if target_files(&self.target)? == produced {
-            self.write_target_marker(&self.key, &produced)?;
+            self.write_target_marker(&self.key, &produced, administrative_inputs)?;
         }
         record_access(&self.cache_root, AccessKind::Gate, &self.key)?;
         self.unlock()
@@ -677,6 +713,11 @@ impl GateSnapshot {
                 manifest.key
             );
         }
+        if !manifest.administrative_inputs.is_empty() {
+            // The build read files beneath cargo-reapi's directory, which a
+            // consumer cannot have: there is nothing to check them against.
+            return Ok(());
+        }
         let produced = snapshot_files(&selected.join("target"))?;
         if !snapshot_matches_digests(&selected.join("target"), &produced, &manifest.outputs) {
             eprintln!(
@@ -699,7 +740,7 @@ impl GateSnapshot {
             &self.resource_ledger,
         )?;
         self.relocation_ms = relocation_started.elapsed().as_millis();
-        self.write_target_marker(&manifest.key, &produced)?;
+        self.write_target_marker(&manifest.key, &produced, BTreeMap::new())?;
         self.restored = Restoration::Cloned;
         Ok(())
     }
@@ -735,6 +776,10 @@ impl GateSnapshot {
         };
         marker.key == selected_key
             && administrative_directory_is_ours(&self.target)
+            && marker.administrative_inputs.iter().all(|(path, digest)| {
+                let path = self.target.join(path);
+                is_regular_file(&path) && digest_file(&path).is_ok_and(|actual| actual == *digest)
+            })
             && present.iter().eq(marker.outputs.keys())
             && marker.outputs.iter().all(|(path, recorded)| {
                 fs::symlink_metadata(self.target.join(path))
@@ -742,7 +787,12 @@ impl GateSnapshot {
             })
     }
 
-    fn write_target_marker(&self, selected_key: &str, produced: &[PathBuf]) -> Result<()> {
+    fn write_target_marker(
+        &self,
+        selected_key: &str,
+        produced: &[PathBuf],
+        administrative_inputs: BTreeMap<PathBuf, String>,
+    ) -> Result<()> {
         let mut outputs = BTreeMap::new();
         for path in produced {
             let metadata = fs::symlink_metadata(self.target.join(path))
@@ -753,6 +803,7 @@ impl GateSnapshot {
         let marker = serde_json::to_vec(&TargetMarker {
             key: selected_key.to_owned(),
             outputs,
+            administrative_inputs,
         })?;
         write_beneath_target(&self.target, &marker_relative(), &marker)
     }
@@ -983,10 +1034,18 @@ fn hash_tree(
         .collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path().to_path_buf());
     for entry in entries {
-        if entry.path() == root || entry.file_type().is_dir() {
+        if entry.path() == root {
             continue;
         }
         let relative = entry.path().strip_prefix(root)?;
+        if entry.file_type().is_dir() {
+            // Directories are keyed by name too, empty ones included: a build
+            // script that lists them sees a new one.
+            hash_field(hasher, logical_root.as_bytes());
+            hash_field(hasher, relative.to_string_lossy().as_bytes());
+            hash_field(hasher, b"directory");
+            continue;
+        }
         hash_field(hasher, logical_root.as_bytes());
         hash_field(hasher, relative.to_string_lossy().as_bytes());
         let metadata = fs::symlink_metadata(entry.path())?;
@@ -1182,53 +1241,101 @@ fn hash_selected_project(
     Ok(())
 }
 
-/// Hashes the repository state of every Git dependency's checkout. Cargo
-/// itself opens a checkout's `.git`, so the sandbox cannot deny it as it does
-/// a local package's, and a build script there can query it. Every part of it
-/// is therefore keyed: all files by content, and `objects` by the names and
-/// sizes of its files, which name their content, so an unreachable object
-/// that would lengthen an abbreviated name is seen as well.
-fn hash_git_dependencies(hasher: &mut Sha256, project: &Project) -> Result<()> {
-    let mut repositories = BTreeSet::new();
-    for package in project.packages.iter().filter(|package| package.git) {
-        let repository = package
-            .root
-            .ancestors()
-            .map(|ancestor| ancestor.join(".git"))
-            .find(|candidate| candidate.is_dir());
-        if let Some(repository) = repository {
-            repositories.insert(repository);
-        }
-    }
-    for repository in repositories {
-        let objects = repository.join("objects");
-        let mut entries = WalkDir::new(&repository)
-            .follow_links(false)
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.path().to_path_buf());
-        for entry in entries {
-            if entry.file_type().is_dir() {
-                continue;
-            }
-            let relative = entry.path().strip_prefix(&repository)?;
-            hash_field(hasher, b"git-dependency");
-            // Named by its place beneath Cargo's `checkouts`, so every Cargo
-            // home with the same checkout agrees.
-            let name = repository
-                .iter()
-                .skip_while(|component| *component != "checkouts")
-                .collect::<PathBuf>();
-            hash_field(hasher, name.to_string_lossy().as_bytes());
-            hash_field(hasher, relative.to_string_lossy().as_bytes());
-            if entry.path().starts_with(&objects) {
-                hash_field(hasher, &entry.metadata()?.len().to_le_bytes());
-            } else {
-                hash_field(hasher, digest_file(entry.path())?.as_bytes());
-            }
+/// The repositories Git dependencies are checked out of, one per checkout.
+fn git_dependency_repositories(project: &Project) -> BTreeSet<PathBuf> {
+    project
+        .packages
+        .iter()
+        .filter(|package| package.git)
+        .filter_map(|package| {
+            package
+                .root
+                .ancestors()
+                .map(|ancestor| ancestor.join(".git"))
+                .find(|candidate| candidate.is_dir())
+        })
+        .collect()
+}
+
+/// Declines a Git dependency whose repository borrows objects from another
+/// (`objects/info/alternates`): the objects a query can see then live outside
+/// the checkout, and following them is not attempted.
+pub fn validate_git_dependencies(project: &Project) -> Result<()> {
+    for repository in git_dependency_repositories(project) {
+        let alternates = repository.join("objects/info/alternates");
+        if alternates.exists() {
+            bail!(
+                "the Git dependency checkout {} borrows objects from another repository \
+                 ({}); cargo-reapi does not follow alternates",
+                repository.display(),
+                alternates.display()
+            );
         }
     }
     Ok(())
+}
+
+/// Hashes the repository state of every Git dependency's checkout. Cargo
+/// itself opens a checkout's `.git`, so the sandbox cannot deny it as it does
+/// a local package's, and a build script there can query it. Every part of it
+/// is therefore keyed.
+fn hash_git_dependencies(hasher: &mut Sha256, project: &Project) -> Result<()> {
+    for repository in git_dependency_repositories(project) {
+        // Named by its place beneath Cargo's `checkouts`, so every Cargo
+        // home with the same checkout agrees.
+        let name = repository
+            .iter()
+            .skip_while(|component| *component != "checkouts")
+            .collect::<PathBuf>();
+        hash_git_repository(hasher, &repository, &name)?;
+    }
+    Ok(())
+}
+
+/// Hashes one repository: every file by content, except what its path names
+/// the content of. Objects are named by their hash, so a loose object or a
+/// pack is keyed by name and size; but `objects/info` (alternates, pack
+/// lists) and a pack's index, `.keep` and `.rev` files carry state their names
+/// do not, and are hashed by content.
+fn hash_git_repository(hasher: &mut Sha256, repository: &Path, name: &Path) -> Result<()> {
+    let objects = repository.join("objects");
+    let mut entries = WalkDir::new(repository)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path().to_path_buf());
+    for entry in entries {
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(repository)?;
+        hash_field(hasher, b"git-dependency");
+        hash_field(hasher, name.to_string_lossy().as_bytes());
+        hash_field(hasher, relative.to_string_lossy().as_bytes());
+        if is_content_addressed_object(entry.path(), &objects) {
+            hash_field(hasher, &entry.metadata()?.len().to_le_bytes());
+        } else {
+            hash_field(hasher, digest_file(entry.path())?.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// Whether a file under `objects` is named by what it holds: a loose object,
+/// or a pack's data.
+fn is_content_addressed_object(path: &Path, objects: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(objects) else {
+        return false;
+    };
+    if relative.starts_with("info") {
+        return false;
+    }
+    let by_content = path.extension().is_some_and(|extension| {
+        ["idx", "keep", "rev", "bitmap", "mtimes"]
+            .iter()
+            .any(|own| extension == *own)
+    });
+    !by_content
 }
 
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
@@ -1946,12 +2053,23 @@ fn observed_input_digest(kind: &str, name: &str) -> String {
                     .follow_links(false)
                     .into_iter()
                     .filter_map(Result::ok)
-                    .filter(|entry| entry.file_type().is_file())
+                    .filter(|entry| entry.path() != path)
                     .collect::<Vec<_>>();
                 entries.sort_by_key(|entry| entry.path().to_path_buf());
                 for entry in entries {
                     if let Ok(relative) = entry.path().strip_prefix(path) {
                         hash_field(&mut hasher, relative.to_string_lossy().as_bytes());
+                    }
+                    if !entry.file_type().is_file() {
+                        // A directory, empty or not, or a link: named by its
+                        // kind, so a new empty directory changes the digest.
+                        let kind: &[u8] = if entry.file_type().is_dir() {
+                            b"directory"
+                        } else {
+                            b"other"
+                        };
+                        hash_field(&mut hasher, kind);
+                        continue;
                     }
                     match fs::read(entry.path()) {
                         Ok(bytes) => hash_field(&mut hasher, &bytes),
@@ -1989,6 +2107,58 @@ fn copy_tree_portable(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_new_empty_directory_changes_an_observed_directory_digest() {
+        let root = tempfile::tempdir().expect("root");
+        let directory = root.path().join("assets");
+        fs::create_dir_all(directory.join("a")).expect("assets");
+        fs::write(directory.join("a/keep"), "a").expect("file");
+        let name = directory.to_string_lossy().into_owned();
+        let before = super::observed_input_digest("path", &name);
+
+        fs::create_dir(directory.join("b")).expect("empty directory");
+
+        assert_ne!(super::observed_input_digest("path", &name), before);
+    }
+
+    #[test]
+    fn git_object_metadata_is_hashed_by_content_and_objects_by_name() {
+        use sha2::{Digest, Sha256};
+
+        let root = tempfile::tempdir().expect("root");
+        let repository = root.path().join(".git");
+        fs::create_dir_all(repository.join("objects/info")).expect("info");
+        fs::create_dir_all(repository.join("objects/pack")).expect("pack");
+        fs::create_dir_all(repository.join("objects/ab")).expect("loose");
+        let hash = |repository: &Path| {
+            let mut hasher = Sha256::new();
+            super::hash_git_repository(&mut hasher, repository, Path::new("checkouts/x"))
+                .expect("hash");
+            format!("{:x}", hasher.finalize())
+        };
+        let write = |relative: &str, text: &str| {
+            fs::write(repository.join(relative), text).expect("write");
+        };
+        write("objects/info/alternates", "/pool/one");
+        write("objects/pack/pack-1.idx", "index one");
+        write("objects/pack/pack-1.pack", "data one");
+        write("objects/ab/cdef", "loose one");
+        let original = hash(&repository);
+
+        // Same length, other content: metadata changes the hash.
+        write("objects/info/alternates", "/pool/two");
+        let alternates = hash(&repository);
+        assert_ne!(alternates, original);
+        write("objects/pack/pack-1.idx", "index two");
+        assert_ne!(hash(&repository), alternates);
+
+        // Content-addressed files are named by what they hold.
+        write("objects/pack/pack-1.pack", "data two");
+        write("objects/ab/cdef", "loose two");
+        let named = hash(&repository);
+        write("objects/pack/pack-1.pack", "data 333");
+        assert_eq!(hash(&repository), named);
+    }
 
     use super::*;
 

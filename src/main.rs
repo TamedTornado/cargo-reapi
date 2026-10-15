@@ -778,6 +778,7 @@ fn prepare_cached_project(
         .as_deref()
         .context("cache directory is required")?;
     let project = Project::resolve(workspace_root, cache_dir, &selection.metadata_arguments)?;
+    crate::gate::validate_git_dependencies(&project)?;
     if selection
         .command
         .as_deref()
@@ -806,27 +807,34 @@ fn prepare_cached_project(
     Ok(())
 }
 
+fn named_target(target: &crate::selection::NamedTarget) -> Result<Option<&str>> {
+    match target {
+        crate::selection::NamedTarget::Absent => Ok(None),
+        crate::selection::NamedTarget::Named(name) => Ok(Some(name.as_str())),
+        crate::selection::NamedTarget::Unnamed => {
+            bail!("`run` gives --bin or --example without a name")
+        }
+    }
+}
+
 /// The binary to name for `run`'s build, or `None` when the arguments name
-/// it (`--bin`, `--example`). Declines when which one `run` builds cannot be
-/// told exactly.
+/// it (`--bin`, `--example`). Declines when which one `run` builds, or that
+/// Cargo can run it, cannot be told exactly, before anything is built.
 fn run_binary(
     selection: &crate::selection::Selection,
     project: &Project,
 ) -> Result<Option<String>> {
-    use crate::selection::NamedTarget::{Absent, Named, Unnamed};
-
-    match (&selection.bin, &selection.example) {
-        (Named(_), _) | (_, Named(_)) => Ok(None),
-        (Unnamed, _) | (_, Unnamed) => {
-            bail!("`run` gives --bin or --example without a name")
-        }
-        (Absent, Absent) => {
-            if selection.selects_packages && selection.packages.is_empty() {
-                bail!("`run` selects packages with --workspace or --exclude");
-            }
-            project.run_binary(&selection.packages).map(Some)
-        }
+    if selection.target_options > 1 {
+        bail!("`run` gives more than one --bin or --example");
     }
+    if selection.selects_packages && selection.packages.is_empty() {
+        bail!("`run` selects packages with --workspace or --exclude");
+    }
+    project.run_target(
+        &selection.packages,
+        named_target(&selection.bin)?,
+        named_target(&selection.example)?,
+    )
 }
 
 /// An error message as one line.

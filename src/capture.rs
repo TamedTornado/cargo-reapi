@@ -202,7 +202,7 @@ pub fn dep_inputs_match(
 
 /// The prerequisites a dependency file lists. rustc escapes only spaces, with
 /// a backslash; every other backslash is part of the name.
-fn dep_info_paths(text: &str) -> BTreeSet<String> {
+pub(crate) fn dep_info_paths(text: &str) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for line in text.lines() {
         if line.is_empty() || line.starts_with('#') {

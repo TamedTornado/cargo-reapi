@@ -22,6 +22,8 @@ pub struct Project {
     /// The package Cargo calls the root: the one at the manifest it finds,
     /// when that manifest has a package.
     pub root_package: Option<String>,
+    /// The workspace's default members, by package id.
+    pub default_members: Vec<String>,
 }
 
 /// A package in the project's resolve.
@@ -31,6 +33,8 @@ pub struct Package {
     pub name: String,
     /// The names of its binary targets.
     pub binaries: Vec<String>,
+    /// The names of its executable examples.
+    pub examples: Vec<String>,
     /// Its `default-run`.
     pub default_run: Option<String>,
     pub root: PathBuf,
@@ -83,6 +87,12 @@ impl Project {
             target_directory: path("target_directory")?,
             packages,
             root_package: metadata["resolve"]["root"].as_str().map(str::to_owned),
+            default_members: metadata["workspace_default_members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect(),
         })
     }
 
@@ -138,37 +148,117 @@ impl Project {
 }
 
 impl Project {
-    /// The one binary `cargo run` with these selections builds, or why that
-    /// cannot be told exactly. `-p` names the package, else the root package;
-    /// then `default-run`, else the package's only binary.
-    pub fn run_binary(&self, selected: &[String]) -> Result<String> {
-        let package = match selected {
+    /// What `cargo run` builds for these selections, as Cargo selects it, or
+    /// why that cannot be told exactly: `Ok(None)` when `--bin` or
+    /// `--example` names a single executable target that exists, and
+    /// `Ok(Some(name))` for the one binary a plain `run` would build.
+    ///
+    /// The packages are `-p`'s, else, at the workspace root manifest, the
+    /// workspace's default members, else (inside a member) that member.
+    pub fn run_target(
+        &self,
+        selected: &[String],
+        bin: Option<&str>,
+        example: Option<&str>,
+    ) -> Result<Option<String>> {
+        let packages = self.run_packages(selected)?;
+        match (bin, example) {
+            (Some(_), Some(_)) => bail!("`run` gives both --bin and --example"),
+            (Some(name), None) => {
+                require_exact(name)?;
+                let found = packages
+                    .iter()
+                    .flat_map(|package| &package.binaries)
+                    .filter(|binary| *binary == name)
+                    .count();
+                if found != 1 {
+                    bail!("--bin {name} names {found} binaries of the selected packages");
+                }
+                Ok(None)
+            }
+            (None, Some(name)) => {
+                require_exact(name)?;
+                let found = packages
+                    .iter()
+                    .flat_map(|package| &package.examples)
+                    .filter(|example| *example == name)
+                    .count();
+                if found != 1 {
+                    bail!(
+                        "--example {name} names {found} executable examples of the selected packages"
+                    );
+                }
+                Ok(None)
+            }
+            (None, None) => {
+                let binaries = packages
+                    .iter()
+                    .flat_map(|package| &package.binaries)
+                    .collect::<Vec<_>>();
+                if let [only] = binaries.as_slice() {
+                    return Ok(Some((*only).clone()));
+                }
+                let defaults = packages
+                    .iter()
+                    .filter_map(|package| package.default_run.as_ref())
+                    .collect::<Vec<_>>();
+                match defaults.as_slice() {
+                    [name] if binaries.contains(name) => Ok(Some((*name).clone())),
+                    _ => bail!(
+                        "`run` selects {} binaries and not exactly one default-run, so which \
+                         one it builds is Cargo's to say",
+                        binaries.len()
+                    ),
+                }
+            }
+        }
+    }
+
+    fn run_packages(&self, selected: &[String]) -> Result<Vec<&Package>> {
+        match selected {
             [] => {
-                let root = self
+                let member = self
                     .root_package
                     .as_ref()
-                    .context("`run` selects no package and there is no root package")?;
-                self.packages.iter().find(|package| &package.id == root)
+                    .and_then(|id| self.packages.iter().find(|package| &package.id == id))
+                    .filter(|package| package.root != self.workspace_root);
+                if let Some(member) = member {
+                    return Ok(vec![member]);
+                }
+                let defaults = self
+                    .default_members
+                    .iter()
+                    .filter_map(|id| self.packages.iter().find(|package| &package.id == id))
+                    .collect::<Vec<_>>();
+                if defaults.is_empty() {
+                    bail!("`run` selects no package and the workspace has no default members");
+                }
+                Ok(defaults)
             }
             [spec] => {
+                require_exact(spec)?;
                 let name = spec.split_once('@').map_or(spec.as_str(), |(name, _)| name);
-                self.packages
+                let matching = self
+                    .packages
                     .iter()
-                    .find(|package| package.name == name && package.local)
+                    .filter(|package| package.name == name && package.local)
+                    .collect::<Vec<_>>();
+                if matching.len() != 1 {
+                    bail!("-p {spec} names {} local packages", matching.len());
+                }
+                Ok(matching)
             }
             _ => bail!("`run` selects more than one package"),
         }
-        .context("the package `run` selects is not in the project")?;
-        match (&package.default_run, package.binaries.as_slice()) {
-            (Some(name), _) | (None, [name]) => Ok(name.clone()),
-            (None, binaries) => bail!(
-                "`run` in {} has {} binaries and no default-run, so which one it builds is \
-                 Cargo's to say",
-                package.name,
-                binaries.len()
-            ),
-        }
     }
+}
+
+/// Declines a name Cargo would read as a pattern.
+fn require_exact(name: &str) -> Result<()> {
+    if name.contains(['*', '?', '[', ']']) {
+        bail!("`{name}` is a pattern, which cargo-reapi does not resolve");
+    }
+    Ok(())
 }
 
 impl Package {
@@ -208,8 +298,24 @@ impl Package {
             .filter_map(|target| target["name"].as_str().map(str::to_owned))
             .collect();
 
+        let examples = package["targets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|target| {
+                let has = |field: &str, wanted: &str| {
+                    target[field]
+                        .as_array()
+                        .is_some_and(|values| values.iter().any(|value| value == wanted))
+                };
+                has("kind", "example") && has("crate_types", "bin")
+            })
+            .filter_map(|target| target["name"].as_str().map(str::to_owned))
+            .collect();
+
         Ok(Self {
             id: package["id"].as_str().unwrap_or(manifest).to_owned(),
+            examples,
             name: package["name"].as_str().unwrap_or_default().to_owned(),
             binaries,
             default_run: package["default_run"].as_str().map(str::to_owned),

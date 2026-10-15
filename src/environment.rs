@@ -64,7 +64,7 @@ pub const RUNTIME_PLUMBING_ENVIRONMENT: [&str; 5] = [
 /// The audit observer, a compiler shim, reads these. The compiler identity
 /// already covers the real compiler, and the trace directory only receives
 /// observations, so they reach the compiler unkeyed.
-const OBSERVER_ENVIRONMENT: [&str; 2] = ["CARGO_REAPI_REAL_RUSTC", "CARGO_REAPI_RUSTC_TRACE"];
+pub const OBSERVER_ENVIRONMENT: [&str; 2] = ["CARGO_REAPI_REAL_RUSTC", "CARGO_REAPI_RUSTC_TRACE"];
 
 /// Settings and records only the wrapper reads: where to log and cache,
 /// scheduling capacity, and this module's own inputs. They never reach a
@@ -211,12 +211,12 @@ impl CompileEnvironment {
         if WRAPPER_PRIVATE.contains(&name) {
             return false;
         }
-        // The audit observer's variables reach the compiler only while an
-        // observer is the compiler, where its shim consumes them and removes
-        // them before the real rustc runs. Otherwise they are unkeyed input
-        // a crate could read (`option_env!`), so they never reach it.
+        // The audit observer's variables are never part of a compile's
+        // environment. Only a compiler that is the observer shim receives
+        // them, added at the process boundary, where the shim removes them
+        // again before the real rustc starts.
         if OBSERVER_ENVIRONMENT.contains(&name) {
-            return env::var_os("CARGO_REAPI_REAL_RUSTC").is_some();
+            return false;
         }
         match self {
             Self::Keyed(names) => names.contains(name),

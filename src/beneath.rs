@@ -56,16 +56,13 @@ impl Beneath {
 
     /// Appends `line` and a newline to `relative`, under an exclusive lock.
     /// A symlink at the name, or in any directory on the way, is an error.
+    /// Only a regular file nothing else is linked to is appended to: a file
+    /// with a second hard link, or any other kind, may be one a build made to
+    /// point at a source, so it is replaced by a new file and never written.
     pub fn append_line(&self, relative: &Path, line: &str) -> Result<()> {
         let (parent, name) = self.parent_of(relative, true)?;
-        let fd = open_at(
-            parent.as_raw_fd(),
-            name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644,
-        )
-        .with_context(|| format!("opening {} without following links", relative.display()))?;
-        let mut file = File::from(fd);
+        let mut file = open_owned_for_append(&parent, name)
+            .with_context(|| format!("opening {} without following links", relative.display()))?;
         fs2::FileExt::lock_exclusive(&file)?;
         let written = writeln!(file, "{line}");
         fs2::FileExt::unlock(&file)?;
@@ -112,6 +109,31 @@ impl Beneath {
             };
         }
     }
+}
+
+/// Opens `name` in `parent` for appending, creating it when missing, and
+/// only when it is a regular file with a single link; otherwise the entry is
+/// removed and a new file is created.
+fn open_owned_for_append(parent: &OwnedFd, name: &OsStr) -> Result<File> {
+    let append = libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let existing = open_at(parent.as_raw_fd(), name, append | libc::O_CREAT, 0o644);
+    if let Ok(fd) = existing {
+        let file = File::from(fd);
+        let metadata = file.metadata()?;
+        if metadata.is_file() && std::os::unix::fs::MetadataExt::nlink(&metadata) == 1 {
+            return Ok(file);
+        }
+    }
+    // A link at the name (ELOOP), another kind of file, or a second hard
+    // link: replace the name. Unlinking never touches what it was linked to.
+    unlink_at(parent, name)?;
+    let fd = open_at(
+        parent.as_raw_fd(),
+        name,
+        append | libc::O_CREAT | libc::O_EXCL,
+        0o644,
+    )?;
+    Ok(File::from(fd))
 }
 
 fn open_directory(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OwnedFd> {
@@ -217,6 +239,40 @@ mod tests {
             .expect("remove");
         assert!(!source.join("marker").exists());
         assert!(!source.join("log").exists());
+    }
+
+    #[test]
+    fn an_append_never_reaches_a_file_with_a_second_hard_link() {
+        let root = tempfile::tempdir().expect("root");
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("target");
+        fs::write(root.path().join("lock"), "source").expect("source");
+        fs::hard_link(root.path().join("lock"), target.join("log")).expect("hard link");
+        let beneath = Beneath::open(&target).expect("handle");
+
+        beneath.append_line("log".as_ref(), "line").expect("append");
+
+        assert_eq!(
+            fs::read(root.path().join("lock")).expect("source"),
+            b"source"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("log")).expect("log"),
+            "line\n"
+        );
+        // A link is replaced too, and a file of its own is appended to.
+        fs::remove_file(target.join("log")).expect("remove");
+        std::os::unix::fs::symlink(root.path().join("lock"), target.join("log")).expect("link");
+        beneath.append_line("log".as_ref(), "one").expect("append");
+        beneath.append_line("log".as_ref(), "two").expect("append");
+        assert_eq!(
+            fs::read(root.path().join("lock")).expect("source"),
+            b"source"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("log")).expect("log"),
+            "one\ntwo\n"
+        );
     }
 
     #[test]

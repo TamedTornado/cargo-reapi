@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+# cargo-reapi-rustc-observer: cargo-reapi recognizes this shim by this line.
 
 : "${CARGO_REAPI_REAL_RUSTC:?CARGO_REAPI_REAL_RUSTC is required}"
 : "${CARGO_REAPI_RUSTC_TRACE:?CARGO_REAPI_RUSTC_TRACE is required}"
