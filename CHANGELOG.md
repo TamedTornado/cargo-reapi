@@ -4,6 +4,8 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
 cargo-reapi is now a per-compile cache, in the model of `sccache`. Cargo runs
 every time and plans every build; cargo-reapi caches the individual rustc
 compiles it is asked to run.
@@ -368,6 +370,7 @@ Initial public release.
 Known limitations and the precise qualified boundary are documented in the
 [README](README.md#known-limitations-and-roadmap).
 
-[Unreleased]: https://github.com/TamedTornado/cargo-reapi/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/TamedTornado/cargo-reapi/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/TamedTornado/cargo-reapi/compare/v0.2.10...v0.3.0
 [0.1.1]: https://github.com/TamedTornado/cargo-reapi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TamedTornado/cargo-reapi/releases/tag/v0.1.0
