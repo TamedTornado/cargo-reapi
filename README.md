@@ -333,7 +333,9 @@ workspace root manifest the workspace's `default-members`, else inside a member
 that member; then its only binary, or the single `default-run`), and the
 program then runs through Cargo as usual, outside the cache and the sandbox,
 with its own stdin and stdout, exactly once. A `run` whose binary cannot be
-told exactly (several binaries and no single `default-run`, `--workspace`) declines,
+told exactly (several binaries and no single `default-run`, `--workspace`,
+a package id that is none of the project's) declines, as does a `run` given an
+option only `build` takes (`--all-targets`) or arguments without `--`,
 and so does a selection Cargo rejects before compiling: a glob or unknown
 name, several `--bin` or `--example`, a non-executable example. Nothing is
 built for these.
@@ -508,8 +510,18 @@ never reach a compile. They are given only to a compiler that carries the
 observer shim's marker line, which removes them before the real compiler
 runs; every other compiler has them stripped, whatever else is set.
 
-Nothing a build can write is something the driver writes after it, outside the
-sandbox: the sandbox's policy makes the cache's `gate-snapshots` and
+Everything an action observed outside the hashed trees is recorded when a gate
+is published and checked by content on every hit: build scripts' declared paths
+and variables (relative paths resolved against their package), files the
+compiles' dependency files list, and the native inputs and linker of every link,
+which the compiler wrapper records. An input that cannot be verified is a miss.
+
+Every write cargo-reapi makes to storage a build can write follows one policy:
+no link is followed; a file is changed in place only by a locked append to a
+regular file with a single link; anything else is replaced by a new file
+renamed over it; lock files are opened without following links and only locked.
+`docs/handoff.md` lists them. Nothing a build can write is something the driver
+writes after it, outside the sandbox: the sandbox's policy makes the cache's `gate-snapshots` and
 `access/gates` read-only to the build, and the action log is appended to only
 as a regular file with a single hard link, opened without following links; any
 other kind of file at its name is replaced by a new one.

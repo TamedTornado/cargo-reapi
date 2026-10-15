@@ -2498,7 +2498,11 @@ fn a_declared_directory_in_the_temporary_directory_is_checked_on_a_hit() {
         .map(|entry| std::fs::read_to_string(entry.path()).expect("read file"))
         .collect::<Vec<_>>();
     contents.sort();
-    println!("cargo:rerun-if-changed={}", directory.display());
+    // Declared relative to the package, as a script usually does; Cargo
+    // records it so, and the target is inside the package.
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest"));
+    let relative = directory.strip_prefix(&manifest).expect("beneath the package");
+    println!("cargo:rerun-if-changed={}", relative.display());
     println!("cargo:rustc-env=SCHEMAS={}", contents.join(","));
 }
 "#,

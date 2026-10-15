@@ -153,6 +153,56 @@ mutation-checked: disabling the fix makes it fail.
 | 7 | Audit variables reached an ordinary compiler when `REAL_RUSTC` was set | Only a compiler with the shim's marker line gets them; every other has them removed | `audit_variables_never_reach_an_ordinary_compiler_even_with_a_real_rustc_set` (assume the shim) |
 | 8 | Named run targets accepted unchecked | Glob, unknown, repeated and non-executable selections decline before any build | `run_selections_cargo_would_reject_are_declined_before_any_build` (skip validation) |
 
+### Review of 6d49afd (0.2.15 findings): fixing classes
+
+Two rules replace the per-sink fixes.
+
+**One rule for gate inputs** (findings 1, 2). At publish the manifest's
+`observed_inputs` records the digest of every input any action observed outside
+the hashed trees (`collect_observed_inputs`): build-script `rerun-if-changed`
+paths and variables (relative paths resolved against every package of the name
+that declared them); every file the compiles' dependency files list that is
+neither in a hashed tree, nor in an immutable registry or git source, nor in
+the target's identity check (files beneath `cargo-reapi/` are recorded); and
+the native inputs and linker the action cache discovered for links, which the
+compiler wrapper records in `cargo-reapi/gate-inputs.jsonl`
+(`record_link_inputs`). Every hit, marker or restore, re-verifies them all by
+content; an input that cannot be verified is a miss. The old
+`administrative_inputs` special case is gone.
+
+**One write path** (findings 3, 4, 9). `src/safe_io.rs` and `src/beneath.rs`:
+no link is followed; a file is modified in place only as a locked append to a
+regular file with one link; anything else is replaced by a new file renamed
+over its name; lock files are opened with `O_NOFOLLOW` and only locked.
+Audit of every write cargo-reapi makes into storage a build can write:
+
+| Write | Process | Path |
+|-------|---------|------|
+| gate marker | driver | `Beneath::write_file` (unlink, `O_EXCL`) |
+| action log, hit record | driver | `Beneath::append_line` (single link, else replaced) |
+| action log, compile records | wrapper (sandbox) | `safe_io::append_line`; the driver replaces a multiply linked or non-regular log before the sandbox binds it (`create_file_and_canonicalize`) |
+| `gate-inputs.jsonl` | wrapper, driver removes | `safe_io::append_line`, `Beneath::remove_file` |
+| srt policy | driver | `safe_io::write_replacing` |
+| output and path-mapping records | wrapper | `create_new`, or `write_atomic` (temp file and rename) |
+| cache locks (maintenance, action, gate, query, resource tokens) | both | `safe_io::open_lock` (`O_NOFOLLOW`, locked only, never written) |
+| progress marker, access records | both | `safe_io::write_replacing` |
+| cache entries, restored outputs | wrapper | temp file and rename (`write_atomic`, `NamedTempFile`) |
+| `gate-snapshots`, `access/gates` | driver | denied to the sandbox's writes |
+| fingerprint and marker removal | driver | `Beneath::remove_file`, Cargo's own directories only |
+
+| # | Finding | Fix | Regression (mutation) |
+|---|---------|-----|------------------------|
+| 1 | Declared directory in `hermetic-tmp` | The one input rule above | `a_declared_directory_in_the_temporary_directory_is_checked_on_a_hit`; unit `a_relative_rerun_path_is_resolved_against_the_package_that_declared_it` (no relative resolution) |
+| 2 | Whole-gate hit ignored native inputs | Link inputs recorded and verified | `a_native_library_replaced_between_runs_is_never_restored_stale` (no `record_link_inputs`) |
+| 3 | Compile-action log hard-linked | `safe_io::append_line` and the pre-sandbox replacement | `hard_linked_log_and_policy_files_never_reach_the_lockfile_on_a_miss` (no replacement) |
+| 4 | Policy file hard-linked | `write_replacing` | same test, policy case (`fs::write`) |
+| 5 | Unframed file contents in tree hashing | Contents hashed apart and framed | unit `tree_hashing_frames_file_contents` (stream the bytes) |
+| 6 | `multi-pack-index` treated as content-addressed | Allowlist: loose objects `xx/{38 hex}` and `pack/pack-{hex}.pack` only | unit `git_object_metadata_is_hashed_by_content_and_objects_by_name` (open the allowlist) |
+| 7 | `run --all-targets` built | `run` rejects the build-only options | `run_with_options_or_arguments_cargo_would_reject_is_declined_before_any_build` (skip the check) |
+| 8 | `run hello` became `build hello` | Positional arguments decline `run` | same test (skip the check) |
+| 9 | Maintenance lock followed a link | `open_lock` | unit `a_lock_is_never_opened_through_a_link` (follow links); `a_planted_lock_link_never_creates_a_source_file` |
+| 10 | Package ids declined | Matched by id as well as name | `run_accepts_cargos_own_package_id` (name only) |
+
 Decline reasons each have a stderr assertion (`assert_declined`): non-build
 command, `--help`/`--version`, alias, `--config`/`-Z`/`--` option, include,
 `--ignore-rust-version`, alternate lockfile (both forms), missing declared
