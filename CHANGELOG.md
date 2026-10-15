@@ -70,6 +70,27 @@ source.
   inside; a link there sent the driver's marker and log writes into source.
 - A strict sandbox that cannot start is an error that says Cargo was not run,
   not a "running Cargo uncached" decline that then failed.
+- An action entry written by another cargo-reapi, such as a schema-1 entry
+  after upgrading, is a cache miss; reading its missing `dep_inputs` field
+  aborted the build. Action keys are namespaced by the cache layout's version.
+- `run` gates the `build --bin <name>` for the binary `run` would build
+  (`--bin`, `--example`, `-p`, `default-run`, the only binary), not every
+  binary of the package, and declines when that cannot be told; a gate
+  preparation failure never runs the program inside the sandbox as well as
+  outside it. `--open` declines.
+- Every driver write in the target after a build (the marker, the hit record)
+  opens beneath a handle with `O_NOFOLLOW`, so a link a build script planted
+  cannot redirect it into source. Snapshot verification covers every entry a
+  restore copies. Fingerprint invalidation removes only Cargo's own
+  `.fingerprint` directories. cargo-reapi's own directory in the target counts
+  as content for cleanliness, and a marker hit needs it to hold only what
+  cargo-reapi writes.
+- Dep-info inputs are resolved as the kernel does (a link then `..`) and
+  parsed with rustc's escaping, spaces only; a changed file behind either was
+  not noticed.
+- A Git dependency's checkout repository state is part of the gate key, since
+  Cargo needs its `.git` readable. The audit observer's variables no longer
+  reach the compiler.
 - Test hooks are compiled only with the `test-hooks` feature, documented as
   for the crate's own tests: the coalescing signal and
   `CARGO_REAPI_ACTION_CACHE_TEST_MODE`. The integration tests that need them

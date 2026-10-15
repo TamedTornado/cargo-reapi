@@ -326,9 +326,14 @@ Only `build`, `check`, `clippy`, `test`, `run`, `bench` and `doc` (and Cargo's
 `b`, `c`, `d`, `r`, `t`) are cached. Any other command, and `--help`,
 `-h`, `--version`, `-V` and `--list`, run as plain Cargo before any metadata
 run, so they never fetch, resolve or write a lockfile. `run` caches only its
-build: the gate is the `build` the `run` contains (arguments after `--`
-dropped), and the program then runs through Cargo as usual, outside the cache
-and the sandbox, with its own stdin and stdout, every time.
+build: the gate is the `build --bin <name>` for the one binary `run` builds
+(arguments after `--` dropped; the name from `--bin` or `--example`, else
+`-p`'s package or the root package's `default-run` or only binary), and the
+program then runs through Cargo as usual, outside the cache and the sandbox,
+with its own stdin and stdout, exactly once. A `run` whose binary cannot be
+told exactly (several binaries and no `default-run`, `--workspace`) declines.
+`--open` (`doc --open`) declines too, since a cache hit would never open the
+viewer.
 
 Because the sandboxed Cargo runs offline, cargo-reapi acquires dependency
 sources first, outside the sandbox, with `cargo metadata --locked` for the
@@ -405,9 +410,10 @@ external target directory to be cached.
 
 The whole-gate snapshot exists for clean consumers: a new checkout, worktree
 or container that has never built. A gate may write into a target only when
-the target is absent, or holds nothing but cargo-reapi's own directory and the
-two files Cargo keeps at the top of every target (`.rustc_info.json` and
-`CACHEDIR.TAG`, regenerated on demand and not build output). A snapshot is
+the target is absent, or holds nothing but the two files Cargo keeps at the top
+of every target (`.rustc_info.json` and `CACHEDIR.TAG`, regenerated on demand
+and not build output). cargo-reapi's own `cargo-reapi/` directory is content:
+what is in it cannot be told from a project's own input by its name. A snapshot is
 restored only into such a target, and a restore never overwrites a file that is
 already there. A producer likewise publishes only when it started from a clean
 target, so a snapshot holds exactly what one clean build wrote and never
@@ -415,20 +421,31 @@ another run's artifacts.
 
 One other state is a hit without a restore: the target holds exactly the files
 a marker recorded when the gate last left it, each with the size, modification
-time, change time and inode recorded then. The marker alone proves nothing: an
+time, change time and inode recorded then, and `cargo-reapi/` holds only
+entries cargo-reapi writes, none a link. The marker alone proves nothing: an
 extra file, or an output another Cargo run replaced, changed or deleted,
 fails the check.
 
 Every other target state skips the gate and runs Cargo with the per-action
 cache, as before any gate existed: nothing is restored, nothing is published,
-and Cargo's old fingerprints are cleared so it plans again. A source edit in a
+and Cargo's old fingerprints (`<target>/<profile>/.fingerprint` and
+`<target>/<triple>/<profile>/.fingerprint` of directories holding Cargo's
+`.cargo-lock`, and no other directory of that name) are cleared so it plans
+again. A source edit in a
 checkout that has built therefore costs a Cargo run over cached compiler
 actions, not a restore.
 
 Each snapshot records a content digest of every file when it is published,
-and every digest is checked against the bytes before anything is restored. A
-snapshot that fails the check is evicted and never restored; the gate runs
-as a producer instead.
+and every digest is checked against the bytes before anything is restored. The
+check covers every entry of the snapshot, whatever its name, and a restore copies
+the snapshot and nothing else. A snapshot that fails it is evicted and never
+restored; the gate runs as a producer instead.
+
+Everything the driver writes in the target outside the sandbox (the marker, the
+hit record in the action log, the removal of a stale marker) goes through a
+directory handle opened on the canonical target and one `openat` per path
+component with `O_NOFOLLOW`, so a symlink a build script planted, anywhere on
+the path, cannot redirect it into the source.
 
 #### What the keys hash
 
@@ -440,7 +457,9 @@ a package reached through a symlink or a virtual workspace beside the working
 directory.
 
 Each cached compile is also a hit only while every file in rustc's own
-dep-info still has the content recorded when the entry was made, the way
+dep-info still resolves to the file it did, with the content recorded when the
+entry was made (paths are resolved as the kernel does, a link followed by `..`
+included, and rustc's escaping, spaces only, is read exactly), the way
 `sccache` keys a compile. The action key covers the command line, the package
 directory and `OUT_DIR`, but `include!`, `include_str!` and `#[path]` can read a
 file anywhere under the workspace, so the entry lists each such input with its
@@ -458,6 +477,19 @@ abbreviated object name that gets longer when an unreachable object is added),
 so no partial hash of it is sound; no hash at all, with the state denied, is.
 A build that needs the commit must receive it through a declared input or the
 environment.
+
+A Git dependency is different because Cargo itself opens its checkout's `.git`
+under the sandbox, so it cannot be denied there. The gate key hashes the whole
+repository state of every Git dependency's checkout instead: every file of
+`.git` by content, and `objects` by the names and sizes of its files, which
+name their content, so a new tag, a reflog entry or an object that lengthens an
+abbreviated name changes the key.
+
+An entry of the action cache written by another version of cargo-reapi is a
+miss, never an error, and action keys carry the cache layout's version. The
+audit observer's variables (`CARGO_REAPI_RUSTC_TRACE`, `CARGO_REAPI_REAL_RUSTC`)
+never reach a compile; the observer shim removes them before the real compiler
+runs.
 
 ### Compile environment
 
