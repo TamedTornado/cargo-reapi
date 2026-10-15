@@ -140,6 +140,19 @@ mutation-checked: disabling the fix makes it fail.
 | 11 | `doc --open` skipped the viewer on a hit | Declined | `doc_open_is_never_cached_and_opens_every_time` (cache it) |
 | 12 | Audit variables reached the compiler | Passed only while an observer is the compiler, and the shim removes them before the real rustc; never counted as withheld | `an_audit_variable_never_reaches_the_compiler` (pass them) |
 
+### Review of 89aecd3 (0.2.14 findings)
+
+| # | Finding | Fix | Regression (mutation) |
+|---|---------|-----|------------------------|
+| 1 | A build plants a link in the cache's `access/gates` for the driver to write through | The sandbox policy denies writes to `gate-snapshots` and `access/gates` (`driver_only_cache_paths`) | `a_build_cannot_write_where_the_driver_records_after_it` (no deny) |
+| 2 | Action log hard-linked to a source file | Append only to a regular file with `st_nlink == 1`, else replace the name | `a_hard_linked_action_log_is_replaced_never_appended_to`, unit test in `beneath.rs` (skip the check) |
+| 3 | Directory-only changes to declared inputs | Directories keyed by name in `hash_tree` and in `observed_input_digest` | `a_new_empty_subdirectory_of_a_declared_directory_rebuilds`, unit test (drop both) |
+| 4 | Input in `hermetic-tmp` invisible to marker hits | **Fallback taken:** `hermetic-tmp` stays in the target (its stable path is part of compile keys); administrative inputs listed by dep-info are recorded with digests and checked on marker hits | `a_file_the_build_keeps_in_its_temporary_directory_is_checked_on_a_hit` (skip the check) |
+| 5 | Git `objects` metadata keyed by name | `objects/info` and `.idx`/`.keep`/`.rev` by content; alternates decline | `a_git_dependency_with_alternates_is_declined`, unit test `git_object_metadata_is_hashed_by_content_and_objects_by_name` |
+| 6 | `run` ignored `default-members` | `-p`, else default members at the root, else the member | `run_follows_the_workspaces_default_members` (root package only) |
+| 7 | Audit variables reached an ordinary compiler when `REAL_RUSTC` was set | Only a compiler with the shim's marker line gets them; every other has them removed | `audit_variables_never_reach_an_ordinary_compiler_even_with_a_real_rustc_set` (assume the shim) |
+| 8 | Named run targets accepted unchecked | Glob, unknown, repeated and non-executable selections decline before any build | `run_selections_cargo_would_reject_are_declined_before_any_build` (skip validation) |
+
 Decline reasons each have a stderr assertion (`assert_declined`): non-build
 command, `--help`/`--version`, alias, `--config`/`-Z`/`--` option, include,
 `--ignore-rust-version`, alternate lockfile (both forms), missing declared

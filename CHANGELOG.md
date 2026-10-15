@@ -91,6 +91,24 @@ source.
 - A Git dependency's checkout repository state is part of the gate key, since
   Cargo needs its `.git` readable. The audit observer's variables no longer
   reach the compiler.
+- Directories are keyed by name as well as files, empty ones included, in tree
+  hashing and in declared and observed directory inputs: a build script that
+  lists a directory saw a new empty subdirectory only after a rebuild nothing
+  forced.
+- A file under `cargo-reapi/` that rustc's dependency files list as read (a
+  generator's file in the build's temporary directory) is checked by content on
+  every marker hit; a snapshot with such files is never restored elsewhere.
+- Git dependency repositories hash `objects/info` and pack index, `.keep` and
+  `.rev` files by content, and a checkout with alternates declines.
+- `run` resolves its package as Cargo does (`-p`, the workspace's
+  `default-members` at its root, else the member) and declines glob, unknown,
+  repeated and non-executable `--bin`/`--example` selections before building.
+- The audit variables are removed from every compiler that does not carry the
+  observer shim's marker; setting `CARGO_REAPI_REAL_RUSTC` no longer opens
+  them to an ordinary compiler.
+- The sandbox makes the cache's `gate-snapshots` and `access/gates` read-only
+  to builds, and the action log is only appended to as a single-link regular
+  file; a build could plant a link there that the driver wrote through.
 - Test hooks are compiled only with the `test-hooks` feature, documented as
   for the crate's own tests: the coalescing signal and
   `CARGO_REAPI_ACTION_CACHE_TEST_MODE`. The integration tests that need them

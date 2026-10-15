@@ -328,10 +328,15 @@ Only `build`, `check`, `clippy`, `test`, `run`, `bench` and `doc` (and Cargo's
 run, so they never fetch, resolve or write a lockfile. `run` caches only its
 build: the gate is the `build --bin <name>` for the one binary `run` builds
 (arguments after `--` dropped; the name from `--bin` or `--example`, else
-`-p`'s package or the root package's `default-run` or only binary), and the
+the one binary of the packages Cargo selects: `-p`'s package, else at the
+workspace root manifest the workspace's `default-members`, else inside a member
+that member; then its only binary, or the single `default-run`), and the
 program then runs through Cargo as usual, outside the cache and the sandbox,
 with its own stdin and stdout, exactly once. A `run` whose binary cannot be
-told exactly (several binaries and no `default-run`, `--workspace`) declines.
+told exactly (several binaries and no single `default-run`, `--workspace`) declines,
+and so does a selection Cargo rejects before compiling: a glob or unknown
+name, several `--bin` or `--example`, a non-executable example. Nothing is
+built for these.
 `--open` (`doc --open`) declines too, since a cache hit would never open the
 viewer.
 
@@ -419,6 +424,12 @@ already there. A producer likewise publishes only when it started from a clean
 target, so a snapshot holds exactly what one clean build wrote and never
 another run's artifacts.
 
+A file under `cargo-reapi/` that rustc's dependency files list as read, such
+as a generator's file in the build's temporary directory (`TMPDIR` is
+`target/cargo-reapi/hermetic-tmp`), is recorded with its digest when a gate is
+published and checked by content on every marker hit; a snapshot that has any
+is never restored into another target, which cannot have them.
+
 One other state is a hit without a restore: the target holds exactly the files
 a marker recorded when the gate last left it, each with the size, modification
 time, change time and inode recorded then, and `cargo-reapi/` holds only
@@ -450,7 +461,9 @@ the path, cannot redirect it into the source.
 #### What the keys hash
 
 The gate key hashes the selected workspace root, the working directory and
-every local package by its real directory, with no exclusion by name except
+every local package by its real directory, directories by name as well as files
+(an empty subdirectory is part of what a build script that lists them reads;
+declared directory inputs are keyed the same way), with no exclusion by name except
 `.git` (below): only the canonical target directory and the action log are
 left out. A directory named `target` inside a source tree is hashed, and so is
 a package reached through a symlink or a virtual workspace beside the working
@@ -481,15 +494,25 @@ environment.
 A Git dependency is different because Cargo itself opens its checkout's `.git`
 under the sandbox, so it cannot be denied there. The gate key hashes the whole
 repository state of every Git dependency's checkout instead: every file of
-`.git` by content, and `objects` by the names and sizes of its files, which
-name their content, so a new tag, a reflog entry or an object that lengthens an
-abbreviated name changes the key.
+`.git` by content, and the loose objects and pack data under `objects` by name
+and size, which name their content; `objects/info` and a pack's `.idx`, `.keep`
+and `.rev` files carry state their names do not and are hashed by content, so a
+new tag, a reflog entry or an object that lengthens an abbreviated name changes
+the key. A checkout whose repository has `objects/info/alternates` borrows
+objects from elsewhere and declines.
 
 An entry of the action cache written by another version of cargo-reapi is a
 miss, never an error, and action keys carry the cache layout's version. The
 audit observer's variables (`CARGO_REAPI_RUSTC_TRACE`, `CARGO_REAPI_REAL_RUSTC`)
-never reach a compile; the observer shim removes them before the real compiler
-runs.
+never reach a compile. They are given only to a compiler that carries the
+observer shim's marker line, which removes them before the real compiler
+runs; every other compiler has them stripped, whatever else is set.
+
+Nothing a build can write is something the driver writes after it, outside the
+sandbox: the sandbox's policy makes the cache's `gate-snapshots` and
+`access/gates` read-only to the build, and the action log is appended to only
+as a regular file with a single hard link, opened without following links; any
+other kind of file at its name is replaced by a new one.
 
 ### Compile environment
 
@@ -529,7 +552,7 @@ shells. A compile receives:
 cargo-reapi's own settings (action log, cache directory, backend, worktree
 roots and resource capacity) are read by the wrapper only; they never reach a
 compile and are not keyed. The audit observer's `CARGO_REAPI_REAL_RUSTC` and
-`CARGO_REAPI_RUSTC_TRACE` reach the compiler unkeyed.
+`CARGO_REAPI_RUSTC_TRACE` reach only a compiler that is the observer shim.
 
 Search lists (`PATH`, `LD_LIBRARY_PATH`, `LIBRARY_PATH`, `COMPILER_PATH` and
 the `DYLD_*` library paths) reach the compile as the canonical directories
