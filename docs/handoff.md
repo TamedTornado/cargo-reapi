@@ -1,7 +1,9 @@
 # cargo-reapi handoff: per-compile caching (read this first)
 
-State as of 2026-10-15. The narrowing is finished and merged to `main`. It is
-**not released**: the version is still 0.2.10, there is no tag, nothing is
+State as of 2026-10-15. The narrowing is finished and merged to `main`. The
+native-rule narrowing and scheduling-key fix are on branch
+`native-narrowing`, waiting for the coordinator's merge go-ahead (see below).
+None of it is **released**: the version is still 0.2.10, there is no tag, nothing is
 published and nothing is installed. The whole-gate design and its review
 history are in Git (`main` at 86d3e1c and earlier, including the previous
 version of this file).
@@ -108,25 +110,101 @@ Why compiles run fresh:
   linked proc-macro `.so` is not byte-identical across checkouts, so its
   dependents' `--extern` digests differ: the proc-macro cost cascades.
 
-## Open proposals (not built; waiting for the coordinator)
+## Native-rule narrowing and scheduling keys (branch `native-narrowing`)
 
-1. **Sound narrowing of the native rule.** Verified with rustc: a
-   metadata-only compile reads no native libraries, and an rlib compile reads
-   only bundled static libraries (not `dylib`, default-kind or
-   `static:-bundle`). So: ignore `-L`/`-l` for metadata-only compiles; ignore
-   non-bundled `-l` kinds for rlib compiles; key bundled `-l static=` found
-   inside; when outside `-L` directories are present, publish only if the
-   produced rlib holds no members besides `lib.rmeta` and the crate's
-   `*.rcgu.o` (the same key implies the same `#[link]` attributes, so the
-   check carries to every hit). Makes check/clippy and the propagated-`-L`
-   crates cacheable.
-2. **Proc-macro and dylib caching.** Record the files the linker opens
-   (`-Wl,--trace`, supported by GNU ld, lld and mold) when the action runs,
-   store them with the entry as link inputs, and verify their digests on
-   lookup like dep-info inputs, with the linker identity keyed. Restrict to
-   proc-macro and dylib crate types whose traced outside inputs are the C
-   toolchain's default libraries (crt objects, libc, libgcc, libm). Restoring
-   the same `.so` also removes the miss cascade.
+Approved by the coordinator; commits e737dbb..native-narrowing (6f5e6fd,
+b0dcaa0, 3418cca, 89325b1 and this handoff). Merge to `main` waits for the
+coordinator's go-ahead; it is a fast-forward of `main` to the branch, then a
+push. No bump, tag, publish or install comes with it.
+
+- `capture::native_inputs`: a metadata-only compile ignores `-L` and `-l`
+  (and keys no `-L` directory files). An rlib compile ignores `-l` kinds it
+  does not bundle (`bundles()`: only `static` without `-bundle` counts); a
+  bundled `-l` must be found in an inside or toolchain directory. An outside
+  `-L` directory sets `check_bundled_members` instead of making the compile
+  ineligible. Link steps are unchanged (always uncached).
+- `capture::bundles_nothing_unkeyed` (called in `cache::finish_cached_execution`
+  before `publish`): with `check_bundled_members`, every `.rlib` output must
+  hold only `lib.rmeta`, `lib.rmeta-link` (an object rustc 1.97 writes that
+  lists the crate's own objects; 1.93 does not) and `<crate>-*.rcgu.o` /
+  `<crate>.*.rcgu.o` members
+  (`src/rlib.rs`, read with the `ar` crate, GNU and BSD formats); otherwise the
+  compile is logged `local-ineligible` (with no reason text, since the reason
+  is found after the compile) and nothing is stored. The check is needed
+  beside the command-line rule because `#[link(kind = "static")]` bundles an
+  archive that never appears as `-l`. Such compiles are also remote-ineligible.
+- `environment::is_scheduling_environment`: `CARGO_MAKEFLAGS`,
+  `CARGO_BUILD_JOBS` and `CARGO_REAPI_*` still reach rustc (it joins the
+  jobserver) but are not keyed. `cache::publish` refuses to store a compile
+  whose dep-info tracks one of them (`env!`), so the key stays sound.
+- Known and out of scope (hostile build code): outside `-L crate=`,
+  `-L dependency=` and `-L all` directories could in principle serve an
+  `extern crate` of a sysroot name; this was already the case before.
+
+Regressions (each shown failing under a targeted mutation, then reverted):
+`a_check_with_a_propagated_outside_search_directory_is_a_hit_the_second_time`
+(metadata rule removed),
+`a_library_searching_an_outside_directory_without_bundling_is_cached`
+(every `-l` treated as bundled),
+`a_library_bundling_an_outside_static_archive_runs_uncached` (the `#[link]`
+case; member check disabled),
+`a_static_library_named_by_link_lib_inside_the_workspace_keys_the_compile`
+(inside directory files not keyed),
+`a_library_naming_an_outside_static_archive_by_link_lib_runs_uncached`
+(tests/native_libraries.rs);
+`job_scheduling_and_wrapper_settings_do_not_change_action_keys` (scheduling
+names keyed again),
+`a_compile_that_reads_an_unkeyed_scheduling_variable_is_not_stored` (publish
+refusal removed) (tests/environment.rs); unit test
+`only_the_metadata_and_the_crates_own_objects_are_its_own` (src/rlib.rs).
+Suite: 118 tests pass with `--features test-hooks`; fmt and clippy
+`-D warnings` clean. The local default toolchain is 1.93, which writes no
+`lib.rmeta-link`; the native and environment tests also pass under
+`cargo +1.97.1`, and there rejecting `lib.rmeta-link` fails
+`a_library_searching_an_outside_directory_without_bundling_is_cached`. The
+first Moria measurement found that defect (34 rlibs refused).
+
+### Moria measurement after the narrowing
+
+Same method as above, but run for both binaries in the same session:
+scratch release builds of `main` e737dbb (before) and `native-narrowing`
+(after), Moria 847db36a, Moria's environment with a separate cache per
+binary, `nice -n 5` through `build-slot.sh`; each invocation in its own fresh
+checkout, cold then warm. Counts are action-log rows; "probe" rows are
+Cargo's and build scripts' uncached probe compiles (no declared outputs),
+22 in each run. Load 9 to 20, so walls are noisy.
+
+| warm invocation | wall | hits | misses | proc-macro links | other links | native-uncached | probes |
+|---|---|---|---|---|---|---|---|
+| check --workspace --all-targets, before | 48.1 s | 567 | 6 | 42 | 77 | 56 | 22 |
+| check --workspace --all-targets, after | 20.8 s | 606 | 23 | 42 | 77 | 0 | 22 |
+| build -p moria-showcase, before | 64.3 s | 496 | 5 | 42 | 75 | 37 | 22 |
+| build -p moria-showcase, after | 52.4 s | 527 | 11 | 42 | 75 | 0 | 22 |
+
+Cold walls: check 84.3 s before, 84.3 s after; showcase 138.7 s before,
+126.8 s after.
+
+The remaining misses come from compiles whose inputs differ between
+checkouts, plus everything that depends on them, which is now cacheable and
+so shows up as a miss rather than as uncached. Proc-macro `.so` files are
+relinked differently in each checkout (num_enum, boa_wintertc, boa_runtime and
+their dependents). `libspa-sys` has cc-built `static_fns.o` and
+`liblibspa-rs-reexports.a` in `OUT_DIR` whose bytes depend on the checkout
+path, so libspa_sys, libspa, pipewire_sys, pipewire, cpal and moria_sfx miss.
+Each of these is keyed correctly; the inputs really do differ.
+
+## Deferred (not approved): proc-macro and dylib caching
+
+Record the files the linker opens (`-Wl,--trace`, supported by GNU ld, lld
+and mold) when the action runs, store them with the entry as link inputs,
+and verify their digests on lookup like dep-info inputs, with the linker
+identity keyed. Restrict to proc-macro and dylib crate types whose traced
+outside inputs are the C toolchain's default libraries (crt objects, libc,
+libgcc, libm). Restoring the same `.so` also removes the miss cascade.
+Measured cost of not doing it, per warm `build -p moria-showcase`: 42
+proc-macro link units, 54 s of summed unit time, plus the 5 to 6 dependent
+misses (a relinked proc-macro `.so` differs across checkouts, so its
+dependents' `--extern` digests differ).
 
 ## Release follow-ons (not this lane's)
 
@@ -140,6 +218,5 @@ Why compiles run fresh:
   `_RESOURCE_CPU_CAPACITY` and `_BACKEND` are still read.
 - Update the Moria skill `.agents/skills/cargo-reapi/SKILL.md` for the new
   behavior: link steps and outside-native compiles run uncached.
-- Possible key splitting to look at: `CARGO_MAKEFLAGS`, `CARGO_BUILD_JOBS`,
-  `RUSTC_WRAPPER` and `CARGO_REAPI_SRT` are keyed through the `CARGO*`/`RUST*`
-  families; no misses came from them in the measurement.
+- `RUSTC_WRAPPER` is still keyed through the `RUST*` family; no misses came
+  from it in the measurement.
