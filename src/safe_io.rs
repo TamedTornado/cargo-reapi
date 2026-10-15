@@ -79,3 +79,43 @@ pub fn append_line(path: &Path, line: &str) -> Result<()> {
         Ok(())
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+
+    use super::{open_lock, write_replacing};
+
+    #[test]
+    fn a_lock_is_never_opened_through_a_link() {
+        let root = tempfile::tempdir().expect("root");
+        let created = root.path().join("created");
+        std::os::unix::fs::symlink(&created, root.path().join("lock")).expect("link");
+
+        assert!(open_lock(&root.path().join("lock")).is_err());
+
+        assert!(
+            !created.exists(),
+            "opening the lock created the file it pointed at"
+        );
+        assert!(open_lock(&root.path().join("fresh")).is_ok());
+    }
+
+    #[test]
+    fn writing_replaces_a_hard_link_and_leaves_what_it_linked_to() {
+        let root = tempfile::tempdir().expect("root");
+        fs::write(root.path().join("source"), "source").expect("source");
+        fs::hard_link(root.path().join("source"), root.path().join("policy")).expect("link");
+
+        write_replacing(&root.path().join("policy"), b"policy").expect("write");
+
+        assert_eq!(
+            fs::read(root.path().join("source")).expect("source"),
+            b"source"
+        );
+        assert_eq!(
+            fs::read(root.path().join("policy")).expect("policy"),
+            b"policy"
+        );
+    }
+}

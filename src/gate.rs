@@ -2211,6 +2211,38 @@ mod tests {
         assert_ne!(super::observed_input_digest("path", &name), before);
     }
 
+    #[test]
+    fn a_relative_rerun_path_is_resolved_against_the_package_that_declared_it() {
+        let root = tempfile::tempdir().expect("root");
+        let fingerprint = root.path().join("run-build-script.json");
+        fs::write(
+            &fingerprint,
+            r#"{"local":[{"RerunIfChanged":{"output":"debug/build/dep-0123456789abcdef/output","paths":["assets","/absolute/input"]}},{"RerunIfEnvChanged":{"var":"SETTING","val":null}}]}"#,
+        )
+        .expect("fingerprint");
+        let scope = super::InputScope {
+            packages: vec![
+                ("dep".to_owned(), PathBuf::from("/packages/dep")),
+                ("other".to_owned(), PathBuf::from("/packages/other")),
+            ],
+            covered: Vec::new(),
+        };
+        let mut paths = BTreeSet::new();
+        let mut variables = BTreeSet::new();
+
+        super::collect_build_script_inputs(&fingerprint, &scope, &mut paths, &mut variables)
+            .expect("collect");
+
+        assert_eq!(
+            paths.into_iter().collect::<Vec<_>>(),
+            [
+                PathBuf::from("/absolute/input"),
+                PathBuf::from("/packages/dep/assets")
+            ]
+        );
+        assert_eq!(variables.into_iter().collect::<Vec<_>>(), ["SETTING"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn tree_hashing_frames_file_contents() {
