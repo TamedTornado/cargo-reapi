@@ -1,5 +1,7 @@
 mod acceptance;
 mod action;
+#[cfg(unix)]
+mod beneath;
 mod cache;
 mod capture;
 mod cargo_config;
@@ -418,7 +420,7 @@ fn describe_compile_environment(
 fn run_cli(cli: &Cli) -> Result<i32> {
     let context = resolve_driver_context(cli)?;
     if let Some(reason) = &context.decline {
-        return run_uncached(cli, &context, reason);
+        return run_uncached(cli, &context, &cli.cargo_args, reason);
     }
     if context.project.is_some() {
         crate::hermetic::provider_identity_digest().context(SANDBOX_UNAVAILABLE)?;
@@ -427,10 +429,14 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     // Only `run`'s build is cached, as the `build` it contains. The program
     // then runs through Cargo as ever, with its own stdin and stdout, and
     // is never skipped, replayed or sandboxed.
-    let Some(command_index) = context.runs_program.filter(|_| context.project.is_some()) else {
+    let Some(plan) = context
+        .runs_program
+        .clone()
+        .filter(|_| context.project.is_some())
+    else {
         return run_with(cli, context, &cli.cargo_args);
     };
-    let build = build_arguments(&cli.cargo_args, command_index);
+    let build = build_arguments(&cli.cargo_args, &plan);
     let code = run_with(cli, context.clone(), &build)?;
     if code != 0 {
         return Ok(code);
@@ -445,15 +451,17 @@ fn run_cli(cli: &Cli) -> Result<i32> {
 }
 
 /// `run`'s arguments as the `build` they contain: the subcommand replaced,
-/// and the program's own arguments after `--` dropped.
-fn build_arguments(cargo_args: &[OsString], command_index: usize) -> Vec<OsString> {
+/// the program's own arguments after `--` dropped, and the one binary `run`
+/// would build named, so that nothing else is built.
+fn build_arguments(cargo_args: &[OsString], plan: &RunPlan) -> Vec<OsString> {
+    let index = plan.command_index;
     let mut build = cargo_args.to_vec();
-    build[command_index] = OsString::from("build");
-    if let Some(separator) = build[command_index..]
-        .iter()
-        .position(|argument| argument == "--")
-    {
-        build.truncate(command_index + separator);
+    build[index] = OsString::from("build");
+    if let Some(separator) = build[index..].iter().position(|argument| argument == "--") {
+        build.truncate(index + separator);
+    }
+    if let Some(binary) = &plan.binary {
+        build.extend([OsString::from("--bin"), OsString::from(binary)]);
     }
     build
 }
@@ -479,7 +487,7 @@ fn run_with(cli: &Cli, context: DriverContext, cargo_args: &[OsString]) -> Resul
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return run_uncached(cli, &context, &one_line(&format!("{error:#}")));
+            return run_uncached(cli, &context, cargo_args, &one_line(&format!("{error:#}")));
         }
     };
     let DriverContext {
@@ -641,6 +649,14 @@ fn restart_installed(executable: &Path) -> Result<i32> {
     )
 }
 
+/// What a cached `run` builds: the subcommand's place among the arguments,
+/// and the binary to name when the arguments do not.
+#[derive(Clone)]
+struct RunPlan {
+    command_index: usize,
+    binary: Option<String>,
+}
+
 /// Said when the strict sandbox cannot be built. Cargo did not run, and
 /// nothing was declined: this is a failure of the environment.
 const SANDBOX_UNAVAILABLE: &str =
@@ -658,7 +674,7 @@ struct DriverContext {
     decline: Option<String>,
     /// The invocation is `run`: only its build is cached, as `build`, and
     /// the program then runs normally.
-    runs_program: Option<usize>,
+    runs_program: Option<RunPlan>,
 }
 
 /// What the preflight of a cached invocation learned before it declined or
@@ -668,7 +684,7 @@ struct Preflight {
     project: Option<Project>,
     target_root: Option<PathBuf>,
     /// For `run`, where the subcommand sits among the Cargo arguments.
-    runs_program: Option<usize>,
+    runs_program: Option<RunPlan>,
 }
 
 fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
@@ -733,18 +749,8 @@ fn prepare_cached_project(
     preflight: &mut Preflight,
 ) -> Result<()> {
     let selection = crate::selection::select(workspace_root, &cli.cargo_args)?;
-    if selection
-        .command
-        .as_deref()
-        .is_some_and(|c| c == "run" || c == "r")
-    {
-        preflight.runs_program = selection.command_index;
-    }
-    if !selection.is_cacheable() {
-        bail!(
-            "only build, check, clippy, test, run, bench and doc invocations are cached, and not \
-             --help or --version"
-        );
+    if let Some(reason) = selection.uncacheable_reason() {
+        bail!("{reason}");
     }
     if let Some(name) = crate::cargo_config::declined_environment() {
         bail!(
@@ -772,6 +778,18 @@ fn prepare_cached_project(
         .as_deref()
         .context("cache directory is required")?;
     let project = Project::resolve(workspace_root, cache_dir, &selection.metadata_arguments)?;
+    if selection
+        .command
+        .as_deref()
+        .is_some_and(|c| c == "run" || c == "r")
+    {
+        preflight.runs_program = Some(RunPlan {
+            command_index: selection
+                .command_index
+                .context("the subcommand has no position")?,
+            binary: run_binary(&selection, &project)?,
+        });
+    }
     let configured = selection
         .target_dir
         .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
@@ -788,6 +806,29 @@ fn prepare_cached_project(
     Ok(())
 }
 
+/// The binary to name for `run`'s build, or `None` when the arguments name
+/// it (`--bin`, `--example`). Declines when which one `run` builds cannot be
+/// told exactly.
+fn run_binary(
+    selection: &crate::selection::Selection,
+    project: &Project,
+) -> Result<Option<String>> {
+    use crate::selection::NamedTarget::{Absent, Named, Unnamed};
+
+    match (&selection.bin, &selection.example) {
+        (Named(_), _) | (_, Named(_)) => Ok(None),
+        (Unnamed, _) | (_, Unnamed) => {
+            bail!("`run` gives --bin or --example without a name")
+        }
+        (Absent, Absent) => {
+            if selection.selects_packages && selection.packages.is_empty() {
+                bail!("`run` selects packages with --workspace or --exclude");
+            }
+            project.run_binary(&selection.packages).map(Some)
+        }
+    }
+}
+
 /// An error message as one line.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -797,7 +838,12 @@ fn one_line(text: &str) -> String {
 /// restored, recorded or wrapped. With a resolved project the strict
 /// sandbox still applies; without one no policy can be built and Cargo runs
 /// plainly.
-fn run_uncached(cli: &Cli, context: &DriverContext, reason: &str) -> Result<i32> {
+fn run_uncached(
+    cli: &Cli,
+    context: &DriverContext,
+    cargo_args: &[OsString],
+    reason: &str,
+) -> Result<i32> {
     let mut cargo = match &context.project {
         Some(project) => {
             let cache_dir = cli
@@ -820,10 +866,7 @@ fn run_uncached(cli: &Cli, context: &DriverContext, reason: &str) -> Result<i32>
         None => Command::new("cargo"),
     };
     eprintln!("cargo-reapi: not caching ({reason}); running Cargo uncached");
-    let status = cargo
-        .args(&cli.cargo_args)
-        .status()
-        .context("starting Cargo")?;
+    let status = cargo.args(cargo_args).status().context("starting Cargo")?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -1150,7 +1193,7 @@ mod cli_tests {
 
     use std::ffi::OsString;
 
-    use super::{Cli, build_arguments, resolve_target_root_from, validate_driver_paths};
+    use super::{Cli, RunPlan, build_arguments, resolve_target_root_from, validate_driver_paths};
 
     fn arguments(words: &[&str]) -> Vec<OsString> {
         words.iter().map(OsString::from).collect()
@@ -1161,12 +1204,21 @@ mod cli_tests {
         assert_eq!(
             build_arguments(
                 &arguments(&["--locked", "run", "-p", "tool", "--", "--all"]),
-                1
+                &RunPlan {
+                    command_index: 1,
+                    binary: Some("tool".to_owned())
+                }
             ),
-            arguments(&["--locked", "build", "-p", "tool"])
+            arguments(&["--locked", "build", "-p", "tool", "--bin", "tool"])
         );
         assert_eq!(
-            build_arguments(&arguments(&["r", "--bin", "tool"]), 0),
+            build_arguments(
+                &arguments(&["r", "--bin", "tool"]),
+                &RunPlan {
+                    command_index: 0,
+                    binary: None
+                }
+            ),
             arguments(&["build", "--bin", "tool"])
         );
     }

@@ -211,8 +211,15 @@ impl CompileEnvironment {
         if WRAPPER_PRIVATE.contains(&name) {
             return false;
         }
+        // The audit observer's variables reach the compiler only while an
+        // observer is the compiler, where its shim consumes them and removes
+        // them before the real rustc runs. Otherwise they are unkeyed input
+        // a crate could read (`option_env!`), so they never reach it.
+        if OBSERVER_ENVIRONMENT.contains(&name) {
+            return env::var_os("CARGO_REAPI_REAL_RUSTC").is_some();
+        }
         match self {
-            Self::Keyed(names) => names.contains(name) || OBSERVER_ENVIRONMENT.contains(&name),
+            Self::Keyed(names) => names.contains(name),
             Self::Whole { .. } => true,
         }
     }
@@ -706,7 +713,8 @@ mod tests {
     fn keyed_environment_never_passes_wrapper_records() {
         let keyed = CompileEnvironment::Keyed(BTreeSet::from(["PATH".to_owned()]));
         assert!(keyed.passes(OsStr::new("PATH")));
-        assert!(keyed.passes(OsStr::new("CARGO_REAPI_RUSTC_TRACE")));
+        // With no observer as the compiler, the audit variables are hidden.
+        assert!(!keyed.passes(OsStr::new("CARGO_REAPI_RUSTC_TRACE")));
         assert!(!keyed.passes(OsStr::new("CARGO_REAPI_ACTION_LOG")));
         assert!(!keyed.passes(OsStr::new("OLDPWD")));
         assert!(!keyed.passes(OsStr::new("CARGO_REAPI_CALLER_ENVIRONMENT")));

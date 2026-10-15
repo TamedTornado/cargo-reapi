@@ -29,4 +29,8 @@ record=$(mktemp "$CARGO_REAPI_RUSTC_TRACE/rustc-observation.XXXXXX")
   printf 'cwd=%s\n' "$(pwd -P)"
 } >"$record"
 
-exec "$CARGO_REAPI_REAL_RUSTC" "$@"
+# The audit variables are this shim's own: the compiler never sees them, so
+# nothing a crate reads (`option_env!`) depends on where a trace is kept.
+real_rustc=$CARGO_REAPI_REAL_RUSTC
+unset CARGO_REAPI_REAL_RUSTC CARGO_REAPI_RUSTC_TRACE
+exec "$real_rustc" "$@"

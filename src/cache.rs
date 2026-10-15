@@ -49,7 +49,7 @@ fn read_action_manifest(encoded: &[u8]) -> Option<ActionManifest> {
 }
 
 /// The version of the action manifest, which records dep-info inputs.
-const ACTION_MANIFEST_VERSION: u32 = 2;
+const ACTION_MANIFEST_VERSION: u32 = 3;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ActionManifest {
@@ -1377,8 +1377,8 @@ mod tests {
         let old = br#"{"schema_version":1,"action_key":"k","outputs":[]}"#;
         assert!(super::read_action_manifest(old).is_none());
         assert!(super::read_action_manifest(b"not json").is_none());
-        assert!(super::read_action_manifest(br#"{"schema_version":2}"#).is_none());
-        let current = br#"{"schema_version":2,"action_key":"k","outputs":[],"dep_inputs":[]}"#;
+        assert!(super::read_action_manifest(br#"{"schema_version":3}"#).is_none());
+        let current = br#"{"schema_version":3,"action_key":"k","outputs":[],"dep_inputs":[]}"#;
         assert!(super::read_action_manifest(current).is_some());
     }
 

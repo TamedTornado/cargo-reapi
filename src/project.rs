@@ -19,12 +19,20 @@ pub struct Project {
     /// `CARGO_TARGET_DIR` put it.
     pub target_directory: PathBuf,
     pub packages: Vec<Package>,
+    /// The package Cargo calls the root: the one at the manifest it finds,
+    /// when that manifest has a package.
+    pub root_package: Option<String>,
 }
 
 /// A package in the project's resolve.
 #[derive(Clone)]
 pub struct Package {
     pub id: String,
+    pub name: String,
+    /// The names of its binary targets.
+    pub binaries: Vec<String>,
+    /// Its `default-run`.
+    pub default_run: Option<String>,
     pub root: PathBuf,
     /// A package built from a local path rather than a registry or Git.
     pub local: bool,
@@ -72,6 +80,7 @@ impl Project {
             workspace_root: path("workspace_root")?,
             target_directory: path("target_directory")?,
             packages,
+            root_package: metadata["resolve"]["root"].as_str().map(str::to_owned),
         })
     }
 
@@ -126,6 +135,40 @@ impl Project {
     }
 }
 
+impl Project {
+    /// The one binary `cargo run` with these selections builds, or why that
+    /// cannot be told exactly. `-p` names the package, else the root package;
+    /// then `default-run`, else the package's only binary.
+    pub fn run_binary(&self, selected: &[String]) -> Result<String> {
+        let package = match selected {
+            [] => {
+                let root = self
+                    .root_package
+                    .as_ref()
+                    .context("`run` selects no package and there is no root package")?;
+                self.packages.iter().find(|package| &package.id == root)
+            }
+            [spec] => {
+                let name = spec.split_once('@').map_or(spec.as_str(), |(name, _)| name);
+                self.packages
+                    .iter()
+                    .find(|package| package.name == name && package.local)
+            }
+            _ => bail!("`run` selects more than one package"),
+        }
+        .context("the package `run` selects is not in the project")?;
+        match (&package.default_run, package.binaries.as_slice()) {
+            (Some(name), _) | (None, [name]) => Ok(name.clone()),
+            (None, binaries) => bail!(
+                "`run` in {} has {} binaries and no default-run, so which one it builds is \
+                 Cargo's to say",
+                package.name,
+                binaries.len()
+            ),
+        }
+    }
+}
+
 impl Package {
     fn from_metadata(package: &serde_json::Value) -> Result<Self> {
         let manifest = package["manifest_path"]
@@ -151,8 +194,23 @@ impl Package {
             }
         }
 
+        let binaries = package["targets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|target| {
+                target["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+            })
+            .filter_map(|target| target["name"].as_str().map(str::to_owned))
+            .collect();
+
         Ok(Self {
             id: package["id"].as_str().unwrap_or(manifest).to_owned(),
+            name: package["name"].as_str().unwrap_or_default().to_owned(),
+            binaries,
+            default_run: package["default_run"].as_str().map(str::to_owned),
             root,
             local: package["source"].is_null(),
             source_directories,

@@ -70,7 +70,7 @@ const HARMLESS_CONFIG_KEYS: [&str; 3] = ["profile.", "term.", "build.jobs"];
 /// Options without a value that the cached subcommands accept, besides the
 /// ones read individually. Anything else after the subcommand declines: an
 /// unknown option could select a lockfile, project or compiler unseen.
-const KNOWN_FLAGS: [&str; 22] = [
+const KNOWN_FLAGS: [&str; 21] = [
     "all-targets",
     "benches",
     "bins",
@@ -83,7 +83,6 @@ const KNOWN_FLAGS: [&str; 22] = [
     "no-deps",
     "no-fail-fast",
     "no-run",
-    "open",
     "quiet",
     "release",
     "tests",
@@ -114,22 +113,50 @@ pub struct Selection {
     pub command: Option<String>,
     /// Where the subcommand sits among the arguments.
     pub command_index: Option<usize>,
+    /// The values of `-p` and `--package`.
+    pub packages: Vec<String>,
+    /// `--bin`, with its value when it has one.
+    pub bin: NamedTarget,
+    /// `--example`, with its value when it has one.
+    pub example: NamedTarget,
+    /// `--open`: the invocation opens a viewer after building.
+    pub opens_viewer: bool,
+    /// `-p`, `--workspace` or `--exclude` was given.
+    pub selects_packages: bool,
     /// `--help`, `-h`, `--version`, `-V` or `--list` was given: Cargo answers
     /// without building anything.
     pub informational: bool,
 }
 
 impl Selection {
-    /// Whether the invocation builds or runs the selected project, the only
-    /// commands cargo-reapi caches. Everything else, and `--help` and
-    /// `--version`, is Cargo's alone.
-    pub fn is_cacheable(&self) -> bool {
-        !self.informational
-            && self
+    /// Why the invocation is Cargo's alone, or `None` when it builds or runs
+    /// the selected project, the only invocations cargo-reapi caches.
+    /// Everything else, `--help` and `--version`, and `--open`, whose viewer a
+    /// cache hit would never open, runs as plain Cargo.
+    pub fn uncacheable_reason(&self) -> Option<&'static str> {
+        if self.informational
+            || !self
                 .command
                 .as_deref()
                 .is_some_and(|command| CACHEABLE_COMMANDS.contains(&command))
+        {
+            return Some(
+                "only build, check, clippy, test, run, bench and doc invocations are cached, and \
+                 not --help or --version",
+            );
+        }
+        self.opens_viewer
+            .then_some("`--open` opens a viewer that a cache hit would skip")
     }
+}
+
+/// A `--bin` or `--example` option: absent, given without a name, or named.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub enum NamedTarget {
+    #[default]
+    Absent,
+    Unnamed,
+    Named(String),
 }
 
 /// The commands whose builds cargo-reapi caches, with Cargo's built-in
@@ -215,6 +242,12 @@ struct Reader<'a> {
     command: Option<String>,
     command_index: Option<usize>,
     informational: bool,
+    package_names: Vec<String>,
+    /// `--bin`, with its value when it has one.
+    bin: NamedTarget,
+    /// `--example`, with its value when it has one.
+    example: NamedTarget,
+    opens_viewer: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -230,6 +263,10 @@ impl<'a> Reader<'a> {
             command: None,
             command_index: None,
             informational: false,
+            package_names: Vec::new(),
+            bin: NamedTarget::Absent,
+            example: NamedTarget::Absent,
+            opens_viewer: false,
         }
     }
 
@@ -314,11 +351,14 @@ impl<'a> Reader<'a> {
             "all-features" => self.features_flags.all = true,
             "no-default-features" => self.features_flags.no_default = true,
             "package" => {
-                if attached.is_none() {
-                    remaining.next_if(|next| !is_option(next));
-                }
+                let value = attached
+                    .clone()
+                    .or_else(|| remaining.next_if(|next| !is_option(next)).cloned());
+                self.package_names
+                    .extend(value.map(|value| value.to_string_lossy().into_owned()));
                 self.selects_packages = true;
             }
+            "open" => self.opens_viewer = true,
             "exclude" => {
                 attached_or_next(remaining);
                 self.selects_packages = true;
@@ -330,8 +370,16 @@ impl<'a> Reader<'a> {
                 attached_or_next(remaining);
             }
             "bin" | "example" | "test" | "bench" => {
-                if attached.is_none() {
-                    remaining.next_if(|next| !is_option(next));
+                let value = attached
+                    .clone()
+                    .or_else(|| remaining.next_if(|next| !is_option(next)).cloned());
+                let named = value.map_or(NamedTarget::Unnamed, |value| {
+                    NamedTarget::Named(value.to_string_lossy().into_owned())
+                });
+                match name {
+                    "bin" => self.bin = named,
+                    "example" => self.example = named,
+                    _ => {}
                 }
             }
             _ if KNOWN_FLAGS.contains(&name) => {}
@@ -386,7 +434,11 @@ impl<'a> Reader<'a> {
         match first {
             'm' => self.manifest_path(value)?,
             'F' => self.features.extend(value),
-            'p' => self.selects_packages = true,
+            'p' => {
+                self.package_names
+                    .extend(value.map(|value| value.to_string_lossy().into_owned()));
+                self.selects_packages = true;
+            }
             'Z' => bail!(
                 "cargo-reapi does not accept Cargo's unstable -Z flags, which can change what \
                  Cargo selects"
@@ -494,6 +546,11 @@ impl<'a> Reader<'a> {
             target_dir: self.target_dir,
             command: self.command,
             command_index: self.command_index,
+            packages: self.package_names,
+            bin: self.bin,
+            example: self.example,
+            opens_viewer: self.opens_viewer,
+            selects_packages: self.selects_packages,
             informational: self.informational,
         })
     }
@@ -724,7 +781,8 @@ mod tests {
         let cacheable = |words: &[&str]| {
             select(Path::new("/"), &arguments(words))
                 .unwrap_or_else(|error| panic!("{words:?}: {error:#}"))
-                .is_cacheable()
+                .uncacheable_reason()
+                .is_none()
         };
         for words in [
             &["build"][..],

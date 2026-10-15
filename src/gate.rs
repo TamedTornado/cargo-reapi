@@ -100,6 +100,118 @@ impl FileIdentity {
     }
 }
 
+/// The marker's path beneath the target.
+fn marker_relative() -> PathBuf {
+    Path::new(ADMINISTRATIVE_DIRECTORY).join("gate-state-v19")
+}
+
+/// Writes a file beneath the target the way [`crate::beneath`] describes: no
+/// symlink anywhere on the path can redirect it.
+#[cfg(unix)]
+fn write_beneath_target(target: &Path, relative: &Path, bytes: &[u8]) -> Result<()> {
+    crate::beneath::Beneath::open(target)?.write_file(relative, bytes)
+}
+
+#[cfg(not(unix))]
+fn write_beneath_target(target: &Path, relative: &Path, bytes: &[u8]) -> Result<()> {
+    let path = target.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, bytes).map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn remove_beneath_target(target: &Path, relative: &Path) -> Result<()> {
+    match crate::beneath::Beneath::open(target) {
+        Ok(beneath) => beneath.remove_file(relative),
+        // No target, or one that is not a real directory: nothing of ours.
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_beneath_target(target: &Path, relative: &Path) -> Result<()> {
+    match fs::remove_file(target.join(relative)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Appends a line to the action log. A log inside the target is written
+/// beneath it; any other is opened without following a link at its name.
+fn append_line(target: &Path, log: &Path, line: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if let Ok(relative) = log.strip_prefix(target) {
+            return crate::beneath::Beneath::open(target)?.append_line(relative, line);
+        }
+        if let Some(parent) = log.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(log)
+            .with_context(|| format!("opening action log {}", log.display()))?;
+        file.lock_exclusive()?;
+        writeln!(file, "{line}")?;
+        FileExt::unlock(&file)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        if let Some(parent) = log.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(log)?;
+        file.lock_exclusive()?;
+        writeln!(file, "{line}")?;
+        FileExt::unlock(&file)?;
+        Ok(())
+    }
+}
+
+/// Removes Cargo's own fingerprint directories, `<target>/<profile>/.fingerprint`
+/// and `<target>/<triple>/<profile>/.fingerprint`, and nothing else. A
+/// directory is a Cargo profile directory when it holds Cargo's `.cargo-lock`
+/// file, so a directory of the project's own that happens to be named
+/// `.fingerprint`, or sits beneath one, is left alone. No link is followed.
+fn remove_cargo_fingerprints(target: &Path) -> Result<()> {
+    for top in real_directories(target) {
+        for profile in std::iter::once(top.clone()).chain(real_directories(&top)) {
+            if !is_regular_file(&profile.join(".cargo-lock")) {
+                continue;
+            }
+            let fingerprints = profile.join(".fingerprint");
+            if fs::symlink_metadata(&fingerprints).is_ok_and(|metadata| metadata.is_dir()) {
+                fs::remove_dir_all(&fingerprints)
+                    .context("invalidating Cargo timestamp fingerprints")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn real_directories(directory: &Path) -> Vec<PathBuf> {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// The files and links under a target tree, relative to it, sorted. The
 /// administrative directory `cargo-reapi` is not target output.
 fn target_files(target: &Path) -> Result<Vec<PathBuf>> {
@@ -168,14 +280,59 @@ pub fn validate_administrative_directory(target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether the target is absent or holds nothing but cargo-reapi's own state.
+/// Whether the target is absent or holds nothing but the two files Cargo
+/// keeps at its top. cargo-reapi's own directory counts as content: what is in
+/// it cannot be told from a project's own input by its name, so a target that
+/// has one is only ever a marker hit.
 fn target_is_clean(target: &Path) -> bool {
     match fs::read_dir(target) {
-        Ok(entries) => entries
-            .flatten()
-            .all(|entry| is_administrative(target, &entry.path())),
+        Ok(entries) => entries.flatten().all(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| CARGO_TARGET_FILES.contains(&name))
+        }),
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
+}
+
+/// Every file and link of a snapshot's target tree, whatever its name:
+/// verification and restoration see the same set.
+fn snapshot_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_dir() {
+            paths.push(entry.path().strip_prefix(root)?.to_path_buf());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// The names cargo-reapi itself writes in its directory in a target.
+const ADMINISTRATIVE_ENTRIES: [&str; 6] = [
+    "actions.jsonl",
+    "gate-state-v19",
+    "hermetic-tmp",
+    "output-records",
+    "path-mappings",
+    "srt-policy-v1.json",
+];
+
+/// Whether cargo-reapi's directory holds only what cargo-reapi writes: no
+/// entry under a name it does not use, and no link.
+fn administrative_directory_is_ours(target: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(target.join(ADMINISTRATIVE_DIRECTORY)) else {
+        return true;
+    };
+    entries.flatten().all(|entry| {
+        entry.file_type().is_ok_and(|kind| !kind.is_symlink())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| ADMINISTRATIVE_ENTRIES.contains(&name))
+    })
 }
 
 /// The digest of each file or link, a link by what it points to.
@@ -415,7 +572,7 @@ impl GateSnapshot {
             &self.target,
             &path_mappings,
         )?;
-        let produced = target_files(&temporary.join("target"))?;
+        let produced = snapshot_files(&temporary.join("target"))?;
         let outputs = digest_files(&temporary.join("target"), &produced)?;
         let manifest = GateSnapshotManifest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -452,32 +609,19 @@ impl GateSnapshot {
         if !self.restored.happened() {
             return Ok(());
         }
-        if let Some(parent) = action_log.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(action_log)
-            .with_context(|| format!("opening action log {}", action_log.display()))?;
-        log.lock_exclusive()?;
-        writeln!(
-            log,
-            "{}",
-            json!({
-                "schema_version": 2,
-                "action_key": self.key,
-                "execution": if self.coalesced { "coalesced-gate-hit" } else { "gate-snapshot-hit" },
-                "exit_code": 0,
-                "cache_eligibility": {"eligible": true, "reasons": []},
-                "snapshot_clone_ms": self.clone_ms,
-                "snapshot_clone_method": self.clone_method,
-                "snapshot_relocation_ms": self.relocation_ms,
-                "snapshot_marker_hit": self.restored == Restoration::MarkerMatched,
-            })
-        )?;
-        FileExt::unlock(&log)?;
-        Ok(())
+        let line = json!({
+            "schema_version": 2,
+            "action_key": self.key,
+            "execution": if self.coalesced { "coalesced-gate-hit" } else { "gate-snapshot-hit" },
+            "exit_code": 0,
+            "cache_eligibility": {"eligible": true, "reasons": []},
+            "snapshot_clone_ms": self.clone_ms,
+            "snapshot_clone_method": self.clone_method,
+            "snapshot_relocation_ms": self.relocation_ms,
+            "snapshot_marker_hit": self.restored == Restoration::MarkerMatched,
+        })
+        .to_string();
+        append_line(&self.target, action_log, &line)
     }
 
     pub fn is_restored(&self) -> bool {
@@ -533,7 +677,7 @@ impl GateSnapshot {
                 manifest.key
             );
         }
-        let produced = target_files(&selected.join("target"))?;
+        let produced = snapshot_files(&selected.join("target"))?;
         if !snapshot_matches_digests(&selected.join("target"), &produced, &manifest.outputs) {
             eprintln!(
                 "cargo-reapi: gate snapshot {} failed its content check and was evicted",
@@ -570,29 +714,8 @@ impl GateSnapshot {
         // when source timestamps were preserved, rounded or moved backwards.
         // Keep artifacts and the action cache: Cargo plans again, and unchanged
         // compiler actions still reuse their content-addressed outputs.
-        match fs::remove_file(self.target_marker()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("invalidating target snapshot marker"),
-        }
-        if !self.target.exists() {
-            return Ok(());
-        }
-        let mut entries = WalkDir::new(&self.target).follow_links(false).into_iter();
-        while let Some(entry) = entries.next() {
-            let entry = entry?;
-            if entry.file_name() != ".fingerprint" {
-                continue;
-            }
-            if entry.file_type().is_dir() {
-                entries.skip_current_dir();
-                fs::remove_dir_all(entry.path())
-                    .context("invalidating Cargo timestamp fingerprints")?;
-            } else if entry.file_type().is_symlink() {
-                fs::remove_file(entry.path()).context("invalidating Cargo fingerprint link")?;
-            }
-        }
-        Ok(())
+        remove_beneath_target(&self.target, &marker_relative())?;
+        remove_cargo_fingerprints(&self.target)
     }
 
     /// Whether the target still holds exactly what the marker says this
@@ -611,6 +734,7 @@ impl GateSnapshot {
             return false;
         };
         marker.key == selected_key
+            && administrative_directory_is_ours(&self.target)
             && present.iter().eq(marker.outputs.keys())
             && marker.outputs.iter().all(|(path, recorded)| {
                 fs::symlink_metadata(self.target.join(path))
@@ -625,18 +749,12 @@ impl GateSnapshot {
                 .with_context(|| format!("recording restored output {}", path.display()))?;
             outputs.insert(path.clone(), FileIdentity::of(&metadata));
         }
-        let marker = self.target_marker();
-        if let Some(parent) = marker.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(
-            marker,
-            serde_json::to_vec(&TargetMarker {
-                key: selected_key.to_owned(),
-                outputs,
-            })?,
-        )?;
-        Ok(())
+        fs::create_dir_all(&self.target)?;
+        let marker = serde_json::to_vec(&TargetMarker {
+            key: selected_key.to_owned(),
+            outputs,
+        })?;
+        write_beneath_target(&self.target, &marker_relative(), &marker)
     }
 
     fn unlock(&mut self) -> Result<()> {

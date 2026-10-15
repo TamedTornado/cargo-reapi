@@ -118,20 +118,25 @@ struct CaptureRoots {
     toolchain: PathBuf,
 }
 
-/// One file rustc's own dep-info lists as read by a compile, by logical path
-/// and content digest.
+/// One file rustc's own dep-info lists as read by a compile.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub struct DepInput {
+    /// The path as rustc named it, under its root's label and with no `..`
+    /// collapsed: resolving it again follows the links on the way as rustc
+    /// did, so a link that moved is noticed.
+    pub raw_logical_path: String,
+    /// The file it resolved to, by logical path.
     pub logical_path: String,
     pub sha256: String,
 }
 
 /// Every file the compile just read, as rustc's own dep-info says, with its
 /// digest. The action key covers the command line, the package directory and
-/// `OUT_DIR`, but `include!`, `include_str!`, `#[path]` and proc macros can
-/// read anywhere, so a cached entry is a hit only while all of these still
-/// match. Fails when the dep-info is missing, or lists a file outside the
-/// declared roots or one that cannot be read, so the entry is not published.
+/// `OUT_DIR`, but `include!`, `include_str!` and `#[path]` can read anywhere,
+/// so a cached entry is a hit only while all of these still resolve to the
+/// same files with the same content. Fails when the dep-info is missing, or
+/// lists a file outside the declared roots or one that cannot be read, so the
+/// entry is not published.
 pub fn read_dep_inputs(
     invocation: &RustcInvocation,
     prepared: &PreparedInvocation,
@@ -145,22 +150,30 @@ pub fn read_dep_inputs(
     let roots = CaptureRoots::from_env(invocation)?;
     let mut inputs = BTreeMap::new();
     for listed in dep_info_paths(&text) {
-        let actual = absolute(Path::new(&listed), &invocation.cwd);
-        let logical = roots.normalize(&actual, &invocation.cwd)?;
-        let (sha256, _) = logical_digest(&actual, &prepared.relocation_mappings)
-            .with_context(|| format!("digesting dep-info input {}", actual.display()))?;
-        inputs.insert(logical, sha256);
+        let unresolved = invocation.cwd.join(&listed);
+        let raw_logical_path = roots.label_unresolved(&unresolved)?;
+        // The file rustc read: links resolved component by component, `..`
+        // after a link meaning the link target's parent, as for the kernel.
+        let resolved = unresolved
+            .canonicalize()
+            .with_context(|| format!("resolving dep-info input {}", unresolved.display()))?;
+        let logical_path = roots.normalize(&resolved, &invocation.cwd)?;
+        let (sha256, _) = logical_digest(&resolved, &prepared.relocation_mappings)
+            .with_context(|| format!("digesting dep-info input {}", resolved.display()))?;
+        inputs.insert(raw_logical_path.clone(), (logical_path, sha256));
     }
     Ok(inputs
         .into_iter()
-        .map(|(logical_path, sha256)| DepInput {
+        .map(|(raw_logical_path, (logical_path, sha256))| DepInput {
+            raw_logical_path,
             logical_path,
             sha256,
         })
         .collect())
 }
 
-/// Whether every recorded dep-info input still has its recorded content.
+/// Whether every recorded dep-info input still resolves to the file it did,
+/// with the content it had.
 pub fn dep_inputs_match(
     invocation: &RustcInvocation,
     recorded: &[DepInput],
@@ -168,10 +181,18 @@ pub fn dep_inputs_match(
 ) -> Result<bool> {
     let roots = CaptureRoots::from_env(invocation)?;
     for input in recorded {
-        let Some(actual) = roots.denormalize(&input.logical_path) else {
+        let Some(unresolved) = roots.denormalize(&input.raw_logical_path) else {
             return Ok(false);
         };
-        match logical_digest(&actual, mappings) {
+        let Ok(resolved) = unresolved.canonicalize() else {
+            return Ok(false);
+        };
+        if roots.normalize(&resolved, &invocation.cwd).ok().as_deref()
+            != Some(input.logical_path.as_str())
+        {
+            return Ok(false);
+        }
+        match logical_digest(&resolved, mappings) {
             Ok((sha256, _)) if sha256 == input.sha256 => {}
             _ => return Ok(false),
         }
@@ -179,42 +200,35 @@ pub fn dep_inputs_match(
     Ok(true)
 }
 
-/// The prerequisites a dependency file lists, unescaped.
+/// The prerequisites a dependency file lists. rustc escapes only spaces, with
+/// a backslash; every other backslash is part of the name.
 fn dep_info_paths(text: &str) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for line in text.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let bytes = line.as_bytes();
-        let separator = (0..bytes.len()).find(|&index| {
-            bytes[index] == b':'
-                && (index == 0 || bytes[index - 1] != b'\\')
-                && bytes.get(index + 1).is_none_or(|next| *next == b' ')
-        });
-        let Some(separator) = separator else {
+        let Some((target, prerequisites)) = split_rule(line) else {
             continue;
         };
-        let (target, prerequisites) = (&line[..separator], &line[separator + 1..]);
         if prerequisites.trim().is_empty() {
-            paths.insert(unescape_path(target));
+            paths.insert(unescape_spaces(target));
             continue;
         }
         let mut current = String::new();
-        let mut escaped = false;
-        for character in prerequisites.chars() {
-            match (escaped, character) {
-                (true, other) => {
-                    current.push(other);
-                    escaped = false;
+        let mut characters = prerequisites.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                '\\' if characters.peek() == Some(&' ') => {
+                    characters.next();
+                    current.push(' ');
                 }
-                (false, '\\') => escaped = true,
-                (false, ' ') => {
+                ' ' => {
                     if !current.is_empty() {
                         paths.insert(std::mem::take(&mut current));
                     }
                 }
-                (false, other) => current.push(other),
+                other => current.push(other),
             }
         }
         if !current.is_empty() {
@@ -224,17 +238,18 @@ fn dep_info_paths(text: &str) -> BTreeSet<String> {
     paths
 }
 
-fn unescape_path(text: &str) -> String {
-    let mut unescaped = String::with_capacity(text.len());
-    let mut characters = text.chars();
-    while let Some(character) = characters.next() {
-        if character == '\\' {
-            unescaped.extend(characters.next());
-        } else {
-            unescaped.push(character);
-        }
-    }
-    unescaped
+/// A rule line's target and prerequisites, split at the first `:` that is
+/// followed by a space or the end of the line and is not an escaped one.
+fn split_rule(line: &str) -> Option<(&str, &str)> {
+    let bytes = line.as_bytes();
+    let separator = (0..bytes.len()).find(|&index| {
+        bytes[index] == b':' && bytes.get(index + 1).is_none_or(|next| *next == b' ')
+    })?;
+    Some((&line[..separator], &line[separator + 1..]))
+}
+
+fn unescape_spaces(text: &str) -> String {
+    text.replace("\\ ", " ")
 }
 
 /// Records the action and runs the compiler with the caller's whole
@@ -516,6 +531,27 @@ impl CaptureRoots {
         } else {
             root.join(relative)
         })
+    }
+
+    /// `path` under its root's label with nothing resolved: `..` and links
+    /// stay as written.
+    fn label_unresolved(&self, path: &Path) -> Result<String> {
+        for (root, label) in [
+            (Some(&self.target), "target"),
+            (self.package.as_ref(), "package"),
+            (Some(&self.workspace), "workspace"),
+            (Some(&self.toolchain), "toolchain"),
+        ] {
+            if let Some(root) = root
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                return Ok(logical_path(label, relative));
+            }
+        }
+        anyhow::bail!(
+            "path is outside declared package, workspace, target, and toolchain roots: {}",
+            path.display()
+        )
     }
 
     fn normalize(&self, path: &Path, cwd: &Path) -> Result<String> {
@@ -833,7 +869,7 @@ fn lossy(value: &OsStr) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{is_compiler_environment, should_record_path_mappings};
+    use super::{dep_info_paths, is_compiler_environment, should_record_path_mappings};
     use crate::invocation::RustcInvocation;
 
     fn invocation(arguments: &[&str]) -> RustcInvocation {
@@ -857,6 +893,21 @@ mod tests {
             "--out-dir",
             "/workspace/target/debug/deps",
         ])));
+    }
+
+    #[test]
+    fn dep_info_escapes_only_spaces() {
+        let text = "out/a.d: src/lib.rs src/with\\ space.rs shared/a\\b.txt\n\
+                    \n\
+                    src/lib.rs:\n\
+                    src/with\\ space.rs:\n\
+                    shared/a\\b.txt:\n\
+                    # env-dep:NAME=value\n";
+        let paths = dep_info_paths(text).into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            ["shared/a\\b.txt", "src/lib.rs", "src/with space.rs"]
+        );
     }
 
     #[test]

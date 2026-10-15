@@ -460,6 +460,12 @@ fn readable_paths(
             .map(|input| paths.workspace.join(input))
             .filter(|input| input.is_dir()),
     );
+    // Git dependencies are checkouts under Cargo's home, and their build
+    // scripts can read the checkout's repository as well as a local
+    // package's: no package sees Git state.
+    if let Some(cargo_home) = crate::cargo_config::cargo_home() {
+        hashed_roots.push(canonical_or_absolute(&cargo_home)?.join("git/checkouts"));
+    }
     let denied = git_entries(&hashed_roots, paths.target);
     let mut readable = readable
         .iter()
@@ -474,7 +480,8 @@ fn readable_paths(
     Ok(without_covered_paths(readable))
 }
 
-/// Every Git entry beneath the trees the gate hashes, which the strict
+/// Every Git entry beneath the trees the gate hashes, and beneath Cargo's git
+/// checkouts, which the strict
 /// sandbox must not let a build read because the gate key does not cover
 /// them: each entry named `.git`, a directory or a file, and the Git
 /// directory a `.git` file names with `gitdir:` (a linked worktree's or a
