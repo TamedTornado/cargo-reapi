@@ -503,21 +503,6 @@ fn materialize_blob(
     }
     #[cfg(unix)]
     set_unix_mode(&temporary, cached.mode)?;
-    #[cfg(target_os = "macos")]
-    if cached.path_rewritten && cached.mode & 0o111 != 0 {
-        let result = Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&temporary)
-            .output()
-            .with_context(|| format!("re-signing restored Mach-O output {}", output.display()))?;
-        if !result.status.success() {
-            anyhow::bail!(
-                "codesign rejected restored output {}: {}",
-                output.display(),
-                String::from_utf8_lossy(&result.stderr).trim()
-            );
-        }
-    }
     fs::rename(&temporary, output)
         .with_context(|| format!("installing cached output {}", output.display()))?;
     if cached.path_rewritten {
