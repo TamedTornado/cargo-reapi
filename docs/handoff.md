@@ -52,24 +52,34 @@ plain Cargo" and `CHANGELOG.md` `[Unreleased]`.
   in both directions (`Project::validate_target`). The only exception is
   `<workspace root>/target`, Cargo's own default: `moria_cargo` uses
   `CARGO_TARGET_DIR=$checkout/target` and stays cached.
-- Hashing has no exclusions by name (`excluded_from_tree`, and the same rule in
-  `capture.rs` `is_ignored`): only the canonical target and the action log.
-  `.git` is hashed except `objects`, `logs` and `info/refs` (also under `.git/modules/**`; `git repack` rewrites `info/refs`),
-  `is_git_bulk`. Rationale in the README.
-- A marker is `TargetMarker`: the snapshot key plus each restored file's
-  identity (size, mtime, ctime, inode). A hit needs every identity to match;
-  otherwise the snapshot is restored again. Restoration removes the snapshot's
-  own paths first and fails if a symlinked directory is on the way
-  (`clear_destinations`), so it writes nothing else.
-- The coalescing signal is compiled only with the `test-hooks` feature
-  (`tests/coalescing.rs` has `required-features`). Run the whole suite with
+- Hashing has no exclusions by name except `.git` (`excluded_from_tree`, and
+  the same rule in `capture.rs` `is_ignored`). The strict sandbox denies reads
+  of every `.git` and gitdir under the hashed trees (`hermetic::git_entries`,
+  `expand_around`), so a build script gets no Git state under caching.
+- Gate rule (README "When a gate hit may touch the target"): a snapshot is
+  restored only into a clean target (absent, or only `cargo-reapi/`,
+  `.rustc_info.json`, `CACHEDIR.TAG`), a producer publishes only from one, and
+  a target the marker still matches exactly (`TargetMarker`: key plus the
+  identity of every file, and no other file) is a hit with nothing to restore.
+  Any other state skips the gate (`GateSnapshot.clean`), and Cargo runs with
+  the per-action cache. Snapshots carry per-file digests (`outputs` in the
+  manifest), verified before a restore; a failure evicts the snapshot.
+- Per-action cache: the manifest (`ACTION_MANIFEST_VERSION` 2) lists
+  `dep_inputs`, every file in rustc's own dep-info with its digest
+  (`capture::read_dep_inputs`, `dep_inputs_match`); a hit needs them all.
+- `run` is its `build` gate (`build_arguments`) followed by `run_with` the
+  original arguments with no project, i.e. unsandboxed, per-action cache only.
+- Sandbox provider failures are `SANDBOX_UNAVAILABLE` errors, not declines.
+- `test-hooks` (Cargo.toml documents it as for the crate's own tests only)
+  compiles in the coalescing signal and `CARGO_REAPI_ACTION_CACHE_TEST_MODE`.
+  Test targets that need them have `required-features`; run the suite with
   `cargo test --features test-hooks`. The `/proc/locks` detector stays in
-  `tests/maintenance.rs`. `CARGO_REAPI_ACTION_CACHE_TEST_MODE` (skips the gate)
-  is still a runtime variable; it only reduces caching.
-- Remaining known residuals: the snapshot holds the whole target as it stood at
-  publication, not only what the gated run wrote; a target that other tools
-  write concurrently while a gate runs is outside the proof; the identity check
-  trusts ctime and inode, which a privileged process can forge.
+  `tests/maintenance.rs`.
+- Remaining known residuals: a target that other tools write concurrently
+  while a gate runs is outside the proof; the identity check trusts ctime and
+  inode, which a privileged process can forge; rustc dep-info lists files, so
+  a directory-walking proc macro reading unlisted files is not keyed (the
+  sandbox limits what it can read to the workspace and package roots).
 
 Test environment on this workstation: set `TMPDIR` under `/mnt/build`,
 `CARGO_REAPI_COW_TEST_DIR=/mnt/build/cow-test` (reflink XFS) and
@@ -87,14 +97,31 @@ mutation-checked: disabling the fix makes it fail.
 | 1 | Target in an `include_str!` data directory overwrote edits | Target disjoint from every project directory, both directions; only `<workspace root>/target` exempt | `a_target_directory_that_is_an_include_str_data_directory_never_overwrites_it` (drop the workspace, cwd, package-root and input checks) |
 | 2 | Alternate lockfile neither hashed nor protected | Decline on `CARGO_RESOLVER_LOCKFILE_PATH` and `resolver.lockfile-path` | `an_alternate_lockfile_is_never_cached` (remove either check) |
 | 3 | Source directory named `target` skipped by the key | No exclusion by name in the gate key or rustc input discovery | `a_source_directory_named_target_is_hashed` (re-add the name rule in `gate.rs`, or in `capture.rs`) |
-| 4 | Marker alone accepted as a hit | Marker carries each output's identity; mismatch restores | `a_gate_hit_restores_outputs_that_another_cargo_run_replaced` (compare the key only) |
+| 4 | Marker alone accepted as a hit | Marker carries every file's identity and the exact file set | `a_target_changed_by_another_cargo_run_is_left_to_cargo` |
 | 5 | `--ignore-rust-version` dropped by preflight | Decline | `ignoring_the_rust_version_is_never_cached` (remove the refusal) |
 | 6 | Metadata ran for help/version/non-build commands | Decide from the command before any metadata run | `commands_that_do_not_build_are_never_prepared_or_cached` (treat every command as cacheable) |
 | 7 | Offline build needed unrelated dev-dependency sources | Metadata failure declines to plain Cargo | `offline_builds_do_not_need_unrelated_dependency_sources` (make the failure an error) |
 | 8 | Refusals were errors, also in local/capture | Declines run Cargo; selection runs only where caching would | `an_alias_works_without_caching_and_in_the_local_backend` (propagate `select`'s error in the local path) |
 | 2' | Preflight could write `Cargo.lock` | `cargo metadata --locked` | `a_missing_or_outdated_lockfile_is_never_written_by_preparation` (stop adding `--locked`) |
-| git | `.git` unconditionally skipped | Hash all but `objects`, `logs`, `info/refs` | `git_state_read_by_a_build_script_is_keyed_but_repacking_objects_is_not` (skip `.git` wholesale: stale hit; hash objects: no hit after `git repack`) |
-| moria | Ordinary `moria_cargo` invocations stay cached | `<workspace root>/target` exemption | `the_ordinary_moria_cargo_invocations_still_hit` (ten invocations hit on their second run), `cargos_default_target_directory_is_cached` (drop the exemption) |
+| git | `.git` unconditionally skipped | Superseded by the sandbox denying `.git` (0.2.12 #8) | `a_build_script_finds_no_git_state_under_caching` |
+| moria | Ordinary `moria_cargo` invocations stay cached | `<workspace root>/target` exemption | `the_ordinary_moria_cargo_invocations_still_hit` (ten invocations restore in a clean second checkout), `cargos_default_target_directory_is_cached` (drop the exemption) |
+
+### Review of f6d2540 (0.2.12 findings)
+
+| # | Finding | Fix | Regression (mutation) |
+|---|---------|-----|------------------------|
+| 1 | Restore over an `include_str!` input in the default target | Restore only into clean targets; producers publish only from clean ones | `an_input_inside_cargos_default_target_is_never_restored_over_an_edit` (treat every target as clean) |
+| 2 | Write through a symlinked `target/cargo-reapi` | Decline unless it is a real directory with no symlink inside | `a_symlinked_administrative_directory_is_declined_and_never_written_through`, directory and log cases (drop the check) |
+| 3 | Legacy `--lockfile-path` with `[unstable]` | Unknown options decline; any `[unstable]` or `CARGO_UNSTABLE_*` declines | `unknown_options_and_unstable_configuration_run_as_plain_cargo` (accept unknown options; ignore `[unstable]`) |
+| 4 | Included file outside the package not in the action key | dep-info inputs with digests per entry | `a_file_included_from_outside_the_package_keys_the_compile` (skip the comparison) |
+| 5 | Whole-target snapshots rolled back other artifacts | Same clean-target rule | `a_restore_never_touches_artifacts_the_snapshot_did_not_build` (treat every target as clean) |
+| 6 | Configured compiler overridden; custom rustdoc unhashed | Decline `build.rustc*`, wrappers and env forms; hash `RUSTDOC` | `a_configured_compiler_or_wrapper_is_declined_not_overridden`, `replacing_a_custom_rustdoc_in_place_misses` |
+| 7 | `build.build-dir` outside the snapshot | Decline | `a_separate_build_directory_is_declined` |
+| 8 | Git exclusion unsound | Sandbox denies `.git` and gitdir; not hashed | `a_build_script_finds_no_git_state_under_caching` (main clone and linked worktree; mutation lets the sandbox read it) |
+| 9 | `run` skipped on a hit | `run` is its build gate plus a normal run | `run_caches_only_its_build_and_always_runs_the_program` (cache `run` whole) |
+| 10 | Snapshot bytes unverified | Digests at publish, verified at restore, evict | `a_corrupted_snapshot_is_evicted_and_never_restored` (skip verification) |
+| 11 | Provider failure announced as uncached | Own error, Cargo not run | `an_unavailable_sandbox_is_an_error_not_a_decline` (announce and fall back) |
+| K | Test mode in release | `test-hooks` | release binary has no `ACTION_CACHE_TEST_MODE` or `COALESCE_SIGNAL` string |
 
 Decline reasons each have a stderr assertion (`assert_declined`): non-build
 command, `--help`/`--version`, alias, `--config`/`-Z`/`--` option, include,

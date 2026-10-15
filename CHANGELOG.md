@@ -32,20 +32,48 @@ source.
   source directory and declared input. Only Cargo's own default,
   `<workspace root>/target`, is exempt. `build.target-dir = "data"` over an
   `include_str!` data directory used to pass and let a hit restore over edits.
-- Hashing has no exclusions by name. A source directory named `target`
-  (`include_str!("target/message.txt")`) was skipped by the gate key and by
-  rustc input discovery, so an edit returned the old binary. Only the
-  canonical target directory is left out. `.git` is hashed except `objects`,
-  `logs` and `info/refs`, also under `.git/modules/*`, so a build script reading
-  `git rev-parse HEAD` misses after a new commit and hits after repacking.
-- A marker alone never proves a hit. A restore records each written file's
-  size, times and inode with the marker, and a mismatch restores again; a
-  plain `cargo build --features extra` into the same target used to leave its
-  executable in place of the cached one. Restoration writes only the snapshot's
-  paths and refuses to write through a symlinked directory.
-- The coalescing signal is a test hook compiled only with the `test-hooks`
-  feature, which only the coalescing integration test requires; run it with
-  `cargo test --features test-hooks`. Release builds no longer contain it.
+- Hashing has no exclusions by name, except `.git`. A source directory named
+  `target` (`include_str!("target/message.txt")`) was skipped by the gate key
+  and by rustc input discovery, so an edit returned the old binary. Only the
+  canonical target directory is left out. The strict sandbox now denies reads
+  of every `.git` (directory or file) and the gitdir it names, in a main clone
+  as in a linked worktree, and `.git` is not hashed: no partial hash of a
+  repository is sound (reflogs and abbreviated object names can change a build
+  script's answer), so a build script gets no Git state under caching.
+- A gate writes into a target only when it is absent or clean (nothing but
+  cargo-reapi's directory and Cargo's `.rustc_info.json` and `CACHEDIR.TAG`),
+  and a producer publishes only from one. A restore had overwritten files
+  already there: an `include_str!` input inside Cargo's own default target, and
+  other builds' artifacts that a snapshot of the whole target carried. Any
+  other target state skips the gate and runs Cargo with the per-action cache.
+- A marker alone never proves a hit. It records the size, times and inode of
+  every file the gate left, and a hit needs exactly that set of files to be
+  there with those identities; a plain `cargo build --features extra` into the
+  same target used to leave its executable in place of the cached one.
+- Snapshots record a content digest of every file when published and verify
+  them before restoring; a mismatch evicts the snapshot.
+- Every cached compile is a hit only while every file in rustc's own dep-info
+  still matches its recorded digest. A file included from outside the package
+  directory (`include!("../../shared/body.rs")`) did not key the compile, so
+  editing it returned the old successful result.
+- Options after the subcommand that cargo-reapi does not know decline,
+  including the older `--lockfile-path`, as do `[unstable]` configuration and
+  `CARGO_UNSTABLE_*`; configured compilers and wrappers (`build.rustc`,
+  `build.rustdoc`, `build.rustc-wrapper`, `build.rustc-workspace-wrapper` and
+  their environment forms) and `build.build-dir`/`CARGO_BUILD_BUILD_DIR`
+  decline instead of being overridden or left out of snapshots. A custom
+  `RUSTDOC` is hashed by content.
+- `run` caches only its build, as the `build` it contains; the program then
+  runs normally with its own stdin and stdout every time. A whole-gate hit
+  used to skip the program.
+- The `cargo-reapi` directory in the target must be real, with no symlink
+  inside; a link there sent the driver's marker and log writes into source.
+- A strict sandbox that cannot start is an error that says Cargo was not run,
+  not a "running Cargo uncached" decline that then failed.
+- Test hooks are compiled only with the `test-hooks` feature, documented as
+  for the crate's own tests: the coalescing signal and
+  `CARGO_REAPI_ACTION_CACHE_TEST_MODE`. The integration tests that need them
+  require it; run the suite with `cargo test --features test-hooks`.
 - Selected packages are hashed by their real directories: a package selected
   through a symlink counted as hashed by the working directory's scan, so an
   edit got a stale hit. The root of a selected virtual workspace is hashed too

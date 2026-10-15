@@ -318,12 +318,17 @@ capture` and `--snapshot-policy off` never inherit them. When the invocation
 was resolved far enough for the strict sandbox, the uncached run stays inside
 it; a decline reached before or without a resolved project, or because the
 target overlaps the project, runs Cargo plainly, since nothing is cached there
-and the sandbox exists only to keep cache keys sound.
+and the sandbox exists only to keep cache keys sound. A sandbox that cannot be
+started is not a decline: cargo-reapi fails with its own message ("the strict
+sandbox is unavailable, so Cargo was not run") and does not run Cargo.
 
 Only `build`, `check`, `clippy`, `test`, `run`, `bench` and `doc` (and Cargo's
 `b`, `c`, `d`, `r`, `t`) are cached. Any other command, and `--help`,
 `-h`, `--version`, `-V` and `--list`, run as plain Cargo before any metadata
-run, so they never fetch, resolve or write a lockfile.
+run, so they never fetch, resolve or write a lockfile. `run` caches only its
+build: the gate is the `build` the `run` contains (arguments after `--`
+dropped), and the program then runs through Cargo as usual, outside the cache
+and the sandbox, with its own stdin and stdout, every time.
 
 Because the sandboxed Cargo runs offline, cargo-reapi acquires dependency
 sources first, outside the sandbox, with `cargo metadata --locked` for the
@@ -332,9 +337,7 @@ project the invocation selects. Preparation never changes the project: with
 would change, or any metadata failure (an offline build whose unrelated
 dev-dependency sources are not cached, say) declines. Create the lockfile
 first (`cargo generate-lockfile`, or any ordinary build), and a cached build
-finds it. An alternate lockfile (`CARGO_RESOLVER_LOCKFILE_PATH` or
-`resolver.lockfile-path`) and `--ignore-rust-version`, which changes how
-dependencies are selected, also decline.
+finds it.
 
 cargo-reapi does not emulate Cargo's command line or configuration. It reads
 the plain option forms Cargo documents, separated or attached: the manifest
@@ -342,20 +345,34 @@ the plain option forms Cargo documents, separated or attached: the manifest
 `--frozen`, `--offline`, each passed to `cargo metadata` once), the features
 (`--features`, `-F`, including an empty `-F=`, `--all-features`,
 `--no-default-features`), the package selection (`-p`, `--workspace`,
-`--exclude`) and the target directory (`--target-dir`). Features without a
-package selection reach `cargo metadata` as given, so an offline build
-acquires only what its features need. With a package selection `cargo
+`--exclude`), the target directory (`--target-dir`), and a fixed list of
+other options the cached subcommands take (`--release`, `--profile`,
+`--all-targets`, `--bin`, `--test`, `-j`, `--message-format` and so on). Features
+without a package selection reach `cargo metadata` as given, so an offline
+build acquires only what its features need. With a package selection `cargo
 metadata` cannot apply them as Cargo does, so it resolves every feature, and
 such an invocation with `--offline` or `--frozen` declines.
 
 Whatever it cannot read exactly declines, with the reason in the line above:
 
+- any option after the subcommand that is not in that list, such as the older
+  `--lockfile-path`, and `--ignore-rust-version`, which changes how Cargo
+  selects dependencies;
 - a user-defined alias, from `[alias]` in any Cargo configuration file or a
   `CARGO_ALIAS_<NAME>` variable, including one that redefines a built-in alias
   such as `b`. Cargo's own commands and its unredefined built-in aliases
   (`b`, `c`, `d`, `r`, `rm`, `t`) are read as usual;
 - any invocation when a configuration file cannot be read completely, as when
   it `include`s another file, which cargo-reapi does not follow;
+- configuration that changes what Cargo builds in a way cargo-reapi neither
+  reads nor keys, in a configuration file or its environment equivalent:
+  `resolver.lockfile-path` (`CARGO_RESOLVER_LOCKFILE_PATH`), the compiler and
+  wrappers `build.rustc`, `build.rustdoc`, `build.rustc-wrapper` and
+  `build.rustc-workspace-wrapper` (`CARGO_BUILD_RUSTC*`, `RUSTC_WRAPPER`,
+  `RUSTC_WORKSPACE_WRAPPER`; an empty wrapper is no wrapper), the separate
+  intermediate directory `build.build-dir` (`CARGO_BUILD_BUILD_DIR`), and any
+  `[unstable]` table or `CARGO_UNSTABLE_*` variable. A custom `RUSTDOC` is
+  honored, and its contents are part of the gate key;
 - `--config`, except `KEY=VALUE` overrides of `profile.*`, `term.*` and
   `build.jobs`, which cannot change the project, sources, lockfile or target
   directory;
@@ -363,11 +380,15 @@ Whatever it cannot read exactly declines, with the reason in the line above:
 - options before the subcommand other than `-v`, `-q`, `--verbose`,
   `--quiet`, `--locked`, `--frozen`, `--offline`, `--color`, `--config` as
   above, `--version`, `--help` and `--list`, and `--` before the subcommand;
-- a cluster of short options that holds one taking a value, such as `-qm`.
+- a cluster of short options that holds one taking a value, such as `-qm`;
+- a target whose `cargo-reapi` administrative directory is not a real
+  directory, or holds a symlink: the driver writes its marker and default
+  action log there outside the sandbox, so a link would send those writes
+  elsewhere.
 
 The target directory is `--target-dir`, else `CARGO_TARGET_DIR`, else the one
-Cargo reports for the selected project. A whole-gate snapshot restores the
-target, which the gate does not hash, so its canonical path (symlinks
+Cargo reports for the selected project. A whole-gate snapshot is restored into
+the target, which the gate does not hash, so its canonical path (symlinks
 resolved, the deepest existing ancestor for a directory not created yet) must
 be disjoint, in both directions, from the working directory, the selected
 workspace, every package in the resolve (path dependencies outside the
@@ -380,35 +401,63 @@ Anything else declines. The one exception is Cargo's own default,
 wants an overlapping layout (`target-dir = "."` or `"data"`) must use an
 external target directory to be cached.
 
-#### What the gate key hashes
+#### When a gate hit may touch the target
+
+The whole-gate snapshot exists for clean consumers: a new checkout, worktree
+or container that has never built. A gate may write into a target only when
+the target is absent, or holds nothing but cargo-reapi's own directory and the
+two files Cargo keeps at the top of every target (`.rustc_info.json` and
+`CACHEDIR.TAG`, regenerated on demand and not build output). A snapshot is
+restored only into such a target, and a restore never overwrites a file that is
+already there. A producer likewise publishes only when it started from a clean
+target, so a snapshot holds exactly what one clean build wrote and never
+another run's artifacts.
+
+One other state is a hit without a restore: the target holds exactly the files
+a marker recorded when the gate last left it, each with the size, modification
+time, change time and inode recorded then. The marker alone proves nothing: an
+extra file, or an output another Cargo run replaced, changed or deleted,
+fails the check.
+
+Every other target state skips the gate and runs Cargo with the per-action
+cache, as before any gate existed: nothing is restored, nothing is published,
+and Cargo's old fingerprints are cleared so it plans again. A source edit in a
+checkout that has built therefore costs a Cargo run over cached compiler
+actions, not a restore.
+
+Each snapshot records a content digest of every file when it is published,
+and every digest is checked against the bytes before anything is restored. A
+snapshot that fails the check is evicted and never restored; the gate runs
+as a producer instead.
+
+#### What the keys hash
 
 The gate key hashes the selected workspace root, the working directory and
-every local package by its real directory, with no exclusion by name: only the
-canonical target directory itself and the action log are left out. A directory
-named `target` inside a source tree is hashed, and so is a package reached
-through a symlink or a virtual workspace beside the working directory.
+every local package by its real directory, with no exclusion by name except
+`.git` (below): only the canonical target directory and the action log are
+left out. A directory named `target` inside a source tree is hashed, and so is
+a package reached through a symlink or a virtual workspace beside the working
+directory.
 
-`.git` is hashed too, in full, except its `objects` and `logs` directories and
-`info/refs`, and the same three inside each submodule's gitdir under
-`.git/modules`. Build scripts
-that run `git describe` or `git rev-parse HEAD` read repository state; `HEAD`,
-refs, `packed-refs`, the index, `config` and `.git/worktrees` pin what any
-object read returns, because objects are named by their content, logs only
-record history, and `info/refs` is derived from the refs and rewritten when
-objects are repacked. A new commit therefore misses, and repacking objects
-(`git repack -ad`) does not. A `.git` that is a file, as in a linked worktree,
-is hashed as an ordinary file; the real gitdir lies outside the workspace,
-which the sandbox does not make readable. The cost is spurious misses in a
-main clone when `git status` refreshes the index, which is sound.
+Each cached compile is also a hit only while every file in rustc's own
+dep-info still has the content recorded when the entry was made, the way
+`sccache` keys a compile. The action key covers the command line, the package
+directory and `OUT_DIR`, but `include!`, `include_str!` and `#[path]` can read a
+file anywhere under the workspace, so the entry lists each such input with its
+digest and a changed one is a miss. A dep-info that cannot be read, or that
+lists a file outside the package, workspace, target and toolchain, is not
+published.
 
-A gate hit never trusts its marker alone. Restoring a snapshot records the
-identity (size, modification and change time, inode) of every file it wrote.
-The next gate checks them all; any output another Cargo run in the same target
-directory replaced, changed or deleted, such as a plain `cargo build
---features extra`, fails the check and restores the snapshot again.
-Restoration writes only the paths the snapshot holds, removes what stands
-there first, and fails, declining the build, if a symlinked directory would
-send a write outside the target.
+**Build scripts get no Git state under caching.** The strict sandbox denies
+reads of every entry named `.git` (a directory or a file) beneath the trees the
+gate hashes, and of the Git directory a `.git` file names, so a build script
+that runs `git rev-parse` or `git describe` finds no repository, in a main
+clone and in a linked worktree alike. The gate key then does not hash `.git`.
+Every part of a repository can change a build script's answer (a reflog, an
+abbreviated object name that gets longer when an unreachable object is added),
+so no partial hash of it is sound; no hash at all, with the state denied, is.
+A build that needs the commit must receive it through a declared input or the
+environment.
 
 ### Compile environment
 
