@@ -67,6 +67,37 @@ const BUILT_IN_COMMANDS: [&str; 39] = [
 /// which project, sources, lockfile or target directory Cargo uses.
 const HARMLESS_CONFIG_KEYS: [&str; 3] = ["profile.", "term.", "build.jobs"];
 
+/// Options without a value that the cached subcommands accept, besides the
+/// ones read individually. Anything else after the subcommand declines: an
+/// unknown option could select a lockfile, project or compiler unseen.
+const KNOWN_FLAGS: [&str; 22] = [
+    "all-targets",
+    "benches",
+    "bins",
+    "doc",
+    "document-private-items",
+    "examples",
+    "future-incompat-report",
+    "keep-going",
+    "lib",
+    "no-deps",
+    "no-fail-fast",
+    "no-run",
+    "open",
+    "quiet",
+    "release",
+    "tests",
+    "timings",
+    "verbose",
+    "frozen",
+    "locked",
+    "offline",
+    "workspace",
+];
+
+/// Short flags that take no value.
+const FLAG_SHORTS: &str = "vqrhV";
+
 /// Short options that take a value, attached (`-mPATH`, `-m=PATH`) or as
 /// the next argument. `-p` takes an optional value.
 const VALUE_SHORTS: [char; 6] = ['m', 'F', 'p', 'j', 'Z', 'C'];
@@ -81,6 +112,8 @@ pub struct Selection {
     pub target_dir: Option<PathBuf>,
     /// The subcommand, as given.
     pub command: Option<String>,
+    /// Where the subcommand sits among the arguments.
+    pub command_index: Option<usize>,
     /// `--help`, `-h`, `--version`, `-V` or `--list` was given: Cargo answers
     /// without building anything.
     pub informational: bool,
@@ -115,7 +148,13 @@ pub fn select(cwd: &Path, cargo_args: &[OsString]) -> Result<Selection> {
         return reader.finish();
     };
     refuse_user_alias(cwd, &command)?;
+    let cacheable = CACHEABLE_COMMANDS.contains(&command.as_str());
     reader.command = Some(command);
+    reader.command_index = Some(cargo_args.len() - remaining.len() - 1);
+    if !cacheable {
+        // Nothing else about an invocation that is never cached matters.
+        return reader.finish();
+    }
 
     while let Some(argument) = remaining.next() {
         if argument == "--" {
@@ -174,6 +213,7 @@ struct Reader<'a> {
     selects_packages: bool,
     target_dir: Option<PathBuf>,
     command: Option<String>,
+    command_index: Option<usize>,
     informational: bool,
 }
 
@@ -188,6 +228,7 @@ impl<'a> Reader<'a> {
             selects_packages: false,
             target_dir: None,
             command: None,
+            command_index: None,
             informational: false,
         }
     }
@@ -285,7 +326,19 @@ impl<'a> Reader<'a> {
             "workspace" | "all" => self.selects_packages = true,
             "target-dir" => self.target_dir = attached_or_next(remaining).map(PathBuf::from),
             "config" => self.check_config_override(attached_or_next(remaining))?,
-            _ => {}
+            "profile" | "target" | "jobs" | "message-format" | "color" => {
+                attached_or_next(remaining);
+            }
+            "bin" | "example" | "test" | "bench" => {
+                if attached.is_none() {
+                    remaining.next_if(|next| !is_option(next));
+                }
+            }
+            _ if KNOWN_FLAGS.contains(&name) => {}
+            _ => bail!(
+                "cargo-reapi does not know Cargo's `--{name}` for a cached invocation, so it \
+                 cannot tell what it selects"
+            ),
         }
         Ok(())
     }
@@ -299,8 +352,17 @@ impl<'a> Reader<'a> {
         let rest = characters.as_str();
 
         if !VALUE_SHORTS.contains(&first) {
-            self.informational |=
-                shorts.chars().all(|short| "vqVh".contains(short)) && shorts.contains(['V', 'h']);
+            if let Some(unknown) = shorts
+                .chars()
+                .find(|short| !FLAG_SHORTS.contains(*short) && !VALUE_SHORTS.contains(short))
+            {
+                bail!(
+                    "cargo-reapi does not know Cargo's `-{unknown}` for a cached invocation, so \
+                     it cannot tell what it selects"
+                );
+            }
+            self.informational |= shorts.chars().all(|short| FLAG_SHORTS.contains(short))
+                && shorts.contains(['V', 'h']);
             if let Some(short) = rest.chars().find(|short| VALUE_SHORTS.contains(short)) {
                 bail!(
                     "cargo-reapi cannot read `-{shorts}` exactly; give `-{short}` as its own \
@@ -431,6 +493,7 @@ impl<'a> Reader<'a> {
             metadata_arguments: arguments,
             target_dir: self.target_dir,
             command: self.command,
+            command_index: self.command_index,
             informational: self.informational,
         })
     }
@@ -638,6 +701,10 @@ mod tests {
             &["--config", "net.offline=true", "build"],
             &["build", "--config", "extra.toml"],
             &["build", "--manifest-path", "a/Cargo.toml", "-mb/Cargo.toml"],
+            &["build", "--lockfile-path", "alt/Cargo.lock"],
+            &["build", "--no-such-option"],
+            &["build", "-x"],
+            &["test", "-qx"],
         ] {
             refusal(words);
         }
@@ -688,6 +755,18 @@ mod tests {
     #[test]
     fn ignoring_the_rust_version_changes_dependency_selection_and_is_refused() {
         assert!(refusal(&["build", "--ignore-rust-version"]).contains("--ignore-rust-version"));
+    }
+
+    #[test]
+    fn the_subcommand_is_located_among_the_arguments() {
+        for (words, index) in [
+            (&["run"][..], 0),
+            (&["--locked", "run", "-p", "x"], 1),
+            (&["-v", "--color", "always", "build"], 3),
+        ] {
+            let selection = select(Path::new("/"), &arguments(words)).expect("selection");
+            assert_eq!(selection.command_index, Some(index), "{words:?}");
+        }
     }
 
     #[test]

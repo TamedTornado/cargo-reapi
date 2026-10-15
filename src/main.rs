@@ -420,6 +420,45 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     if let Some(reason) = &context.decline {
         return run_uncached(cli, &context, reason);
     }
+    if context.project.is_some() {
+        crate::hermetic::provider_identity_digest().context(SANDBOX_UNAVAILABLE)?;
+    }
+
+    // Only `run`'s build is cached, as the `build` it contains. The program
+    // then runs through Cargo as ever, with its own stdin and stdout, and
+    // is never skipped, replayed or sandboxed.
+    let Some(command_index) = context.runs_program.filter(|_| context.project.is_some()) else {
+        return run_with(cli, context, &cli.cargo_args);
+    };
+    let build = build_arguments(&cli.cargo_args, command_index);
+    let code = run_with(cli, context.clone(), &build)?;
+    if code != 0 {
+        return Ok(code);
+    }
+    let program = DriverContext {
+        project: None,
+        decline: None,
+        runs_program: None,
+        ..context
+    };
+    run_with(cli, program, &cli.cargo_args)
+}
+
+/// `run`'s arguments as the `build` they contain: the subcommand replaced,
+/// and the program's own arguments after `--` dropped.
+fn build_arguments(cargo_args: &[OsString], command_index: usize) -> Vec<OsString> {
+    let mut build = cargo_args.to_vec();
+    build[command_index] = OsString::from("build");
+    if let Some(separator) = build[command_index..]
+        .iter()
+        .position(|argument| argument == "--")
+    {
+        build.truncate(command_index + separator);
+    }
+    build
+}
+
+fn run_with(cli: &Cli, context: DriverContext, cargo_args: &[OsString]) -> Result<i32> {
     // Compiles run in their package's directory, so a relative log would
     // land beside each package rather than where the caller asked.
     let action_log = cli.action_log.as_ref().map_or_else(
@@ -436,6 +475,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         &context.target_root,
         &action_log_for_snapshot,
         context.project.as_ref(),
+        cargo_args,
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -447,7 +487,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         workspace_root,
         target_root,
         project,
-        decline: _,
+        ..
     } = context;
     if let Some(snapshot) = gate_snapshot.as_ref()
         && snapshot.is_restored()
@@ -473,8 +513,8 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     if matches!(cli.backend, Backend::Cache | Backend::Reapi) {
         ResourceCapacity::from_env()?.apply_to(&mut cargo);
     }
-    cargo.args(&cli.cargo_args);
-    describe_compile_environment(&mut cargo, &workspace_root, &cli.cargo_args);
+    cargo.args(cargo_args);
+    describe_compile_environment(&mut cargo, &workspace_root, cargo_args);
     cargo
         .env("RUSTC_WRAPPER", executable)
         .env(
@@ -558,10 +598,12 @@ fn prepare_gate(
     target_root: &Path,
     action_log: &Path,
     project: Option<&Project>,
+    cargo_args: &[OsString],
 ) -> Result<Option<GateSnapshot>> {
     let Some(project) = project else {
         return Ok(None);
     };
+    #[cfg(feature = "test-hooks")]
     if env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_some() {
         return Ok(None);
     }
@@ -575,7 +617,7 @@ fn prepare_gate(
         workspace_root,
         target_root,
         action_log,
-        &cli.cargo_args,
+        cargo_args,
         &cli.declared_inputs,
         project,
     )
@@ -599,6 +641,12 @@ fn restart_installed(executable: &Path) -> Result<i32> {
     )
 }
 
+/// Said when the strict sandbox cannot be built. Cargo did not run, and
+/// nothing was declined: this is a failure of the environment.
+const SANDBOX_UNAVAILABLE: &str =
+    "the strict sandbox is unavailable, so Cargo was not run (this is not a decline)";
+
+#[derive(Clone)]
 struct DriverContext {
     executable: PathBuf,
     workspace_root: PathBuf,
@@ -608,6 +656,9 @@ struct DriverContext {
     /// Why this invocation is not cached, when it is not: the invocation
     /// runs as plain Cargo.
     decline: Option<String>,
+    /// The invocation is `run`: only its build is cached, as `build`, and
+    /// the program then runs normally.
+    runs_program: Option<usize>,
 }
 
 /// What the preflight of a cached invocation learned before it declined or
@@ -616,6 +667,8 @@ struct DriverContext {
 struct Preflight {
     project: Option<Project>,
     target_root: Option<PathBuf>,
+    /// For `run`, where the subcommand sits among the Cargo arguments.
+    runs_program: Option<usize>,
 }
 
 fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
@@ -642,6 +695,7 @@ fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
             target_root,
             project: preflight.project,
             decline,
+            runs_program: preflight.runs_program,
         });
     }
 
@@ -665,6 +719,7 @@ fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
         target_root,
         project: None,
         decline: None,
+        runs_program: None,
     })
 }
 
@@ -678,19 +733,30 @@ fn prepare_cached_project(
     preflight: &mut Preflight,
 ) -> Result<()> {
     let selection = crate::selection::select(workspace_root, &cli.cargo_args)?;
+    if selection
+        .command
+        .as_deref()
+        .is_some_and(|c| c == "run" || c == "r")
+    {
+        preflight.runs_program = selection.command_index;
+    }
     if !selection.is_cacheable() {
         bail!(
             "only build, check, clippy, test, run, bench and doc invocations are cached, and not \
              --help or --version"
         );
     }
-    if env::var_os("CARGO_RESOLVER_LOCKFILE_PATH").is_some() {
+    if let Some(name) = crate::cargo_config::declined_environment() {
         bail!(
-            "CARGO_RESOLVER_LOCKFILE_PATH moves Cargo's lockfile, which cargo-reapi does not track"
+            "{name} changes what Cargo builds in a way cargo-reapi neither reads nor keys \
+             (a lockfile path, compiler, wrapper, build directory or unstable option)"
         );
     }
-    if let Some(origin) = crate::cargo_config::sets_lockfile_path(workspace_root)? {
-        bail!("{origin} sets resolver.lockfile-path, which moves Cargo's lockfile");
+    if let Some((origin, key)) = crate::cargo_config::declined_setting(workspace_root)? {
+        bail!(
+            "{origin} sets {key}, which changes what Cargo builds in a way cargo-reapi neither \
+             reads nor keys"
+        );
     }
 
     if let Some(missing) = cli
@@ -717,6 +783,7 @@ fn prepare_cached_project(
     // project is kept for the uncached run only once its target passes.
     validate_driver_paths(executable, &target_root)?;
     project.validate_target(workspace_root, &target_root, &cli.declared_inputs)?;
+    crate::gate::validate_administrative_directory(&target_root)?;
     preflight.project = Some(project);
     Ok(())
 }
@@ -731,8 +798,6 @@ fn one_line(text: &str) -> String {
 /// sandbox still applies; without one no policy can be built and Cargo runs
 /// plainly.
 fn run_uncached(cli: &Cli, context: &DriverContext, reason: &str) -> Result<i32> {
-    eprintln!("cargo-reapi: not caching ({reason}); running Cargo uncached");
-
     let mut cargo = match &context.project {
         Some(project) => {
             let cache_dir = cli
@@ -748,11 +813,13 @@ fn run_uncached(cli: &Cli, context: &DriverContext, reason: &str) -> Result<i32>
                 &action_log,
                 &cli.declared_inputs,
                 Some(project),
-            )?
+            )
+            .context(SANDBOX_UNAVAILABLE)?
             .command
         }
         None => Command::new("cargo"),
     };
+    eprintln!("cargo-reapi: not caching ({reason}); running Cargo uncached");
     let status = cargo
         .args(&cli.cargo_args)
         .status()
@@ -1081,7 +1148,28 @@ mod cli_tests {
 
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, resolve_target_root_from, validate_driver_paths};
+    use std::ffi::OsString;
+
+    use super::{Cli, build_arguments, resolve_target_root_from, validate_driver_paths};
+
+    fn arguments(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn run_is_cached_as_the_build_it_contains() {
+        assert_eq!(
+            build_arguments(
+                &arguments(&["--locked", "run", "-p", "tool", "--", "--all"]),
+                1
+            ),
+            arguments(&["--locked", "build", "-p", "tool"])
+        );
+        assert_eq!(
+            build_arguments(&arguments(&["r", "--bin", "tool"]), 0),
+            arguments(&["build", "--bin", "tool"])
+        );
+    }
 
     #[test]
     fn version_identifies_cargo_reapi_instead_of_delegating_to_cargo() {

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 
 /// The selected project, with every path canonical: symlinks resolved, so
 /// that two spellings of one directory compare equal.
+#[derive(Clone)]
 pub struct Project {
     pub workspace_root: PathBuf,
     /// Cargo's own target directory for the project: beside a
@@ -21,6 +22,7 @@ pub struct Project {
 }
 
 /// A package in the project's resolve.
+#[derive(Clone)]
 pub struct Package {
     pub id: String,
     pub root: PathBuf,

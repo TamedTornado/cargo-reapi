@@ -118,6 +118,125 @@ struct CaptureRoots {
     toolchain: PathBuf,
 }
 
+/// One file rustc's own dep-info lists as read by a compile, by logical path
+/// and content digest.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
+pub struct DepInput {
+    pub logical_path: String,
+    pub sha256: String,
+}
+
+/// Every file the compile just read, as rustc's own dep-info says, with its
+/// digest. The action key covers the command line, the package directory and
+/// `OUT_DIR`, but `include!`, `include_str!`, `#[path]` and proc macros can
+/// read anywhere, so a cached entry is a hit only while all of these still
+/// match. Fails when the dep-info is missing, or lists a file outside the
+/// declared roots or one that cannot be read, so the entry is not published.
+pub fn read_dep_inputs(
+    invocation: &RustcInvocation,
+    prepared: &PreparedInvocation,
+) -> Result<Vec<DepInput>> {
+    let dep_info = prepared
+        .dep_info
+        .as_ref()
+        .context("the compile writes no dep-info, so its inputs are unknown")?;
+    let text = fs::read_to_string(&dep_info.actual_path)
+        .with_context(|| format!("reading dep-info {}", dep_info.actual_path.display()))?;
+    let roots = CaptureRoots::from_env(invocation)?;
+    let mut inputs = BTreeMap::new();
+    for listed in dep_info_paths(&text) {
+        let actual = absolute(Path::new(&listed), &invocation.cwd);
+        let logical = roots.normalize(&actual, &invocation.cwd)?;
+        let (sha256, _) = logical_digest(&actual, &prepared.relocation_mappings)
+            .with_context(|| format!("digesting dep-info input {}", actual.display()))?;
+        inputs.insert(logical, sha256);
+    }
+    Ok(inputs
+        .into_iter()
+        .map(|(logical_path, sha256)| DepInput {
+            logical_path,
+            sha256,
+        })
+        .collect())
+}
+
+/// Whether every recorded dep-info input still has its recorded content.
+pub fn dep_inputs_match(
+    invocation: &RustcInvocation,
+    recorded: &[DepInput],
+    mappings: &[(String, String)],
+) -> Result<bool> {
+    let roots = CaptureRoots::from_env(invocation)?;
+    for input in recorded {
+        let Some(actual) = roots.denormalize(&input.logical_path) else {
+            return Ok(false);
+        };
+        match logical_digest(&actual, mappings) {
+            Ok((sha256, _)) if sha256 == input.sha256 => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// The prerequisites a dependency file lists, unescaped.
+fn dep_info_paths(text: &str) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let separator = (0..bytes.len()).find(|&index| {
+            bytes[index] == b':'
+                && (index == 0 || bytes[index - 1] != b'\\')
+                && bytes.get(index + 1).is_none_or(|next| *next == b' ')
+        });
+        let Some(separator) = separator else {
+            continue;
+        };
+        let (target, prerequisites) = (&line[..separator], &line[separator + 1..]);
+        if prerequisites.trim().is_empty() {
+            paths.insert(unescape_path(target));
+            continue;
+        }
+        let mut current = String::new();
+        let mut escaped = false;
+        for character in prerequisites.chars() {
+            match (escaped, character) {
+                (true, other) => {
+                    current.push(other);
+                    escaped = false;
+                }
+                (false, '\\') => escaped = true,
+                (false, ' ') => {
+                    if !current.is_empty() {
+                        paths.insert(std::mem::take(&mut current));
+                    }
+                }
+                (false, other) => current.push(other),
+            }
+        }
+        if !current.is_empty() {
+            paths.insert(current);
+        }
+    }
+    paths
+}
+
+fn unescape_path(text: &str) -> String {
+    let mut unescaped = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            unescaped.extend(characters.next());
+        } else {
+            unescaped.push(character);
+        }
+    }
+    unescaped
+}
+
 /// Records the action and runs the compiler with the caller's whole
 /// environment. The recorded key covers the environment a cached compile
 /// would start with.
@@ -382,6 +501,23 @@ impl CaptureRoots {
         })
     }
 
+    /// The actual path a logical path names, the inverse of [`Self::normalize`].
+    fn denormalize(&self, logical: &str) -> Option<PathBuf> {
+        let (label, relative) = logical.split_once('/').unwrap_or((logical, ""));
+        let root = match label {
+            "target" => Some(&self.target),
+            "package" => self.package.as_ref(),
+            "workspace" => Some(&self.workspace),
+            "toolchain" => Some(&self.toolchain),
+            _ => None,
+        }?;
+        Some(if relative.is_empty() {
+            root.clone()
+        } else {
+            root.join(relative)
+        })
+    }
+
     fn normalize(&self, path: &Path, cwd: &Path) -> Result<String> {
         let absolute = absolute(path, cwd);
         if let Ok(relative) = absolute.strip_prefix(&self.target) {
@@ -517,10 +653,10 @@ fn extern_path(value: &OsString) -> Option<PathBuf> {
 }
 
 /// Whether the walk over a package's files skips `path`: Cargo's target
-/// directory itself, which is output, and the bulk of a Git directory (see
-/// [`crate::gate::is_git_bulk`]). No directory is skipped by its name.
+/// directory itself, which is output, and any entry named `.git`, which the
+/// strict sandbox denies reads of. No other name is skipped.
 fn is_ignored(path: &Path, target: &Path) -> bool {
-    path.starts_with(target) || crate::gate::is_git_bulk(path)
+    path.starts_with(target) || path.file_name().is_some_and(|name| name == ".git")
 }
 
 fn digest_file(

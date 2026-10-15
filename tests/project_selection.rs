@@ -5,8 +5,9 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -51,6 +52,31 @@ impl Fixture {
             "generate-lockfile failed in {}",
             root.display()
         );
+    }
+
+    /// As [`Self::cargo_reapi`], with `input` on the program's standard input.
+    fn cargo_reapi_with_input(&self, cwd: &Path, cargo_args: &[&str], input: &str) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
+        command
+            .current_dir(cwd)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_REAPI_ACTION_LOG")
+            .args(["--backend", "cache", "--cache-dir"])
+            .arg(&self.cache)
+            .arg("--")
+            .args(cargo_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("start cargo-reapi");
+        child
+            .stdin
+            .take()
+            .expect("standard input")
+            .write_all(input.as_bytes())
+            .expect("write standard input");
+        child.wait_with_output().expect("wait for cargo-reapi")
     }
 
     /// Runs the gated cache backend in `cwd`, letting Cargo choose the
@@ -443,10 +469,11 @@ fn a_source_directory_named_target_is_hashed() {
     assert_eq!(run(&output.join("debug/project")), "edited");
 }
 
-/// Astra 0.2.11 finding 4: another Cargo run in the same target directory
-/// replaces outputs without touching the gate's marker.
+/// Astra 0.2.11 finding 4 and 0.2.12 finding 5: another Cargo run in the same
+/// target directory leaves files the gate did not produce. A gate never
+/// restores into such a target, and Cargo itself rebuilds what changed.
 #[test]
-fn a_gate_hit_restores_outputs_that_another_cargo_run_replaced() {
+fn a_target_changed_by_another_cargo_run_is_left_to_cargo() {
     let fixture = Fixture::new();
     let project = fixture.path("project");
     write_package(&project, "project", "unused", "\n[features]\nextra = []\n");
@@ -459,12 +486,12 @@ fn a_gate_hit_restores_outputs_that_another_cargo_run_replaced() {
     let target = project.join("target");
     let binary = target.join("debug/project");
 
-    // Cold, then a restore that writes the marker, then a marker hit.
-    for _ in 0..3 {
+    // Cold, then a marker hit: the producer left exactly what it published.
+    for _ in 0..2 {
         assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
         assert_eq!(run(&binary), "plain");
     }
-    assert_eq!(gate_hits(&target), 2);
+    assert_eq!(gate_hits(&target), 1);
 
     // A plain build with the feature replaces the executable.
     let plain = Command::new("cargo")
@@ -476,13 +503,16 @@ fn a_gate_hit_restores_outputs_that_another_cargo_run_replaced() {
     assert!(plain.status.success(), "{}", stderr(&plain));
     assert_eq!(run(&binary), "extra");
 
+    // The target no longer matches, so no gate runs, and Cargo rebuilds.
     assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
     assert_eq!(run(&binary), "plain");
+    assert_eq!(gate_hits(&target), 1, "a gate hit into a changed target");
 
-    // A deleted output is restored the same way.
+    // A deleted output is Cargo's to rebuild the same way.
     fs::remove_file(&binary).expect("delete the executable");
     assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
     assert_eq!(run(&binary), "plain");
+    assert_eq!(gate_hits(&target), 1);
 }
 
 /// Defines the `ci` alias somewhere a Cargo run in `project` reads it, and
@@ -1106,13 +1136,9 @@ fn the_short_manifest_option_selects_the_project() {
     assert_declined(&output, "own argument");
 }
 
-/// The invocations Moria's `moria_cargo` makes, with `CARGO_TARGET_DIR` at
-/// `<checkout>/target`, stay cached: each hits on its second run.
-#[test]
-fn the_ordinary_moria_cargo_invocations_still_hit() {
-    let fixture = Fixture::new();
-    let checkout = fixture.path("checkout");
-    fs::create_dir_all(&checkout).expect("checkout");
+/// A workspace of two packages, as a Moria checkout, with its lockfile.
+fn write_moria_checkout(fixture: &Fixture, checkout: &Path) {
+    fs::create_dir_all(checkout).expect("checkout");
     fs::write(
         checkout.join("Cargo.toml"),
         "[workspace]\nmembers = ['moria', 'crate_name']\nresolver = '3'\n",
@@ -1147,9 +1173,15 @@ fn the_ordinary_moria_cargo_invocations_still_hit() {
         "fn main() { println!(\"{}\", crate_name::answer()); }\n",
     )
     .expect("moria source");
-    fixture.lock(&checkout);
-    let target = checkout.join("target");
-    let environment = [("CARGO_TARGET_DIR", target.as_os_str())];
+    fixture.lock(checkout);
+}
+
+/// The invocations Moria's `moria_cargo` makes, with `CARGO_TARGET_DIR` at
+/// `<checkout>/target`, stay cached: a clean second checkout restores each
+/// from the snapshot the first one published, and `run` still runs.
+#[test]
+fn the_ordinary_moria_cargo_invocations_still_hit() {
+    let fixture = Fixture::new();
 
     let invocations: [&[&str]; 10] = [
         &["build", "-p", "moria", "--profile", "release", "-q"],
@@ -1194,78 +1226,29 @@ fn the_ordinary_moria_cargo_invocations_still_hit() {
         &["run", "--locked", "--bin", "moria"],
         &["build", "--all-features"],
     ];
-    for arguments in invocations {
-        let before = gate_hits(&target);
-        for _ in 0..2 {
-            let output = fixture.cargo_reapi_with(&checkout, arguments, &environment);
+    for (index, arguments) in invocations.into_iter().enumerate() {
+        let producer = fixture.path(&format!("producer-{index}"));
+        let consumer = fixture.path(&format!("consumer-{index}"));
+        for checkout in [&producer, &consumer] {
+            write_moria_checkout(&fixture, checkout);
+        }
+        for checkout in [&producer, &consumer] {
+            let target = checkout.join("target");
+            let environment = [("CARGO_TARGET_DIR", target.as_os_str())];
+            let output = fixture.cargo_reapi_with(checkout, arguments, &environment);
             assert_succeeded(&output);
         }
-        assert_eq!(gate_hits(&target), before + 1, "{arguments:?} did not hit");
+        assert_eq!(
+            gate_hits(&producer.join("target")),
+            0,
+            "{arguments:?} hit in the producer"
+        );
+        assert_eq!(
+            gate_hits(&consumer.join("target")),
+            1,
+            "{arguments:?} did not hit in a clean checkout"
+        );
     }
-}
-
-/// A build script reading Git state: the gate keys `.git` except its
-/// objects and logs.
-#[test]
-fn git_state_read_by_a_build_script_is_keyed_but_repacking_objects_is_not() {
-    let fixture = Fixture::new();
-    let project = fixture.path("project");
-    write_package(&project, "project", "unused", "");
-    fs::write(
-        project.join("build.rs"),
-        "fn main() {\n    let head = std::process::Command::new(\"git\").args([\"rev-parse\", \"HEAD\"]).output().expect(\"git\");\n    println!(\"cargo:rustc-env=HEAD={}\", String::from_utf8_lossy(&head.stdout).trim());\n}\n",
-    )
-    .expect("build script");
-    fs::write(
-        project.join("src/main.rs"),
-        "fn main() { println!(\"{}\", env!(\"HEAD\")); }\n",
-    )
-    .expect("main source");
-    fs::write(project.join(".gitignore"), "target\n").expect("ignore");
-    fixture.lock(&project);
-    let git = |arguments: &[&str]| {
-        let status = Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
-            .args(arguments)
-            .current_dir(&project)
-            .status()
-            .expect("git");
-        assert!(status.success(), "git {arguments:?} failed");
-    };
-    git(&["init", "-q"]);
-    git(&["add", "."]);
-    git(&["commit", "-qm", "first"]);
-    let binary = project.join("target/debug/project");
-    let head = |project: &Path| {
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(project)
-            .output()
-            .expect("git rev-parse");
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
-
-    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
-    assert_eq!(run(&binary), head(&project));
-
-    // A new commit changes what the build script reads.
-    git(&["commit", "-qm", "second", "--allow-empty"]);
-    let hits = gate_hits(&project.join("target"));
-    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
-    assert_eq!(gate_hits(&project.join("target")), hits, "a stale hit");
-    assert_eq!(run(&binary), head(&project));
-
-    // Repacking objects changes nothing it can read: the very next build hits.
-    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
-    let hits = gate_hits(&project.join("target"));
-    git(&["repack", "-a", "-d", "-q"]);
-    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
-    assert_eq!(
-        gate_hits(&project.join("target")),
-        hits + 1,
-        "no hit after repacking"
-    );
-    assert_eq!(run(&binary), head(&project));
 }
 
 #[test]
@@ -1288,4 +1271,491 @@ fn a_missing_declared_input_runs_uncached() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_declined(&output, "declared input does not exist");
     assert!(!cache_holds_a_snapshot(&fixture));
+}
+
+/// Astra 0.2.12 finding 1: a package input inside Cargo's own default target.
+#[test]
+fn an_input_inside_cargos_default_target_is_never_restored_over_an_edit() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"{}\", include_str!(\"../target/message.txt\")); }\n",
+    )
+    .expect("main source");
+    fs::create_dir_all(project.join("target")).expect("target");
+    let message = project.join("target/message.txt");
+    fs::write(&message, "original").expect("message");
+    fixture.lock(&project);
+    let binary = project.join("target/debug/project");
+
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    assert_eq!(run(&binary), "original");
+    fs::write(&message, "edited").expect("edit message");
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+
+    assert_eq!(fs::read_to_string(&message).expect("message"), "edited");
+    assert_eq!(run(&binary), "edited");
+}
+
+/// Astra 0.2.12 finding 2: cargo-reapi's own directory in the target is a
+/// link into the source.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_administrative_directory_is_declined_and_never_written_through() {
+    for link_the in ["directory", "log"] {
+        let fixture = Fixture::new();
+        let project = fixture.path("project");
+        write_package(&project, "project", "project", "");
+        fixture.lock(&project);
+        assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+        let administrative = project.join("target/cargo-reapi");
+        let source = fs::read(project.join("src/main.rs")).expect("source");
+        if link_the == "directory" {
+            fs::remove_dir_all(&administrative).expect("remove administrative directory");
+            std::os::unix::fs::symlink(project.join("src"), &administrative).expect("link");
+        } else {
+            fs::remove_file(administrative.join("actions.jsonl")).expect("remove the log");
+            std::os::unix::fs::symlink(
+                project.join("src/main.rs"),
+                administrative.join("actions.jsonl"),
+            )
+            .expect("link the log");
+        }
+
+        let output = fixture.cargo_reapi(&project, &["build"]);
+
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_declined(&output, "cargo-reapi");
+        assert_eq!(
+            fs::read(project.join("src/main.rs")).expect("source"),
+            source
+        );
+        let strays = fs::read_dir(project.join("src"))
+            .expect("source directory")
+            .count();
+        assert_eq!(strays, 1, "{link_the}: cargo-reapi wrote into src");
+    }
+}
+
+/// Astra 0.2.12 finding 3: options after the subcommand that cargo-reapi does
+/// not know decline, however Cargo reads them.
+#[test]
+fn unknown_options_and_unstable_configuration_run_as_plain_cargo() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "project", "");
+    fixture.lock(&project);
+
+    let output = fixture.cargo_reapi(
+        &project,
+        &["build", "--lockfile-path", "target/alt/Cargo.lock"],
+    );
+    assert_declined(&output, "--lockfile-path");
+    let output = fixture.cargo_reapi(&project, &["build", "--no-such-option"]);
+    assert_declined(&output, "--no-such-option");
+    let output = fixture.cargo_reapi(&project, &["build", "-x"]);
+    assert_declined(&output, "-x");
+    assert!(!cache_holds_a_snapshot(&fixture));
+
+    write_config(&project, "config.toml", "[unstable]\n");
+    let output = fixture.cargo_reapi(&project, &["build"]);
+    assert_declined(&output, "unstable");
+
+    fs::remove_file(project.join(".cargo/config.toml")).expect("remove configuration");
+    let output = fixture.cargo_reapi_with(
+        &project,
+        &["build"],
+        &[("CARGO_UNSTABLE_BUILD_STD", OsStr::new("core"))],
+    );
+    assert_declined(&output, "CARGO_UNSTABLE_BUILD_STD");
+    assert!(!cache_holds_a_snapshot(&fixture));
+}
+
+/// Astra 0.2.12 finding 4: rustc reads a file outside the package.
+#[test]
+fn a_file_included_from_outside_the_package_keys_the_compile() {
+    let fixture = Fixture::new();
+    let workspace = fixture.path("workspace");
+    fs::create_dir_all(workspace.join("shared")).expect("shared directory");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = ['member']\nresolver = '3'\n",
+    )
+    .expect("workspace manifest");
+    write_package(&workspace.join("member"), "member", "unused", "");
+    fs::remove_file(workspace.join("member/src/main.rs")).expect("no binary");
+    fs::write(
+        workspace.join("member/src/lib.rs"),
+        "include!(\"../../shared/body.rs\");\n",
+    )
+    .expect("library");
+    let body = workspace.join("shared/body.rs");
+    fs::write(&body, "pub fn answer() -> u8 { 1 }\n").expect("body");
+    fixture.lock(&workspace);
+
+    assert_succeeded(&fixture.cargo_reapi(&workspace, &["check", "-p", "member"]));
+    fs::write(&body, "compile_error!(\"changed\");\n").expect("break the body");
+    let output = fixture.cargo_reapi(&workspace, &["check", "-p", "member"]);
+
+    assert!(
+        !output.status.success(),
+        "a stale compile result: {}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("changed"), "{}", stderr(&output));
+
+    // Unchanged inputs still hit the action cache in another target.
+    fs::write(&body, "pub fn answer() -> u8 { 1 }\n").expect("restore the body");
+    let target = workspace.join("target");
+    fs::remove_dir_all(&target).expect("retire the target");
+    // A target that already holds something is never restored into, so the
+    // per-action cache serves it.
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("occupied"), "").expect("occupy the target");
+    assert_succeeded(&fixture.cargo_reapi(&workspace, &["check", "-p", "member"]));
+    let log = fs::read_to_string(target.join("cargo-reapi/actions.jsonl")).expect("action log");
+    assert!(log.contains("\"cache-hit\""), "{log}");
+}
+
+/// Astra 0.2.12 finding 5: a restore never rolls back other artifacts.
+#[test]
+fn a_restore_never_touches_artifacts_the_snapshot_did_not_build() {
+    let fixture = Fixture::new();
+    let workspace = fixture.path("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = ['a', 'b']\nresolver = '3'\n",
+    )
+    .expect("workspace manifest");
+    write_package(&workspace.join("a"), "a", "a", "");
+    write_package(
+        &workspace.join("b"),
+        "b",
+        "unused",
+        "\n[features]\nextra = []\n",
+    );
+    fs::write(
+        workspace.join("b/src/main.rs"),
+        "fn main() { println!(\"{}\", if cfg!(feature = \"extra\") { \"extra\" } else { \"plain\" }); }\n",
+    )
+    .expect("b source");
+    fixture.lock(&workspace);
+    let first = fixture.path("first-target");
+    let second = fixture.path("second-target");
+
+    // B, then a build of A that shares the target: a producer that started
+    // with B's output in place.
+    let first_environment = [("CARGO_TARGET_DIR", first.as_os_str())];
+    assert_succeeded(&fixture.cargo_reapi_with(
+        &workspace,
+        &["build", "-p", "b"],
+        &first_environment,
+    ));
+    assert_succeeded(&fixture.cargo_reapi_with(
+        &workspace,
+        &["build", "-p", "a"],
+        &first_environment,
+    ));
+
+    // B with the feature, in another target, then the same build of A.
+    let second_environment = [("CARGO_TARGET_DIR", second.as_os_str())];
+    let plain = Command::new("cargo")
+        .args(["build", "-p", "b", "--features", "extra"])
+        .current_dir(&workspace)
+        .env("CARGO_HOME", &fixture.cargo_home)
+        .env("CARGO_TARGET_DIR", &second)
+        .output()
+        .expect("plain cargo build");
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    assert_succeeded(&fixture.cargo_reapi_with(
+        &workspace,
+        &["build", "-p", "a"],
+        &second_environment,
+    ));
+
+    assert_eq!(run(&second.join("debug/b")), "extra");
+    assert_eq!(run(&second.join("debug/a")), "a");
+}
+
+/// Astra 0.2.12 finding 6: a configured compiler is declined, not replaced.
+#[test]
+fn a_configured_compiler_or_wrapper_is_declined_not_overridden() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "project", "");
+    fixture.lock(&project);
+    let rustc = Command::new("rustup")
+        .args(["which", "rustc"])
+        .output()
+        .map_or_else(
+            |_| "rustc".to_owned(),
+            |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        );
+
+    for (key, reason) in [
+        ("rustc", "build.rustc"),
+        ("rustdoc", "build.rustdoc"),
+        ("rustc-wrapper", "build.rustc-wrapper"),
+        ("rustc-workspace-wrapper", "build.rustc-workspace-wrapper"),
+    ] {
+        write_config(
+            &project,
+            "config.toml",
+            &format!("[build]\n{key} = '{rustc}'\n"),
+        );
+        let output = fixture.cargo_reapi(&project, &["build"]);
+        assert_declined(&output, reason);
+    }
+    fs::remove_file(project.join(".cargo/config.toml")).expect("remove configuration");
+
+    for name in [
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        let output = fixture.cargo_reapi_with(&project, &["build"], &[(name, OsStr::new(&rustc))]);
+        assert_declined(&output, name);
+    }
+    assert!(!cache_holds_a_snapshot(&fixture));
+
+    // An empty wrapper is no wrapper, as for Cargo.
+    let output =
+        fixture.cargo_reapi_with(&project, &["build"], &[("RUSTC_WRAPPER", OsStr::new(""))]);
+    assert_succeeded(&output);
+}
+
+/// Astra 0.2.12 finding 6: a replaced custom rustdoc is a different tool.
+#[cfg(unix)]
+#[test]
+fn replacing_a_custom_rustdoc_in_place_misses() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "project", "");
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn answer() {}\nfn hidden() {}\n",
+    )
+    .expect("library");
+    fs::remove_file(project.join("src/main.rs")).expect("no binary");
+    fixture.lock(&project);
+    let real = Command::new("rustup")
+        .args(["which", "rustdoc"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .expect("rustup which rustdoc");
+    let tool = fixture.path("tools/rustdoc");
+    fs::create_dir_all(tool.parent().expect("tools")).expect("tools directory");
+    let install = |flags: &str| {
+        fs::write(&tool, format!("#!/bin/sh\nexec {real} \"$@\" {flags}\n"))
+            .expect("custom rustdoc");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("executable");
+    };
+    let environment = [("RUSTDOC", tool.as_os_str())];
+    let hidden = project.join("target/doc/project/fn.hidden.html");
+
+    install("");
+    assert_succeeded(&fixture.cargo_reapi_with(&project, &["doc"], &environment));
+    assert!(!hidden.exists());
+    install("--document-private-items");
+    assert_succeeded(&fixture.cargo_reapi_with(&project, &["doc"], &environment));
+
+    assert!(hidden.exists(), "a replaced rustdoc was not run");
+}
+
+/// Astra 0.2.12 finding 7: a separate build directory is declined.
+#[test]
+fn a_separate_build_directory_is_declined() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    let build_dir = fixture.path("intermediate");
+    write_package(&project, "project", "project", "");
+    fixture.lock(&project);
+
+    write_config(
+        &project,
+        "config.toml",
+        &format!("[build]\nbuild-dir = '{}'\n", build_dir.display()),
+    );
+    assert_declined(
+        &fixture.cargo_reapi(&project, &["build"]),
+        "build.build-dir",
+    );
+    fs::remove_file(project.join(".cargo/config.toml")).expect("remove configuration");
+    let output = fixture.cargo_reapi_with(
+        &project,
+        &["build"],
+        &[("CARGO_BUILD_BUILD_DIR", build_dir.as_os_str())],
+    );
+    assert_declined(&output, "CARGO_BUILD_BUILD_DIR");
+    assert!(!cache_holds_a_snapshot(&fixture));
+}
+
+/// Astra 0.2.12 finding 8: a build script finds no Git state under caching,
+/// in a main clone or a linked worktree.
+#[test]
+fn a_build_script_finds_no_git_state_under_caching() {
+    let fixture = Fixture::new();
+    let clone = fixture.path("clone");
+    write_package(&clone, "project", "unused", "");
+    fs::write(
+        clone.join("build.rs"),
+        r#"fn main() {
+    let git = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let files = std::fs::read(".git/HEAD").is_ok() || std::fs::read_to_string(".git").is_ok();
+    println!("cargo:rustc-env=GIT={}", if git || files { "visible" } else { "denied" });
+}
+"#,
+    )
+    .expect("build script");
+    fs::write(
+        clone.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"GIT\")); }\n",
+    )
+    .expect("main source");
+    fs::write(clone.join(".gitignore"), "target\n").expect("ignore");
+    let git = |directory: &Path, arguments: &[&str]| {
+        let status = Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+            .args(arguments)
+            .current_dir(directory)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {arguments:?} failed");
+    };
+    git(&clone, &["init", "-q"]);
+    git(&clone, &["add", "."]);
+    git(&clone, &["commit", "-qm", "first"]);
+    fixture.lock(&clone);
+    git(&clone, &["add", "Cargo.lock"]);
+    git(&clone, &["commit", "-qm", "lock"]);
+    let worktree = fixture.path("worktree");
+    git(
+        &clone,
+        &["worktree", "add", "-q", &worktree.to_string_lossy()],
+    );
+
+    // Plain Cargo sees the repository: the premise of the test.
+    let plain = Command::new("cargo")
+        .arg("build")
+        .current_dir(&clone)
+        .env("CARGO_HOME", &fixture.cargo_home)
+        .env("CARGO_TARGET_DIR", fixture.path("plain-target"))
+        .output()
+        .expect("plain cargo build");
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    assert_eq!(run(&fixture.path("plain-target/debug/project")), "visible");
+
+    for checkout in [&clone, &worktree] {
+        assert_succeeded(&fixture.cargo_reapi(checkout, &["build"]));
+        assert_eq!(
+            run(&checkout.join("target/debug/project")),
+            "denied",
+            "{checkout:?}"
+        );
+    }
+}
+
+/// Astra 0.2.12 finding 9: `run` caches its build, never the program.
+#[test]
+fn run_caches_only_its_build_and_always_runs_the_program() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("src/main.rs"),
+        r#"use std::io::Read;
+fn main() {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).expect("stdin");
+    println!("got:{}:{}", input.trim(), std::env::args().skip(1).collect::<Vec<_>>().join(","));
+    if input.trim() == "bad" {
+        std::process::exit(3);
+    }
+}
+"#,
+    )
+    .expect("main source");
+    fixture.lock(&project);
+    let target = project.join("target");
+    let arguments = ["run", "--", "x", "y"];
+
+    let first = fixture.cargo_reapi_with_input(&project, &arguments, "ok");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(String::from_utf8_lossy(&first.stdout).trim(), "got:ok:x,y");
+    let second = fixture.cargo_reapi_with_input(&project, &arguments, "bad");
+
+    assert_eq!(second.status.code(), Some(3), "{}", stderr(&second));
+    assert_eq!(
+        String::from_utf8_lossy(&second.stdout).trim(),
+        "got:bad:x,y"
+    );
+    assert_eq!(gate_hits(&target), 1, "the build was not reused");
+}
+
+/// Astra 0.2.12 finding 10: a corrupted snapshot is never restored.
+#[test]
+fn a_corrupted_snapshot_is_evicted_and_never_restored() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "intact", "");
+    fixture.lock(&project);
+    let first = fixture.path("first-target");
+    let second = fixture.path("second-target");
+    let first_environment = [("CARGO_TARGET_DIR", first.as_os_str())];
+    assert_succeeded(&fixture.cargo_reapi_with(&project, &["build"], &first_environment));
+    let published = fs::read_dir(fixture.cache.join("gate-snapshots/objects"))
+        .expect("snapshots")
+        .next()
+        .expect("a snapshot")
+        .expect("entry")
+        .path();
+    fs::write(published.join("target/debug/project"), "corrupt").expect("corrupt the snapshot");
+
+    let second_environment = [("CARGO_TARGET_DIR", second.as_os_str())];
+    let output = fixture.cargo_reapi_with(&project, &["build"], &second_environment);
+
+    assert_succeeded(&output);
+    assert!(
+        stderr(&output).contains("failed its content check"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(run(&second.join("debug/project")), "intact");
+    assert_eq!(gate_hits(&second), 0);
+}
+
+/// Astra 0.2.12 finding 11: a sandbox that cannot start is an error that
+/// says so, never a hand-off to Cargo.
+#[test]
+fn an_unavailable_sandbox_is_an_error_not_a_decline() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "project", "");
+    fixture.lock(&project);
+
+    let output = fixture.cargo_reapi_with(
+        &project,
+        &["build"],
+        &[("CARGO_REAPI_SRT", OsStr::new("/nonexistent/srt"))],
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("Cargo was not run"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains(DECLINE), "{}", stderr(&output));
+    assert!(!project.join("target/debug/project").exists());
 }

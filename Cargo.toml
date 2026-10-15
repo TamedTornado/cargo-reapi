@@ -38,13 +38,36 @@ walkdir = "2.5"
 libc = "0.2"
 
 [features]
-# Test synchronization hooks. Only the integration tests that need them
-# enable it (`cargo test --features test-hooks`); a release build never has it.
+# For this crate's own tests only; never enable it for a build you use.
+# It compiles in test synchronization and a switch that skips the whole-gate
+# snapshot (`CARGO_REAPI_ACTION_CACHE_TEST_MODE`), which a release build does
+# not contain. The integration tests that need them require it: run the suite
+# with `cargo test --features test-hooks`.
 test-hooks = []
+
+[[test]]
+name = "capture"
+path = "tests/capture.rs"
+required-features = ["test-hooks"]
 
 [[test]]
 name = "coalescing"
 path = "tests/coalescing.rs"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "dependency_relocation"
+path = "tests/dependency_relocation.rs"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "environment"
+path = "tests/environment.rs"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "pipelining"
+path = "tests/pipelining.rs"
 required-features = ["test-hooks"]
 
 [lints.clippy]

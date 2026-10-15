@@ -1900,12 +1900,13 @@ fn changed_source_in_an_existing_target_cannot_reuse_stale_cargo_freshness() {
         fs::write(&source, original).expect("revert failed edit");
         fs::remove_file(&log).expect("retire action log");
         run_snapshot_gate(root.path(), cache.path(), &log, &["check"]);
-        let actions = read_actions(&log);
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0]["execution"], "gate-snapshot-hit");
-        assert_eq!(
-            actions[0]["snapshot_marker_hit"], false,
-            "a failed replan must invalidate the old target marker"
+        // The failed replan left the target holding files no snapshot
+        // describes, so no gate runs: Cargo rebuilds with the action cache.
+        assert!(
+            !fs::read_to_string(&log)
+                .expect("action log")
+                .contains("gate-snapshot-hit"),
+            "a gate hit restored into a target it did not leave"
         );
     }
 }
@@ -1936,6 +1937,8 @@ fn whole_gate_snapshot_restores_cargo_state_after_producer_deletion() {
         )
         .success()
     );
+    // A snapshot is published only from a clean target.
+    fs::remove_dir_all(producer.join("target")).expect("clean producer target");
     assert!(
         run_snapshot_gate_with_environment(
             &producer,
@@ -1958,18 +1961,20 @@ fn whole_gate_snapshot_restores_cargo_state_after_producer_deletion() {
             &consumer,
             cache.path(),
             &consumer_log,
-            &["build", "--all-targets"],
+            &["check", "--all-targets"],
             &[],
             Some(&consumer_trace),
         )
         .success()
     );
+    // A snapshot restores only into a clean target.
+    fs::remove_dir_all(consumer.join("target")).expect("clean consumer target");
     assert!(
         run_snapshot_gate_with_environment(
             &consumer,
             cache.path(),
             &consumer_log,
-            &["check", "--all-targets"],
+            &["build", "--all-targets"],
             &[],
             Some(&consumer_trace),
         )
@@ -2060,13 +2065,17 @@ fn check_clippy_and_test_publish_three_exact_gate_snapshots() {
     let cache = tempdir().expect("gate cache");
     write_fixture(root.path(), false);
     let action_log = root.path().join("actions.jsonl");
+    // A snapshot is published only from a clean target, so each command
+    // starts with none.
     run_snapshot_gate(root.path(), cache.path(), &action_log, &["check"]);
+    fs::remove_dir_all(root.path().join("target")).expect("clean target");
     run_snapshot_gate(
         root.path(),
         cache.path(),
         &action_log,
         &["clippy", "--", "-D", "warnings"],
     );
+    fs::remove_dir_all(root.path().join("target")).expect("clean target");
     run_snapshot_gate(root.path(), cache.path(), &action_log, &["test"]);
     let objects = fs::read_dir(cache.path().join("gate-snapshots/objects"))
         .expect("snapshot objects")

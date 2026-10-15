@@ -258,7 +258,6 @@ fn the_default_action_log_collects_compiles_run_outside_the_workspace() {
         .current_dir(&workspace)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_REAPI_ACTION_LOG")
-        .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .args(["--backend", "cache", "--cache-dir"])
         .arg(root.path().join("cache"))
         .args(["--", "build"])

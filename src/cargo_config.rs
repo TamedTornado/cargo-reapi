@@ -86,22 +86,78 @@ pub fn defines_alias(cwd: &Path, name: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// The file setting `resolver.lockfile-path`, if any. Cargo then reads and
-/// writes its lockfile elsewhere, which cargo-reapi neither hashes nor
-/// protects. Fails when a file cannot be read completely.
-pub fn sets_lockfile_path(cwd: &Path) -> Result<Option<String>> {
+/// Configuration that changes what Cargo builds in ways cargo-reapi neither
+/// reads nor keys, so an invocation under it is not cached. Each is a dotted
+/// key, or a whole table for a trailing `.*`.
+const DECLINED_SETTINGS: [&str; 7] = [
+    "resolver.lockfile-path",
+    "build.rustc",
+    "build.rustdoc",
+    "build.rustc-wrapper",
+    "build.rustc-workspace-wrapper",
+    "build.build-dir",
+    "unstable.*",
+];
+
+/// The first configuration file that sets one of the [`DECLINED_SETTINGS`],
+/// as `(origin, key)`. A table such as `[unstable]` counts however empty.
+/// Fails when a file cannot be read completely.
+pub fn declined_setting(cwd: &Path) -> Result<Option<(String, &'static str)>> {
     for path in files(cwd) {
         let layer = read_file(&path)?;
-        let set = layer
-            .table
-            .get("resolver")
-            .and_then(toml::Value::as_table)
-            .is_some_and(|resolver| resolver.contains_key("lockfile-path"));
-        if set {
-            return Ok(Some(layer.origin));
+        for key in DECLINED_SETTINGS {
+            if sets(&layer.table, key) {
+                return Ok(Some((layer.origin, key)));
+            }
         }
     }
     Ok(None)
+}
+
+fn sets(table: &toml::Table, key: &str) -> bool {
+    if let Some(name) = key.strip_suffix(".*") {
+        return table.contains_key(name);
+    }
+    let mut current = table;
+    let mut parts = key.split('.').peekable();
+    while let Some(part) = parts.next() {
+        let Some(value) = current.get(part) else {
+            return false;
+        };
+        if parts.peek().is_none() {
+            return true;
+        }
+        let Some(next) = value.as_table() else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+/// Environment variables that do what a [`DECLINED_SETTINGS`] entry does.
+/// An empty value counts as unset, as it does for Cargo's wrapper variables.
+pub fn declined_environment() -> Option<String> {
+    const NAMES: [&str; 8] = [
+        "CARGO_RESOLVER_LOCKFILE_PATH",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_BUILD_DIR",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+    ];
+    let set = |name: &str| env::var_os(name).is_some_and(|value| !value.is_empty());
+    NAMES
+        .iter()
+        .find(|name| set(name))
+        .map(|name| (*name).to_owned())
+        .or_else(|| {
+            env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .find(|name| name.starts_with("CARGO_UNSTABLE_"))
+        })
 }
 
 fn read_file(path: &Path) -> Result<Layer> {

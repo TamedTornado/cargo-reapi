@@ -20,7 +20,7 @@ use crate::relocation::{RecordedPathMapping, execution_slot};
 #[cfg(target_os = "macos")]
 use crate::resource::ResourceLease;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 18;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 19;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct GateSnapshotManifest {
@@ -32,6 +32,9 @@ struct GateSnapshotManifest {
     relocation_files: Vec<PathBuf>,
     executable_relocations: Vec<ExecutableRelocation>,
     observed_inputs: Vec<ObservedGateInput>,
+    /// The content digest of every file the snapshot holds, taken when it
+    /// was published and verified before any restore.
+    outputs: BTreeMap<PathBuf, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -97,57 +100,143 @@ impl FileIdentity {
     }
 }
 
-/// The files and links a snapshot holds, relative to its target tree: the
-/// only paths restoring it may write.
-fn produced_paths(snapshot_target: &Path) -> Result<Vec<PathBuf>> {
+/// The files and links under a target tree, relative to it, sorted. The
+/// administrative directory `cargo-reapi` is not target output.
+fn target_files(target: &Path) -> Result<Vec<PathBuf>> {
+    if !target.exists() {
+        return Ok(Vec::new());
+    }
     let mut paths = Vec::new();
-    for entry in WalkDir::new(snapshot_target).follow_links(false) {
+    for entry in WalkDir::new(target)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_administrative(target, entry.path()))
+    {
         let entry = entry?;
         if !entry.file_type().is_dir() {
-            paths.push(entry.path().strip_prefix(snapshot_target)?.to_path_buf());
+            paths.push(entry.path().strip_prefix(target)?.to_path_buf());
         }
     }
     paths.sort();
     Ok(paths)
 }
 
-/// Removes what stands at each produced path in `target`, so the restore
-/// replaces those paths and nothing else. A symlinked directory on the way
-/// would send a write outside the target, so it fails the restore.
-fn clear_destinations(target: &Path, produced: &[PathBuf]) -> Result<()> {
-    for path in produced {
-        let mut current = target.to_path_buf();
-        let mut exists = true;
-        let mut components = path.components().peekable();
-        while let Some(component) = components.next() {
-            current.push(component);
-            let is_last = components.peek().is_none();
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if is_last => {
-                    if metadata.is_dir() {
-                        fs::remove_dir_all(&current)?;
-                    } else {
-                        fs::remove_file(&current)?;
-                    }
-                }
-                Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-                    "{} is a symlink inside the target directory; restoring would write through it",
-                    current.display()
-                ),
-                Ok(metadata) if !metadata.is_dir() => {
-                    fs::remove_file(&current)?;
-                    exists = false;
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => exists = false,
-                Err(error) => return Err(error).with_context(|| current.display().to_string()),
-            }
-            if !exists {
-                break;
-            }
+/// The directory beneath the target that holds cargo-reapi's own state.
+pub const ADMINISTRATIVE_DIRECTORY: &str = "cargo-reapi";
+
+/// The files Cargo keeps at the top of a target for itself: a cache of what
+/// `rustc -vV` said, which any Cargo run, including preparing the project,
+/// may rewrite, and the marker that tags the directory as a cache. They are
+/// regenerated on demand and are not build output.
+const CARGO_TARGET_FILES: [&str; 2] = [".rustc_info.json", "CACHEDIR.TAG"];
+
+/// Whether `path` is state of cargo-reapi's or Cargo's own at the top of the
+/// target rather than build output.
+fn is_administrative(target: &Path, path: &Path) -> bool {
+    path.parent() == Some(target)
+        && path.file_name().is_some_and(|name| {
+            name == ADMINISTRATIVE_DIRECTORY || CARGO_TARGET_FILES.iter().any(|own| name == *own)
+        })
+}
+
+/// Requires cargo-reapi's own state in the target to be real: the
+/// administrative directory, when it exists, must be a directory with no
+/// symlink anywhere inside it. The driver writes the marker and the default
+/// action log there, outside the sandbox, so a link would send those writes
+/// wherever it points.
+pub fn validate_administrative_directory(target: &Path) -> Result<()> {
+    let administrative = target.join(ADMINISTRATIVE_DIRECTORY);
+    match fs::symlink_metadata(&administrative) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => bail!(
+            "{} is not a real directory; cargo-reapi writes its state there",
+            administrative.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context(administrative.display().to_string()),
+    }
+    for entry in WalkDir::new(&administrative).follow_links(false) {
+        let entry = entry?;
+        if entry.path_is_symlink() {
+            bail!(
+                "{} is a symlink inside cargo-reapi's state in the target; cargo-reapi writes \
+                 there",
+                entry.path().display()
+            );
         }
     }
     Ok(())
+}
+
+/// Whether the target is absent or holds nothing but cargo-reapi's own state.
+fn target_is_clean(target: &Path) -> bool {
+    match fs::read_dir(target) {
+        Ok(entries) => entries
+            .flatten()
+            .all(|entry| is_administrative(target, &entry.path())),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// The digest of each file or link, a link by what it points to.
+fn digest_files(root: &Path, paths: &[PathBuf]) -> Result<BTreeMap<PathBuf, String>> {
+    paths
+        .iter()
+        .map(|path| Ok((path.clone(), digest_file(&root.join(path))?)))
+        .collect()
+}
+
+fn digest_file(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    let mut hasher = Sha256::new();
+    if metadata.file_type().is_symlink() {
+        hash_field(&mut hasher, b"link");
+        hash_field(
+            &mut hasher,
+            fs::read_link(path)?.to_string_lossy().as_bytes(),
+        );
+    } else {
+        hash_field(&mut hasher, b"file");
+        let mut file = File::open(path)?;
+        let mut buffer = vec![0_u8; 128 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Whether the snapshot holds exactly the files its manifest digested.
+fn snapshot_matches_digests(
+    root: &Path,
+    present: &[PathBuf],
+    recorded: &BTreeMap<PathBuf, String>,
+) -> bool {
+    present.iter().eq(recorded.keys())
+        && recorded.iter().all(|(path, digest)| {
+            digest_file(&root.join(path)).is_ok_and(|actual| actual == *digest)
+        })
+}
+
+/// How a gate hit left the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Restoration {
+    /// No hit.
+    No,
+    /// The marker still matched every file, so nothing was written.
+    MarkerMatched,
+    /// The snapshot was cloned into a clean target.
+    Cloned,
+}
+
+impl Restoration {
+    fn happened(self) -> bool {
+        self != Self::No
+    }
 }
 
 /// A durable snapshot of Cargo's complete target state for one exact logical gate.
@@ -162,12 +251,15 @@ pub struct GateSnapshot {
     snapshot: PathBuf,
     resource_ledger: PathBuf,
     lock: Option<File>,
-    restored: bool,
+    /// The target was absent or empty when the gate started: the only state
+    /// a snapshot is restored into, and the only one a producer publishes
+    /// from, so a snapshot holds exactly what one clean build wrote.
+    clean: bool,
+    restored: Restoration,
     coalesced: bool,
     clone_ms: u128,
     clone_method: &'static str,
     relocation_ms: u128,
-    marker_hit: bool,
     /// The learned environment when the gate started. Compiles run
     /// differently once it changes, so the gate is keyed on it and is not
     /// published if it changed while the gate ran.
@@ -213,17 +305,26 @@ impl GateSnapshot {
             snapshot,
             resource_ledger: crate::resource::ledger_root(cache_root)?,
             lock: None,
-            restored: false,
+            clean: target_is_clean(target),
+            restored: Restoration::No,
             coalesced: false,
             clone_ms: 0,
             clone_method: "none",
             relocation_ms: 0,
-            marker_hit: false,
             learned_environment,
         };
         if gate.is_published() && gate.observed_inputs_match()? {
-            gate.restore_exact()?;
-            record_access(&gate.cache_root, AccessKind::Gate, &gate.key)?;
+            gate.restore_published()?;
+            if gate.restored.happened() {
+                record_access(&gate.cache_root, AccessKind::Gate, &gate.key)?;
+                return Ok(gate);
+            }
+        }
+        if !gate.clean {
+            // Neither a restore nor a publication is sound here: the target
+            // holds files this gate did not produce. Cargo runs with the
+            // per-action cache only.
+            gate.invalidate_target_freshness()?;
             return Ok(gate);
         }
 
@@ -254,15 +355,18 @@ impl GateSnapshot {
         if gate.is_published() {
             if gate.observed_inputs_match()? {
                 gate.coalesced = waited;
-                gate.restore_exact()?;
-                record_access(&gate.cache_root, AccessKind::Gate, &gate.key)?;
-                gate.unlock()?;
+                gate.clean = target_is_clean(&gate.target);
+                gate.restore_published()?;
+                if gate.restored.happened() {
+                    record_access(&gate.cache_root, AccessKind::Gate, &gate.key)?;
+                    gate.unlock()?;
+                }
             } else {
                 fs::remove_dir_all(&gate.snapshot)
                     .context("retiring a gate snapshot with stale declared inputs")?;
             }
         }
-        if !gate.restored {
+        if !gate.restored.happened() {
             gate.invalidate_target_freshness()?;
         }
         Ok(gate)
@@ -270,7 +374,7 @@ impl GateSnapshot {
 
     pub fn publish_after_success(&mut self) -> Result<()> {
         let _maintenance = acquire_shared(&self.cache_root)?;
-        if self.restored || self.lock.is_none() || self.is_published() {
+        if self.restored.happened() || !self.clean || self.lock.is_none() || self.is_published() {
             return self.unlock();
         }
         // A compile learned a variable during this gate, so some of the
@@ -295,6 +399,15 @@ impl GateSnapshot {
         if generated.exists() {
             fs::remove_dir_all(&generated)?;
         }
+        for own in CARGO_TARGET_FILES {
+            match fs::remove_file(temporary.join("target").join(own)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context("leaving Cargo's own files out of a snapshot");
+                }
+            }
+        }
         let path_mappings = read_path_mappings(&self.target)?;
         let (relocation_files, executable_relocations) = build_relocation_index(
             &temporary.join("target"),
@@ -302,6 +415,8 @@ impl GateSnapshot {
             &self.target,
             &path_mappings,
         )?;
+        let produced = target_files(&temporary.join("target"))?;
+        let outputs = digest_files(&temporary.join("target"), &produced)?;
         let manifest = GateSnapshotManifest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             key: self.key.clone(),
@@ -311,6 +426,7 @@ impl GateSnapshot {
             relocation_files,
             executable_relocations,
             observed_inputs,
+            outputs,
         };
         fs::write(
             temporary.join("manifest.json"),
@@ -323,12 +439,17 @@ impl GateSnapshot {
             }
             Err(error) => return Err(error).context("publishing gate snapshot"),
         }
+        // The producer's target now holds exactly what was published, so the
+        // next identical gate finds it and restores nothing.
+        if target_files(&self.target)? == produced {
+            self.write_target_marker(&self.key, &produced)?;
+        }
         record_access(&self.cache_root, AccessKind::Gate, &self.key)?;
         self.unlock()
     }
 
     pub fn record_successful_hit(&self, action_log: &Path) -> Result<()> {
-        if !self.restored {
+        if !self.restored.happened() {
             return Ok(());
         }
         if let Some(parent) = action_log.parent() {
@@ -352,7 +473,7 @@ impl GateSnapshot {
                 "snapshot_clone_ms": self.clone_ms,
                 "snapshot_clone_method": self.clone_method,
                 "snapshot_relocation_ms": self.relocation_ms,
-                "snapshot_marker_hit": self.marker_hit,
+                "snapshot_marker_hit": self.restored == Restoration::MarkerMatched,
             })
         )?;
         FileExt::unlock(&log)?;
@@ -360,7 +481,7 @@ impl GateSnapshot {
     }
 
     pub fn is_restored(&self) -> bool {
-        self.restored
+        self.restored.happened()
     }
 
     fn is_published(&self) -> bool {
@@ -381,15 +502,25 @@ impl GateSnapshot {
             .all(|input| observed_input_digest(&input.kind, &input.name) == input.sha256))
     }
 
-    fn restore_exact(&mut self) -> Result<()> {
+    /// Brings the target to the published snapshot, or leaves it alone.
+    ///
+    /// A target the marker still matches exactly needs nothing. Otherwise a
+    /// snapshot is restored only into a clean target, so a restore never
+    /// overwrites a file that is already there, and only after every byte of
+    /// the snapshot matches the digest taken when it was published. A
+    /// snapshot that fails that check is evicted and never restored.
+    fn restore_published(&mut self) -> Result<()> {
         let selected = self.snapshot.clone();
         let selected_key = selected
             .file_name()
             .and_then(|name| name.to_str())
-            .context("selected gate snapshot has no key")?;
-        if self.target_matches_marker(selected_key) {
-            self.restored = true;
-            self.marker_hit = true;
+            .context("selected gate snapshot has no key")?
+            .to_owned();
+        if self.target_matches_marker(&selected_key) {
+            self.restored = Restoration::MarkerMatched;
+            return Ok(());
+        }
+        if !self.clean {
             return Ok(());
         }
         let manifest: GateSnapshotManifest = serde_json::from_slice(
@@ -402,9 +533,16 @@ impl GateSnapshot {
                 manifest.key
             );
         }
+        let produced = target_files(&selected.join("target"))?;
+        if !snapshot_matches_digests(&selected.join("target"), &produced, &manifest.outputs) {
+            eprintln!(
+                "cargo-reapi: gate snapshot {} failed its content check and was evicted",
+                self.key
+            );
+            fs::remove_dir_all(&selected).context("evicting a corrupt gate snapshot")?;
+            return Ok(());
+        }
         fs::create_dir_all(&self.target)?;
-        let produced = produced_paths(&selected.join("target"))?;
-        clear_destinations(&self.target, &produced)?;
         let clone_started = Instant::now();
         self.clone_method = clone_tree(&selected.join("target"), &self.target)?.name();
         self.clone_ms = clone_started.elapsed().as_millis();
@@ -418,12 +556,12 @@ impl GateSnapshot {
         )?;
         self.relocation_ms = relocation_started.elapsed().as_millis();
         self.write_target_marker(&manifest.key, &produced)?;
-        self.restored = true;
+        self.restored = Restoration::Cloned;
         Ok(())
     }
 
     fn target_marker(&self) -> PathBuf {
-        self.target.join("cargo-reapi/gate-state-v18")
+        self.target.join("cargo-reapi/gate-state-v19")
     }
 
     fn invalidate_target_freshness(&self) -> Result<()> {
@@ -458,9 +596,10 @@ impl GateSnapshot {
     }
 
     /// Whether the target still holds exactly what the marker says this
-    /// gate restored. The marker alone proves nothing: another Cargo run in
-    /// the same target directory can replace, change or delete outputs
-    /// without touching it, so every output's recorded identity must match.
+    /// gate left: the same set of files, each with its recorded identity.
+    /// The marker alone proves nothing: another Cargo run in the same target
+    /// directory can replace, change, delete or add outputs without touching
+    /// it.
     fn target_matches_marker(&self, selected_key: &str) -> bool {
         let Ok(bytes) = fs::read(self.target_marker()) else {
             return false;
@@ -468,7 +607,11 @@ impl GateSnapshot {
         let Ok(marker) = serde_json::from_slice::<TargetMarker>(&bytes) else {
             return false;
         };
+        let Ok(present) = target_files(&self.target) else {
+            return false;
+        };
         marker.key == selected_key
+            && present.iter().eq(marker.outputs.keys())
             && marker.outputs.iter().all(|(path, recorded)| {
                 fs::symlink_metadata(self.target.join(path))
                     .is_ok_and(|metadata| FileIdentity::of(&metadata) == *recorded)
@@ -533,7 +676,7 @@ fn gate_key(scope: &GateScope<'_>, learned_environment: &str) -> Result<String> 
     } = *scope;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"cargo-reapi-gate-state-v18\0");
+    hasher.update(b"cargo-reapi-gate-state-v19\0");
     hash_field(&mut hasher, b"learned-environment");
     hash_field(&mut hasher, learned_environment.as_bytes());
     hash_field(&mut hasher, std::env::consts::OS.as_bytes());
@@ -599,6 +742,15 @@ fn hash_host_tools(hasher: &mut Sha256) -> Result<()> {
     }
     hash_tool_identity(hasher, "cargo")?;
     hash_tool_identity(hasher, "rustc")?;
+    if let Some(rustdoc) = std::env::var_os("RUSTDOC").filter(|value| !value.is_empty()) {
+        // The environment keys the path; the tool behind it is keyed too, so
+        // replacing a custom rustdoc in place cannot return stale docs.
+        let rustdoc = rustdoc.to_string_lossy().into_owned();
+        let path =
+            resolve_executable(&rustdoc).with_context(|| format!("resolving RUSTDOC {rustdoc}"))?;
+        hash_field(hasher, b"rustdoc");
+        hash_field(hasher, &fs::read(&path)?);
+    }
     for tool in ["cc", "clang", "ld"] {
         if resolve_executable(tool).is_some() {
             hash_tool_identity(hasher, tool)?;
@@ -675,43 +827,15 @@ fn hash_declared_inputs(
 }
 
 /// Whether [`hash_tree`] skips `path`, and everything beneath it, when it
-/// meets it below the root it walks. Nothing is skipped by name: the
-/// target directory itself, the action log and the bulk of a Git directory
-/// only (see [`is_git_bulk`]).
+/// meets it below the root it walks: the canonical target directory, the
+/// action log, and any entry named `.git`, a directory or a link file. The
+/// strict sandbox denies reads of those (see
+/// [`crate::hermetic::git_entries`]), so nothing the build can read is left
+/// unhashed. No other name is skipped.
 fn excluded_from_tree(path: &Path, target: &Path, action_log: &Path) -> bool {
-    path.starts_with(target) || path == action_log || is_git_bulk(path)
-}
-
-/// Whether `path` is bulk the key leaves out of a Git directory: its
-/// `objects` and `logs` directories and the `info/refs` file, in `.git` or in
-/// a submodule's under `.git/modules`. Build scripts that run `git describe`
-/// or `git rev-parse` read repository state, so everything else in `.git`,
-/// including `HEAD`, refs, `packed-refs`, the index, `config` and
-/// `worktrees`, is hashed. Objects are named by their content, so those refs
-/// and the index fix what any object read returns; logs only record history;
-/// `info/refs` is derived from the refs and written whenever objects are
-/// repacked. Repacking or collecting objects changes none of what is hashed.
-pub fn is_git_bulk(path: &Path) -> bool {
-    let named = |path: &Path, wanted: &[&str]| {
-        path.file_name()
-            .is_some_and(|name| wanted.iter().any(|wanted| name == *wanted))
-    };
-    let git_directory = if named(path, &["objects", "logs"]) {
-        path.parent()
-    } else if named(path, &["refs"]) {
-        path.parent()
-            .filter(|info| named(info, &["info"]))
-            .and_then(Path::parent)
-    } else {
-        None
-    };
-    let Some(git_directory) = git_directory else {
-        return false;
-    };
-    git_directory.join("HEAD").is_file()
-        && path
-            .ancestors()
-            .any(|ancestor| ancestor.file_name().is_some_and(|name| name == ".git"))
+    path.starts_with(target)
+        || path == action_log
+        || path.file_name().is_some_and(|name| name == ".git")
 }
 
 /// Whether hashing the tree at `root` already hashed everything at `path`:
@@ -1697,74 +1821,6 @@ fn copy_tree_portable(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn restoring_replaces_only_produced_paths_and_never_writes_through_a_link() {
-        let root = tempfile::tempdir().expect("root");
-        let target = root.path().join("target");
-        fs::create_dir_all(target.join("debug")).expect("debug");
-        fs::write(target.join("debug/exe"), "other run").expect("exe");
-        fs::write(target.join("debug/unrelated"), "keep").expect("unrelated");
-        let produced = [PathBuf::from("debug/exe"), PathBuf::from("debug/new")];
-
-        super::clear_destinations(&target, &produced).expect("cleared");
-
-        assert!(!target.join("debug/exe").exists());
-        assert_eq!(
-            fs::read(target.join("debug/unrelated")).expect("kept"),
-            b"keep"
-        );
-
-        #[cfg(unix)]
-        {
-            let outside = root.path().join("outside");
-            fs::create_dir_all(&outside).expect("outside");
-            fs::write(outside.join("exe"), "user data").expect("outside file");
-            fs::remove_dir_all(target.join("debug")).expect("remove debug");
-            std::os::unix::fs::symlink(&outside, target.join("debug")).expect("link");
-
-            assert!(super::clear_destinations(&target, &produced).is_err());
-            assert_eq!(
-                fs::read(outside.join("exe")).expect("untouched"),
-                b"user data"
-            );
-        }
-    }
-
-    #[test]
-    fn only_the_bulk_of_a_git_directory_is_left_out_of_the_hash() {
-        let root = tempfile::tempdir().expect("root");
-        let git = root.path().join(".git");
-        let submodule = git.join("modules/deep/name");
-        for directory in [&git, &submodule] {
-            fs::create_dir_all(directory.join("objects")).expect("objects");
-            fs::create_dir_all(directory.join("logs")).expect("logs");
-            fs::create_dir_all(directory.join("refs")).expect("refs");
-            fs::write(directory.join("HEAD"), "ref: refs/heads/main").expect("HEAD");
-        }
-        fs::create_dir_all(git.join("worktrees/linked/logs")).expect("worktree");
-        let source_objects = root.path().join("src/objects");
-        fs::create_dir_all(&source_objects).expect("source objects");
-
-        for bulk in ["objects", "logs"] {
-            assert!(super::is_git_bulk(&git.join(bulk)));
-            assert!(super::is_git_bulk(&submodule.join(bulk)));
-        }
-        for directory in [&git, &submodule] {
-            fs::create_dir_all(directory.join("info")).expect("info");
-            assert!(super::is_git_bulk(&directory.join("info/refs")));
-        }
-        for kept in [
-            git.join("info/exclude"),
-            git.join("refs"),
-            git.join("HEAD"),
-            git.join("modules"),
-            git.join("worktrees/linked/logs"),
-            source_objects,
-            root.path().join("target"),
-        ] {
-            assert!(!super::is_git_bulk(&kept), "{kept:?}");
-        }
-    }
 
     use super::*;
 

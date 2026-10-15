@@ -9,7 +9,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::capture::{CaptureOptions, PreparedInvocation, prepare_invocation, record_invocation};
+use crate::capture::{
+    CaptureOptions, DepInput, PreparedInvocation, prepare_invocation, record_invocation,
+};
 use crate::environment::{CompileEnvironment, EnvironmentHints, tracked_environment};
 use crate::invocation::RustcInvocation;
 use crate::maintenance::{AccessKind, acquire_shared, record_access};
@@ -29,11 +31,17 @@ impl CacheOptions {
     }
 }
 
+/// The version of the action manifest, which records dep-info inputs.
+const ACTION_MANIFEST_VERSION: u32 = 2;
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ActionManifest {
     schema_version: u32,
     action_key: String,
     outputs: Vec<CachedOutput>,
+    /// Every file rustc's own dep-info listed when this entry was made, with
+    /// its digest: the entry is a hit only while all of them still match.
+    dep_inputs: Vec<DepInput>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -270,7 +278,7 @@ fn finish_cached_execution(
             rerun: true,
         });
     }
-    if restore(cache_options, prepared)? {
+    if restore(cache_options, invocation, prepared)? {
         record_access(
             &cache_options.root,
             AccessKind::Action,
@@ -306,7 +314,7 @@ fn finish_cached_execution(
         });
     }
 
-    let execution = if exit_code == 0 && publish(cache_options, prepared)? {
+    let execution = if exit_code == 0 && publish(cache_options, invocation, prepared)? {
         record_access(
             &cache_options.root,
             AccessKind::Action,
@@ -407,7 +415,7 @@ fn execute_cached_link(
                 rerun: true,
             });
         }
-        if restore(cache_options, &prepared)? {
+        if restore(cache_options, invocation, &prepared)? {
             record_invocation(
                 capture_options,
                 &prepared,
@@ -462,7 +470,7 @@ fn execute_cached_link(
             Ok(discovery) => {
                 prepared.action_key = discovered_action_key(&base_action_key, &discovery)?;
                 publish_link_discovery(cache_options, &discovery)?;
-                if publish(cache_options, &prepared)? {
+                if publish(cache_options, invocation, &prepared)? {
                     record_invocation(capture_options, &prepared, "local-cache-miss", exit_code)?;
                 } else {
                     record_invocation(
@@ -1081,14 +1089,20 @@ fn discovered_action_key(base_key: &str, discovery: &LinkDiscovery) -> Result<St
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn restore(options: &CacheOptions, prepared: &PreparedInvocation) -> Result<bool> {
+fn restore(
+    options: &CacheOptions,
+    invocation: &RustcInvocation,
+    prepared: &PreparedInvocation,
+) -> Result<bool> {
     let manifest_path = action_manifest_path(options, &prepared.action_key);
     let Ok(encoded) = fs::read(&manifest_path) else {
         return Ok(false);
     };
     let manifest: ActionManifest = serde_json::from_slice(&encoded)
         .with_context(|| format!("reading action manifest {}", manifest_path.display()))?;
-    if manifest.schema_version != 1 || manifest.action_key != prepared.action_key {
+    if manifest.schema_version != ACTION_MANIFEST_VERSION
+        || manifest.action_key != prepared.action_key
+    {
         return Ok(false);
     }
     if manifest.outputs.len() != prepared.output_files.len() {
@@ -1104,13 +1118,24 @@ fn restore(options: &CacheOptions, prepared: &PreparedInvocation) -> Result<bool
             return Ok(false);
         }
     }
+    if !crate::capture::dep_inputs_match(
+        invocation,
+        &manifest.dep_inputs,
+        &prepared.relocation_mappings,
+    )? {
+        return Ok(false);
+    }
     for (cached, output) in manifest.outputs.iter().zip(&prepared.output_files) {
         materialize_blob(options, prepared, cached, &output.actual_path)?;
     }
     Ok(true)
 }
 
-fn publish(options: &CacheOptions, prepared: &PreparedInvocation) -> Result<bool> {
+fn publish(
+    options: &CacheOptions,
+    invocation: &RustcInvocation,
+    prepared: &PreparedInvocation,
+) -> Result<bool> {
     if prepared.output_files.is_empty()
         || prepared
             .output_files
@@ -1152,10 +1177,16 @@ fn publish(options: &CacheOptions, prepared: &PreparedInvocation) -> Result<bool
         });
     }
 
+    // Without every input rustc read there is nothing to check a hit
+    // against, so the entry is not published.
+    let Ok(dep_inputs) = crate::capture::read_dep_inputs(invocation, prepared) else {
+        return Ok(false);
+    };
     let manifest = ActionManifest {
-        schema_version: 1,
+        schema_version: ACTION_MANIFEST_VERSION,
         action_key: prepared.action_key.clone(),
         outputs,
+        dep_inputs,
     };
     let path = action_manifest_path(options, &prepared.action_key);
     write_atomic(

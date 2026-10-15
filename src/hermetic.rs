@@ -442,7 +442,99 @@ fn readable_paths(
         }
         readable.insert(canonical_or_absolute(&input)?);
     }
+    let mut hashed_roots = vec![
+        paths.workspace.to_path_buf(),
+        paths.project.workspace_root.clone(),
+    ];
+    hashed_roots.extend(
+        paths
+            .project
+            .packages
+            .iter()
+            .filter(|package| package.local)
+            .map(|package| package.root.clone()),
+    );
+    hashed_roots.extend(
+        explicit_inputs
+            .iter()
+            .map(|input| paths.workspace.join(input))
+            .filter(|input| input.is_dir()),
+    );
+    let denied = git_entries(&hashed_roots, paths.target);
+    let mut readable = readable
+        .iter()
+        .map(|path| expand_around(path, &denied))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    // The route to the target is expanded above; the target itself stays
+    // readable whole.
+    readable.insert(paths.target.to_path_buf());
     Ok(without_covered_paths(readable))
+}
+
+/// Every Git entry beneath the trees the gate hashes, which the strict
+/// sandbox must not let a build read because the gate key does not cover
+/// them: each entry named `.git`, a directory or a file, and the Git
+/// directory a `.git` file names with `gitdir:` (a linked worktree's or a
+/// submodule's). Nothing below `target` is searched.
+///
+/// A build script reads no Git state under caching: `git rev-parse` there
+/// finds no repository. That is the price of a key that is sound however it
+/// reads, because a reflog, an abbreviated object name or any other part of
+/// the repository can change a build script's answer.
+pub fn git_entries(roots: &[PathBuf], target: &Path) -> BTreeSet<PathBuf> {
+    let mut entries = BTreeSet::new();
+    for root in roots {
+        let mut walk = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+        while let Some(Ok(entry)) = walk.next() {
+            if entry.path().starts_with(target) {
+                if entry.file_type().is_dir() {
+                    walk.skip_current_dir();
+                }
+                continue;
+            }
+            if entry.file_name() != ".git" {
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                walk.skip_current_dir();
+            } else if let Some(gitdir) = linked_git_directory(entry.path()) {
+                entries.insert(gitdir);
+            }
+            entries.insert(entry.path().to_path_buf());
+        }
+    }
+    entries
+}
+
+/// The directory a `.git` file points at.
+fn linked_git_directory(file: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(file).ok()?;
+    let pointed = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let pointed = file.parent()?.join(pointed);
+    pointed.canonicalize().ok()
+}
+
+/// `path` as readable entries that leave out every denied path beneath it:
+/// itself when none is, otherwise its children with the denied ones dropped,
+/// recursively. Reading a directory permits everything below it, so a denied
+/// path inside a readable one is only excluded by listing around it.
+fn expand_around(path: &Path, denied: &BTreeSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    if denied.contains(path) {
+        return Ok(Vec::new());
+    }
+    if !denied.iter().any(|entry| entry.starts_with(path)) {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut expanded = Vec::new();
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("enumerating readable input {}", path.display()))?
+    {
+        expanded.extend(expand_around(&entry?.path(), denied)?);
+    }
+    Ok(expanded)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
