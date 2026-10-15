@@ -285,7 +285,7 @@ fn native_input_reason(invocation: &RustcInvocation, roots: &CaptureRoots) -> Op
         .map(|argument| argument.to_string_lossy());
     while let Some(argument) = arguments.next() {
         let value = if argument == "-L" || argument == "-l" {
-            arguments.next().map(|value| value.into_owned())
+            arguments.next().map(std::borrow::Cow::into_owned)
         } else {
             argument
                 .strip_prefix("-L")
@@ -710,12 +710,9 @@ fn discover_inputs(
     roots: &CaptureRoots,
 ) -> Result<(Vec<PreparedInput>, Vec<String>)> {
     let mut candidates = BTreeSet::new();
-    let audit_observer = env::var_os("CARGO_REAPI_REAL_RUSTC")
-        .and_then(|_| env::var_os("RUSTC"))
-        .map(PathBuf::from);
     for (index, arg) in invocation.args.iter().enumerate() {
         let path = PathBuf::from(arg);
-        if path.is_file() && audit_observer.as_ref() != Some(&path) {
+        if path.is_file() {
             candidates.insert(path);
         }
         if let Some(response_path) = arg.to_string_lossy().strip_prefix('@') {

@@ -61,11 +61,6 @@ pub const RUNTIME_PLUMBING_ENVIRONMENT: [&str; 5] = [
     "SHLVL",
 ];
 
-/// The audit observer, a compiler shim, reads these. The compiler identity
-/// already covers the real compiler, and the trace directory only receives
-/// observations, so they reach the compiler unkeyed.
-pub const OBSERVER_ENVIRONMENT: [&str; 2] = ["CARGO_REAPI_REAL_RUSTC", "CARGO_REAPI_RUSTC_TRACE"];
-
 /// Settings and records only the wrapper reads: where to log and cache,
 /// scheduling capacity, and this module's own inputs. They never reach a
 /// compiler and are never keyed.
@@ -140,7 +135,7 @@ const SEARCH_PATH_ENVIRONMENT: [&str; 6] = [
 
 #[derive(Clone, Debug)]
 pub enum CompileEnvironment {
-    /// Only these variables, plus the audit observer's, reach the compiler,
+    /// Only these variables reach the compiler,
     /// and only these are keyed.
     Keyed(BTreeSet<String>),
     /// The keyed environment could not be determined, so the compiler
@@ -181,7 +176,7 @@ impl CompileEnvironment {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if WRAPPER_PRIVATE.contains(&name) || OBSERVER_ENVIRONMENT.contains(&name) {
+            if WRAPPER_PRIVATE.contains(&name) {
                 continue;
             }
             if is_toolchain_environment(name)
@@ -211,13 +206,6 @@ impl CompileEnvironment {
         if WRAPPER_PRIVATE.contains(&name) {
             return false;
         }
-        // The audit observer's variables are never part of a compile's
-        // environment. Only a compiler that is the observer shim receives
-        // them, added at the process boundary, where the shim removes them
-        // again before the real rustc starts.
-        if OBSERVER_ENVIRONMENT.contains(&name) {
-            return false;
-        }
         match self {
             Self::Keyed(names) => names.contains(name),
             Self::Whole { .. } => true,
@@ -225,7 +213,7 @@ impl CompileEnvironment {
     }
 
     fn keys(&self, name: &str) -> bool {
-        if WRAPPER_PRIVATE.contains(&name) || OBSERVER_ENVIRONMENT.contains(&name) {
+        if WRAPPER_PRIVATE.contains(&name) {
             return false;
         }
         match self {
@@ -252,15 +240,13 @@ impl CompileEnvironment {
 
     /// Tracked variables the caller set that this environment withholds but
     /// could pass. Wrapper settings are never the caller's to give a
-    /// compile, and neither are the audit observer's, so a compile that reads
-    /// one sees it unset, as under Cargo.
+    /// compile, so a compile that reads one sees it unset, as under Cargo.
     pub fn withheld(&self, tracked: &BTreeSet<String>) -> BTreeSet<String> {
         tracked
             .iter()
             .filter(|name| {
                 env::var_os(name).is_some()
                     && !WRAPPER_PRIVATE.contains(&name.as_str())
-                    && !OBSERVER_ENVIRONMENT.contains(&name.as_str())
                     && !self.passes(OsStr::new(name))
             })
             .cloned()
@@ -696,8 +682,6 @@ mod tests {
     fn keyed_environment_never_passes_wrapper_records() {
         let keyed = CompileEnvironment::Keyed(BTreeSet::from(["PATH".to_owned()]));
         assert!(keyed.passes(OsStr::new("PATH")));
-        // With no observer as the compiler, the audit variables are hidden.
-        assert!(!keyed.passes(OsStr::new("CARGO_REAPI_RUSTC_TRACE")));
         assert!(!keyed.passes(OsStr::new("CARGO_REAPI_ACTION_LOG")));
         assert!(!keyed.passes(OsStr::new("OLDPWD")));
         assert!(!keyed.passes(OsStr::new("CARGO_REAPI_CALLER_ENVIRONMENT")));

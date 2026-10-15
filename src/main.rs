@@ -1,4 +1,3 @@
-mod acceptance;
 mod action;
 #[cfg(unix)]
 mod beneath;
@@ -6,12 +5,10 @@ mod cache;
 mod capture;
 mod cargo_config;
 mod environment;
-mod evidence;
 mod footprint;
 mod invocation;
 mod maintenance;
 mod project;
-mod proof;
 mod reclient;
 mod relocation;
 mod resource;
@@ -92,20 +89,6 @@ struct Cli {
 
 #[derive(Debug, Parser)]
 #[command(name = "cargo reapi", bin_name = "cargo reapi")]
-struct ContractCli {
-    #[command(subcommand)]
-    command: ContractCommand,
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "cargo reapi", bin_name = "cargo reapi")]
-struct ProveCli {
-    #[command(subcommand)]
-    command: ProveCommand,
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "cargo reapi", bin_name = "cargo reapi")]
 struct CacheCli {
     #[command(subcommand)]
     command: CacheCommand,
@@ -156,93 +139,6 @@ struct DoctorReport {
     cache: maintenance::CacheStats,
 }
 
-#[derive(Debug, Subcommand)]
-enum ProveCommand {
-    /// Capture and enforce the locked host CPU, memory, OS, and architecture contract.
-    Environment {
-        #[arg(long, value_enum)]
-        storage_profile: StorageProfileArg,
-        #[arg(long)]
-        platform_profile: PathBuf,
-        #[arg(long)]
-        report: PathBuf,
-    },
-    /// Validate a warm action log against the embedded zero-physical-action contract.
-    ActionLog {
-        #[arg(long)]
-        action_log: PathBuf,
-        #[arg(long)]
-        rustc_trace: PathBuf,
-        #[arg(long)]
-        worktree: PathBuf,
-        #[arg(long)]
-        report: PathBuf,
-    },
-    /// Validate that N or 2N complete gates were truly simultaneous and physically warm.
-    Population {
-        #[arg(long, value_enum)]
-        kind: PopulationProofKind,
-        #[arg(long, value_enum)]
-        storage_profile: StorageProfileArg,
-        #[arg(long)]
-        evidence: PathBuf,
-        #[arg(long)]
-        report: PathBuf,
-    },
-    /// Fail closed unless every receipt required by the embedded criteria is present and valid.
-    Complete {
-        #[arg(long)]
-        receipts: PathBuf,
-        #[arg(long)]
-        report: PathBuf,
-    },
-    /// Verify complete macOS and Linux current-schema evidence graphs.
-    Aggregate {
-        #[arg(long)]
-        root: PathBuf,
-        #[arg(long)]
-        report: PathBuf,
-    },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum PopulationProofKind {
-    Single,
-    Five,
-    Stress,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum StorageProfileArg {
-    Ssd,
-    Rotational,
-}
-
-impl From<StorageProfileArg> for proof::StorageProfile {
-    fn from(value: StorageProfileArg) -> Self {
-        match value {
-            StorageProfileArg::Ssd => Self::Ssd,
-            StorageProfileArg::Rotational => Self::Rotational,
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-enum ContractCommand {
-    /// Print the immutable acceptance contract embedded in this binary.
-    Show,
-    /// Verify that a contract file exactly matches the embedded contract.
-    Verify {
-        #[arg(long, default_value = "acceptance/contract.toml")]
-        path: PathBuf,
-    },
-    /// Print the normative and exact-document identities for acceptance criteria.
-    CriteriaIdentity {
-        #[arg(long, default_value = "acceptance/ACCEPTANCE_CRITERIA.md")]
-        path: PathBuf,
-    },
-}
-
 fn main() -> ExitCode {
     match run() {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -256,12 +152,6 @@ fn main() -> ExitCode {
 fn run() -> Result<i32> {
     let args: Vec<OsString> = env::args_os().collect();
     let args = strip_cargo_subcommand_name(args);
-    if args.get(1).is_some_and(|value| value == "contract") {
-        return run_contract(args);
-    }
-    if args.get(1).is_some_and(|value| value == "prove") {
-        return run_prove(args);
-    }
     if args.get(1).is_some_and(|value| value == "cache") {
         return run_cache(args);
     }
@@ -568,105 +458,6 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         validate_platform_template(platform)?;
     }
     Ok(())
-}
-
-fn run_prove(mut args: Vec<OsString>) -> Result<i32> {
-    args.remove(1);
-    let cli = ProveCli::parse_from(args);
-    match cli.command {
-        ProveCommand::Environment {
-            storage_profile,
-            platform_profile,
-            report,
-        } => {
-            let proof =
-                proof::EnvironmentProof::capture(storage_profile.into(), &platform_profile)?;
-            proof.write_and_require_pass(&report)?;
-            println!("PASS  {}", report.display());
-        }
-        ProveCommand::ActionLog {
-            action_log,
-            rustc_trace,
-            worktree,
-            report,
-        } => {
-            let proof = proof::ActionLogProof::verify_with_trace(
-                &action_log,
-                Some(&rustc_trace),
-                Some(&worktree),
-            )?;
-            proof.write_and_require_pass(&report)?;
-            println!("PASS  {}", report.display());
-        }
-        ProveCommand::Population {
-            kind,
-            storage_profile,
-            evidence,
-            report,
-        } => {
-            let kind = match kind {
-                PopulationProofKind::Single => proof::PopulationKind::Single,
-                PopulationProofKind::Five => proof::PopulationKind::Five,
-                PopulationProofKind::Stress => proof::PopulationKind::Stress,
-            };
-            let proof = proof::PopulationProof::verify(&evidence, kind, storage_profile.into())?;
-            proof.write_and_require_pass(&report)?;
-            println!("PASS  {}", report.display());
-        }
-        ProveCommand::Complete { receipts, report } => {
-            let proof = proof::CompleteProof::verify(&receipts)?;
-            proof.write_and_require_pass(&report)?;
-            println!("PASS  {}", report.display());
-        }
-        ProveCommand::Aggregate { root, report } => {
-            let proof = evidence::AggregateProofV2::verify(&root)?;
-            proof.write(&report)?;
-            if !proof.passed {
-                bail!(
-                    "multi-platform aggregate acceptance failed closed; report: {}",
-                    report.display()
-                );
-            }
-            println!("PASS  {}", report.display());
-        }
-    }
-    Ok(0)
-}
-
-fn run_contract(mut args: Vec<OsString>) -> Result<i32> {
-    args.remove(1);
-    let cli = ContractCli::parse_from(args);
-    match cli.command {
-        ContractCommand::Show => {
-            print!("{}", acceptance::EMBEDDED_CONTRACT);
-        }
-        ContractCommand::Verify { path } => {
-            acceptance::AcceptanceContract::verify_file(&path)?;
-            println!(
-                "{}  {}",
-                acceptance::AcceptanceContract::digest(),
-                path.display()
-            );
-        }
-        ContractCommand::CriteriaIdentity { path } => {
-            let (criteria_sha256, criteria_document_sha256) =
-                acceptance::criteria_file_identity(&path)?;
-            if criteria_sha256 != acceptance::criteria_digest() {
-                bail!(
-                    "normative criteria do not match the criteria embedded in this binary: {}",
-                    path.display()
-                );
-            }
-            println!(
-                "{}",
-                serde_json::json!({
-                    "criteria_sha256": criteria_sha256,
-                    "criteria_document_sha256": criteria_document_sha256,
-                })
-            );
-        }
-    }
-    Ok(0)
 }
 
 fn run_wrapper(args: Vec<OsString>) -> Result<i32> {

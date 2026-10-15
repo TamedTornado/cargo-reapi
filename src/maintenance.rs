@@ -280,7 +280,6 @@ fn removable_units(cache_root: &Path) -> Result<Units> {
 
     let obsolete = obsolete_directories(cache_root)
         .into_iter()
-        .into_iter()
         .map(|path| {
             let owner = register(&path);
             (path, owner)

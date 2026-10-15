@@ -1,6 +1,4 @@
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -44,7 +42,6 @@ impl RustcInvocation {
     /// Runs the compiler with `environment` alone, or with the caller's whole
     /// environment when it is `None`.
     pub fn execute_in(&self, environment: Option<&CompileEnvironment>) -> Result<i32> {
-        self.record_physical_compiler_observation()?;
         let mut command = Command::new(&self.compiler);
         command.args(&self.args);
         apply_compiler_environment(&mut command, &self.compiler, environment)?;
@@ -52,45 +49,6 @@ impl RustcInvocation {
             .status()
             .with_context(|| format!("executing {}", self.compiler.display()))?;
         Ok(status.code().unwrap_or(1))
-    }
-
-    /// Record only compiler processes that cargo-reapi is actually about to
-    /// execute. Cache hits never reach this method, so this trace cannot turn
-    /// a restored action into a false physical-compiler observation.
-    fn record_physical_compiler_observation(&self) -> Result<()> {
-        let Some(trace_root) = std::env::var_os("CARGO_REAPI_RUSTC_TRACE").map(PathBuf::from)
-        else {
-            return Ok(());
-        };
-        let mut kind = "compile";
-        let mut crate_name = None;
-        let mut arguments = self.args.iter();
-        while let Some(argument) = arguments.next() {
-            if argument == "--crate-name" {
-                crate_name = arguments
-                    .next()
-                    .map(|value| value.to_string_lossy().into_owned());
-            }
-            if argument == "--print" || argument.to_string_lossy().starts_with("--print=") {
-                kind = "query";
-            }
-        }
-        if crate_name.is_none() {
-            kind = "query";
-        }
-        fs::create_dir_all(&trace_root).with_context(|| {
-            format!("creating compiler trace directory {}", trace_root.display())
-        })?;
-        let mut output =
-            create_observation_file(&trace_root, crate_name.as_deref().unwrap_or("control"))?;
-        writeln!(output, "kind={kind}")?;
-        writeln!(
-            output,
-            "crate_name={}",
-            crate_name.as_deref().unwrap_or("control")
-        )?;
-        writeln!(output, "cwd={}", self.cwd.display())?;
-        Ok(())
     }
 
     pub fn crate_name(&self) -> Option<&OsStr> {
@@ -224,34 +182,6 @@ impl RustcInvocation {
     }
 }
 
-fn create_observation_file(trace_root: &Path, crate_name: &str) -> Result<File> {
-    for sequence in 0..u32::MAX {
-        let record = trace_root.join(format!(
-            "rustc-observation.{}.{}.{}",
-            std::process::id(),
-            crate_name,
-            sequence
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&record)
-        {
-            Ok(file) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("creating compiler observation {}", record.display())
-                });
-            }
-        }
-    }
-    bail!(
-        "compiler observation namespace exhausted in {}",
-        trace_root.display()
-    )
-}
-
 fn is_cargo_driver_command(value: &OsStr) -> bool {
     matches!(
         value.to_str(),
@@ -297,47 +227,7 @@ fn apply_compiler_environment(
         );
     }
     apply_relocation_environment(command, compiler, environment)?;
-    apply_observer_environment(command, compiler);
     Ok(())
-}
-
-/// The marker line the audit observer shim carries.
-const OBSERVER_MARKER: &[u8] = b"cargo-reapi-rustc-observer";
-
-/// The first bytes of a file, where the shim's marker line is.
-fn observer_head(compiler: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
-
-    let mut head = Vec::new();
-    std::fs::File::open(compiler)
-        .ok()?
-        .take(1024)
-        .read_to_end(&mut head)
-        .ok()?;
-    Some(head)
-}
-
-/// Gives the audit variables to a compiler that is the observer shim and
-/// removes them from every other: a crate must not read them
-/// (`option_env!`), and they are not keyed. The shim is recognized by its own
-/// marker line, never inferred from the variables being set.
-fn apply_observer_environment(command: &mut Command, compiler: &Path) {
-    let is_shim = observer_head(compiler).is_some_and(|head| {
-        head.starts_with(b"#!")
-            && head
-                .windows(OBSERVER_MARKER.len())
-                .any(|part| part == OBSERVER_MARKER)
-    });
-    for name in crate::environment::OBSERVER_ENVIRONMENT {
-        match std::env::var_os(name) {
-            Some(value) if is_shim => {
-                command.env(name, value);
-            }
-            _ => {
-                command.env_remove(name);
-            }
-        }
-    }
 }
 
 fn apply_relocation_environment(
@@ -582,17 +472,6 @@ mod tests {
         ]
         .map(OsString::from);
         assert!(RustcInvocation::looks_like_wrapper(&args));
-    }
-
-    #[test]
-    fn compiler_observations_survive_pid_reuse_in_nested_namespaces() {
-        let trace = tempfile::tempdir().expect("compiler trace");
-        drop(create_observation_file(trace.path(), "control").expect("first observation"));
-        drop(create_observation_file(trace.path(), "control").expect("second observation"));
-        assert_eq!(
-            fs::read_dir(trace.path()).expect("trace directory").count(),
-            2
-        );
     }
 
     #[test]

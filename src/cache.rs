@@ -253,7 +253,7 @@ fn finish_cached_execution(
         return Ok(Resolution::Finished(0));
     }
 
-    let _lease = ResourceLease::acquire(false)?;
+    let _lease = ResourceLease::acquire()?;
     remove_stale_dep_info(prepared)?;
     let exit_code = invocation.execute_in(Some(environment))?;
     let withheld = withheld_by_execution(prepared, environment)?;

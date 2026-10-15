@@ -5,7 +5,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 
-use crate::acceptance::AcceptanceContract;
+/// How long a compile waits for a lease while no other lease is released
+/// before it reports an infrastructure stall rather than waiting forever.
+const STALL_SECONDS: u64 = 300;
+
+/// The memory a cache-miss compile reserves from the ledger.
+const COMPILE_MEMORY_GIB: usize = 2;
 
 const CPU_CAPACITY_ENV: &str = "CARGO_REAPI_RESOURCE_CPU_CAPACITY";
 const MEMORY_CAPACITY_ENV: &str = "CARGO_REAPI_RESOURCE_MEMORY_GIB_CAPACITY";
@@ -195,69 +200,42 @@ fn wait_for_progress<T>(
 }
 
 impl ResourceLease {
-    pub fn acquire(native_link: bool) -> Result<Self> {
+    pub fn acquire() -> Result<Self> {
         let lease_root = std::env::var_os("CARGO_REAPI_RESOURCE_LEDGER").map_or_else(
             || std::env::temp_dir().join("cargo-reapi-resource-ledger-v1"),
             std::path::PathBuf::from,
         );
-        Self::acquire_at_with(&lease_root, native_link, ResourceCapacity::from_env()?)
+        Self::acquire_at(&lease_root, ResourceCapacity::from_env()?)
     }
 
-    #[cfg(test)]
-    fn acquire_at(lease_root: &Path, native_link: bool) -> Result<Self> {
-        let contract = AcceptanceContract::embedded()?;
-        Self::acquire_at_with(
-            lease_root,
-            native_link,
-            ResourceCapacity {
-                cpu: contract.minimum_logical_cpus,
-                memory_gib: usize::try_from(contract.maximum_build_rss_gib)
-                    .context("resource memory capacity does not fit usize")?,
-            },
-        )
-    }
-
-    fn acquire_at_with(
-        lease_root: &Path,
-        native_link: bool,
-        capacity: ResourceCapacity,
-    ) -> Result<Self> {
-        let contract = AcceptanceContract::embedded()?;
+    fn acquire_at(lease_root: &Path, capacity: ResourceCapacity) -> Result<Self> {
         let cpu_demand = 1;
-        // Bevy/wgpu links are the observed high-water action. Two may overlap
-        // inside the 15-GiB build budget; ordinary rustc actions may overlap up
-        // to the CPU limit while still reserving a realistic 2 GiB each.
-        let memory_demand = if native_link { 7 } else { 2 };
+        let memory_demand = COMPILE_MEMORY_GIB;
         fs::create_dir_all(lease_root.join("cpu"))?;
         fs::create_dir_all(lease_root.join("memory-gib"))?;
         let progress = lease_root.join(PROGRESS_MARKER);
 
-        let lease = wait_for_progress(
-            &progress,
-            Duration::from_secs(contract.stall_seconds),
-            || {
-                let mut files = Vec::with_capacity(cpu_demand + memory_demand);
-                let acquired = try_acquire_tokens(
-                    &lease_root.join("cpu"),
-                    capacity.cpu,
-                    cpu_demand,
-                    &mut files,
-                )? && try_acquire_tokens(
-                    &lease_root.join("memory-gib"),
-                    capacity.memory_gib,
-                    memory_demand,
-                    &mut files,
-                )?;
-                Ok(acquired.then(|| Self {
-                    files,
-                    progress: progress.clone(),
-                }))
-            },
-        )?;
+        let lease = wait_for_progress(&progress, Duration::from_secs(STALL_SECONDS), || {
+            let mut files = Vec::with_capacity(cpu_demand + memory_demand);
+            let acquired = try_acquire_tokens(
+                &lease_root.join("cpu"),
+                capacity.cpu,
+                cpu_demand,
+                &mut files,
+            )? && try_acquire_tokens(
+                &lease_root.join("memory-gib"),
+                capacity.memory_gib,
+                memory_demand,
+                &mut files,
+            )?;
+            Ok(acquired.then(|| Self {
+                files,
+                progress: progress.clone(),
+            }))
+        })?;
         lease.with_context(|| {
             format!(
-                "infrastructure stall: no {cpu_demand}-CPU/{memory_demand}-GiB physical-action lease was released for {} seconds",
-                contract.stall_seconds
+                "infrastructure stall: no {cpu_demand}-CPU/{memory_demand}-GiB physical-action lease was released for {STALL_SECONDS} seconds"
             )
         })
     }
@@ -303,7 +281,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ResourceCapacity, ResourceLease, record_progress, wait_for_progress};
+    use super::{
+        COMPILE_MEMORY_GIB, ResourceCapacity, ResourceLease, record_progress, wait_for_progress,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -353,7 +333,12 @@ mod tests {
         let marker = root.path().join("progress");
         let before = std::fs::read(&marker).ok();
 
-        drop(ResourceLease::acquire_at(root.path(), false).expect("lease"));
+        let capacity = ResourceCapacity {
+            cpu: 1,
+            memory_gib: COMPILE_MEMORY_GIB,
+        };
+
+        drop(ResourceLease::acquire_at(root.path(), capacity).expect("lease"));
 
         assert_ne!(std::fs::read(&marker).ok(), before);
     }
@@ -391,62 +376,57 @@ mod tests {
         );
     }
 
-    #[test]
-    fn distinct_physical_actions_overlap_without_exceeding_the_ledger() {
+    /// The most leases `workers` threads held at once from one ledger.
+    fn peak_concurrent_leases(capacity: ResourceCapacity, workers: usize) -> usize {
         let root = Arc::new(tempdir().expect("ledger root"));
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        let mut workers = Vec::new();
-        for _ in 0..128 {
-            let root = Arc::clone(&root);
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            workers.push(std::thread::spawn(move || {
-                let _lease = ResourceLease::acquire_at(root.path(), false).expect("resource lease");
-                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(current, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                active.fetch_sub(1, Ordering::SeqCst);
-            }));
+
+        let handles = (0..workers)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                std::thread::spawn(move || {
+                    let _lease =
+                        ResourceLease::acquire_at(root.path(), capacity).expect("resource lease");
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(4));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("worker");
         }
-        for worker in workers {
-            worker.join().expect("worker");
-        }
-        assert!(
-            peak.load(Ordering::SeqCst) > 1,
-            "ledger serialized all work"
-        );
-        assert!(
-            peak.load(Ordering::SeqCst) <= 8,
-            "ledger exceeded CPU capacity"
-        );
+
+        peak.load(Ordering::SeqCst)
     }
 
     #[test]
-    fn bevy_scale_links_overlap_without_exceeding_memory_tokens() {
-        let root = Arc::new(tempdir().expect("ledger root"));
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let mut workers = Vec::new();
-        for _ in 0..20 {
-            let root = Arc::clone(&root);
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            workers.push(std::thread::spawn(move || {
-                let _lease = ResourceLease::acquire_at(root.path(), true).expect("link lease");
-                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(current, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(4));
-                active.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("worker");
-        }
-        assert!(peak.load(Ordering::SeqCst) > 1, "ledger serialized links");
-        assert!(
-            peak.load(Ordering::SeqCst) <= 2,
-            "ledger exceeded the link memory budget"
-        );
+    fn distinct_physical_actions_overlap_without_exceeding_the_cpu_capacity() {
+        let capacity = ResourceCapacity {
+            cpu: 8,
+            memory_gib: 8 * COMPILE_MEMORY_GIB,
+        };
+
+        let peak = peak_concurrent_leases(capacity, 128);
+
+        assert!(peak > 1, "ledger serialized all work");
+        assert!(peak <= 8, "ledger exceeded CPU capacity");
+    }
+
+    #[test]
+    fn physical_actions_overlap_without_exceeding_the_memory_capacity() {
+        let capacity = ResourceCapacity {
+            cpu: 8,
+            memory_gib: 2 * COMPILE_MEMORY_GIB,
+        };
+
+        let peak = peak_concurrent_leases(capacity, 20);
+
+        assert!(peak > 1, "ledger serialized all work");
+        assert!(peak <= 2, "ledger exceeded memory capacity");
     }
 }
