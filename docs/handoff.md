@@ -1,8 +1,8 @@
 # cargo-reapi handoff: per-compile caching (read this first)
 
 State as of 2026-10-15. The narrowing is finished and merged to `main`. The
-native-rule narrowing and scheduling-key fix are on branch
-`native-narrowing`, waiting for the coordinator's merge go-ahead (see below).
+native-rule narrowing and scheduling-key fix are merged to `main` at 33892a4
+(see below); the coordinator launched the pre-release review of 33892a4.
 None of it is **released**: the version is still 0.2.10, there is no tag, nothing is
 published and nothing is installed. The whole-gate design and its review
 history are in Git (`main` at 86d3e1c and earlier, including the previous
@@ -113,9 +113,8 @@ Why compiles run fresh:
 ## Native-rule narrowing and scheduling keys (branch `native-narrowing`)
 
 Approved by the coordinator; commits e737dbb..native-narrowing (6f5e6fd,
-b0dcaa0, 3418cca, 89325b1 and this handoff). Merge to `main` waits for the
-coordinator's go-ahead; it is a fast-forward of `main` to the branch, then a
-push. No bump, tag, publish or install comes with it.
+b0dcaa0, 3418cca, 89325b1, 33892a4). Fast-forwarded to `main` with the
+coordinator's go-ahead. No bump, tag, publish or install came with it.
 
 - `capture::native_inputs`: a metadata-only compile ignores `-L` and `-l`
   (and keys no `-L` directory files). An rlib compile ignores `-l` kinds it
@@ -208,6 +207,9 @@ dependents' `--extern` digests differ).
 
 ## Release follow-ons (not this lane's)
 
+- Before a release, run the native tests under the newest stable toolchain
+  (`cargo +<newest> test --features test-hooks --test native_libraries`) as
+  well as the default: rustc's rlib layout changes show up there first.
 - Release rule: Astra reviews the exact release commit before the bump; fix
   findings and repeat; then bump `Cargo.toml`, `Cargo.lock` and the CHANGELOG,
   tag, push, `cargo publish`, `cargo install --version <v> --locked`. Never
