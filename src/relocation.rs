@@ -125,20 +125,22 @@ pub fn logical_text(value: &str, mappings: &[(String, String)]) -> String {
     String::from_utf8(text).unwrap_or_else(|_| value.to_owned())
 }
 
-/// Bytes that end one path and start the next inside a composite value: a
-/// list or assignment separator, a quote, whitespace, or the separator of
+/// Bytes that may start a path inside a composite value: a list or
+/// assignment separator, a quote, whitespace, or the separator of
 /// `CARGO_ENCODED_RUSTFLAGS`.
 const PATH_DELIMITERS: &[u8] = b" \t\n\r=:;,\"'\x1f";
 
 /// Whether `root` occurs in `text` at `offset` as a whole path, or as the
 /// leading components of one: it starts `text` or follows a delimiter, and
-/// it ends `text` or is followed by `/` or a delimiter. `/work/foo` is a
-/// root of `/work/foo/src`, but not of `/work/foo-assets` or `/x/work/foo`.
+/// it ends `text` or is followed by `/`. `/work/foo` is a root of
+/// `/work/foo/src`, but not of `/work/foo-assets`, `/x/work/foo` or
+/// `/work/foo assets`: a delimiter may be part of a file name, so a root
+/// followed by one is left as written, in the key and the compile alike.
 fn is_whole_root_at(text: &[u8], offset: usize, root: &[u8]) -> bool {
     let starts_path = offset == 0 || PATH_DELIMITERS.contains(&text[offset - 1]);
     let ends_component = text
         .get(offset + root.len())
-        .is_none_or(|next| *next == b'/' || PATH_DELIMITERS.contains(next));
+        .is_none_or(|next| *next == b'/');
     starts_path && ends_component
 }
 
@@ -555,10 +557,12 @@ mod tests {
 
         assert_eq!(
             logical_text(
-                "/work/foo/src:/work/foo-assets/data:/x/work/foo:/work/foo/target/debug=/work/foo",
+                "/work/foo/src:/work/foo-assets/data:/x/work/foo:/work/foo assets:\
+                 /work/foo:/work/foo/target/debug=/work/foo",
                 &mappings
             ),
-            "workspace/src:/work/foo-assets/data:/x/work/foo:target/debug=workspace"
+            "workspace/src:/work/foo-assets/data:/x/work/foo:/work/foo assets:\
+             /work/foo:target/debug=workspace"
         );
 
         let dep_info = b"/work/foo/target/a.d: /work/foo/src/lib.rs /work/foo-assets/x.txt\n";

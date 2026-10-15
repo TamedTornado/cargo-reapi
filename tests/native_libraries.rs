@@ -555,3 +555,38 @@ fn a_thin_archive_inside_the_workspace_runs_uncached() {
         "42"
     );
 }
+
+#[test]
+fn a_search_directory_reached_through_a_link_and_its_parent_keys_the_compile() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("shared cache");
+    let workspace = roots.path().join("workspace");
+    // `native/current/../lib` is `native/v1/lib` to the kernel, since
+    // `current` links to `v1/build`; collapsed as text it would be
+    // `native/lib`, which does not exist.
+    write_bundling_library(&workspace.join("package"), "../native/current/../lib");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = ['package']\nresolver = '3'\n",
+    )
+    .expect("workspace manifest");
+    let native = workspace.join("native");
+    fs::create_dir_all(native.join("v1/build")).expect("build directory");
+    std::os::unix::fs::symlink("v1/build", native.join("current")).expect("current link");
+    write_answer_archive(&native.join("v1/lib"), 42);
+
+    let built = cached_build(&workspace, cache.path());
+    built.assert_succeeded();
+    assert_eq!(library_executions(&built), ["local-cache-miss"]);
+
+    // Replacing the archive the compile bundled changes its key.
+    write_answer_archive(&native.join("v1/lib"), 43);
+    let rebuilt = cached_build(&workspace, cache.path());
+
+    rebuilt.assert_succeeded();
+    assert_eq!(library_executions(&rebuilt), ["local-cache-miss"]);
+    assert_eq!(
+        run_program(&workspace.join("target/debug/native-library")),
+        "43"
+    );
+}

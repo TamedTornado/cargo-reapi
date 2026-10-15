@@ -52,8 +52,10 @@ impl RemoteEligibility {
     }
 }
 
-/// The version of the action cache layout that keys belong to.
-const ACTION_KEY_NAMESPACE: &str = "cargo-reapi-action-v2\0";
+/// The version of the action cache layout that keys belong to. Raised with
+/// the manifest version whenever the rules for what may be stored tighten,
+/// so no entry stored under the older rules is even looked up.
+const ACTION_KEY_NAMESPACE: &str = "cargo-reapi-action-v3\0";
 
 pub fn action_key(action: &DeterministicAction) -> Result<String> {
     let encoded = serde_json::to_vec(action).context("serializing deterministic action")?;
@@ -145,6 +147,19 @@ mod tests {
                 "declared correctness dimension did not invalidate the key"
             );
         }
+    }
+
+    #[test]
+    fn an_action_keyed_under_the_previous_namespace_has_another_key() {
+        let action = action(&["--crate-name", "demo"]);
+        let mut previous = Sha256::new();
+        previous.update(b"cargo-reapi-action-v2\0");
+        previous.update(serde_json::to_vec(&action).expect("encoded action"));
+
+        assert_ne!(
+            action_key(&action).expect("key"),
+            format!("{:x}", previous.finalize())
+        );
     }
 
     #[test]

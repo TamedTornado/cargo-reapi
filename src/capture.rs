@@ -375,7 +375,9 @@ fn native_inputs(
     let mut toolchain_directories = Vec::new();
     for directory in search_directories {
         // A directory that does not exist holds nothing the compile can read.
-        let Ok(directory) = absolute(&directory, &invocation.cwd).canonicalize() else {
+        // It is resolved as rustc opens it, `..` after a link meaning the
+        // link target's parent, so `..` is not collapsed first.
+        let Ok(directory) = invocation.cwd.join(&directory).canonicalize() else {
             continue;
         };
         let keyed_root = [
@@ -577,17 +579,14 @@ pub fn prepare_invocation(
     let check_bundled_members = native.check_bundled_members;
     let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots, native.files)?;
     eligibility_reasons.extend(native.outside);
+    eligibility_reasons.extend(roots.dep_info_escaping_reason());
     eligibility_reasons.extend(invocation.unsupported_reason());
     let paths = prepare_paths(invocation, &roots, &mut eligibility_reasons)?;
     let platform = PlatformIdentity {
         os: env::consts::OS,
         arch: env::consts::ARCH,
     };
-    let arguments: Vec<String> = invocation
-        .args
-        .iter()
-        .map(|value| roots.normalize_text(&lossy(value)))
-        .collect();
+    let arguments = logical_arguments(&invocation.args, &roots);
     let environment: BTreeMap<String, String> = captured_environment()
         .into_iter()
         .map(|(name, value)| (name, roots.normalize_text(&value)))
@@ -664,6 +663,34 @@ pub fn prepare_invocation(
         relocation_mappings,
         check_bundled_members,
     })
+}
+
+/// The arguments as keyed (see [`CaptureRoots::normalize_text`]). A root
+/// ends a path only before `/` or the end of the value, so the two paths of
+/// a `--remap-path-prefix FROM=TO` value, which rustc splits at the last
+/// `=`, are each normalized on their own.
+fn logical_arguments(args: &[OsString], roots: &CaptureRoots) -> Vec<String> {
+    let mut arguments = Vec::with_capacity(args.len());
+    let mut remapping = false;
+    for argument in args.iter().map(|argument| lossy(argument)) {
+        let (option, value) = match argument.strip_prefix("--remap-path-prefix=") {
+            Some(value) => ("--remap-path-prefix=", Some(value)),
+            None if remapping => ("", Some(argument.as_str())),
+            None => ("", None),
+        };
+        remapping = argument == "--remap-path-prefix";
+
+        let logical = match value.and_then(|value| value.rsplit_once('=')) {
+            Some((from, to)) => format!(
+                "{option}{}={}",
+                roots.normalize_text(from),
+                roots.normalize_text(to)
+            ),
+            None => roots.normalize_text(&argument),
+        };
+        arguments.push(logical);
+    }
+    arguments
 }
 
 /// Why a compile the cache may run still cannot run remotely: what it reads
@@ -955,7 +982,27 @@ impl CaptureRoots {
             })
             .collect()
     }
+
+    /// Why a root keeps the compile from being cached, if one does: rustc
+    /// writes it into dep-info in an escaped spelling. The dep-info rewrite
+    /// replaces roots as plain bytes, so an escaped producer root would stay
+    /// in a stored dependency file, and a consumer root that needs escaping
+    /// would be written unescaped. rustc escapes a space in a file name as
+    /// `\ `, and a backslash, newline or carriage return in an `env-dep`
+    /// value; a newline in a file name ends its line unescaped.
+    fn dep_info_escaping_reason(&self) -> Option<String> {
+        self.path_mappings()
+            .into_iter()
+            .find(|(_, root)| root.contains(DEP_INFO_ESCAPED_CHARACTERS))
+            .map(|(label, root)| {
+                format!("the {label} root {root:?} is escaped in dep-info, which is not relocated")
+            })
+    }
 }
+
+/// The characters rustc's dep-info writer escapes in a path or `env-dep`
+/// value, or that break its lines.
+const DEP_INFO_ESCAPED_CHARACTERS: &[char] = &[' ', '\\', '\n', '\r'];
 
 fn discover_inputs(
     invocation: &RustcInvocation,
@@ -963,15 +1010,23 @@ fn discover_inputs(
     native_files: Vec<PathBuf>,
 ) -> Result<(Vec<PreparedInput>, Vec<String>)> {
     let mut candidates = native_files.into_iter().collect::<BTreeSet<_>>();
-    for (index, arg) in invocation.args.iter().enumerate() {
+    let mut reasons = Vec::new();
+    for arg in &invocation.args {
         let path = PathBuf::from(arg);
         if path.is_file() {
             candidates.insert(path);
         }
-        if arg == "--extern"
-            && let Some(value) = invocation.args.get(index + 1).and_then(extern_path)
-        {
-            candidates.insert(value);
+    }
+    // An extern crate's artifact is keyed by content; one that cannot be
+    // read cannot be keyed, so the compile runs uncached.
+    for path in extern_paths(&invocation.args) {
+        if invocation.cwd.join(&path).is_file() {
+            candidates.insert(path);
+        } else {
+            reasons.push(format!(
+                "the --extern artifact {} cannot be read to key it",
+                path.display()
+            ));
         }
     }
 
@@ -996,7 +1051,6 @@ fn discover_inputs(
     }
 
     let mut inputs = Vec::new();
-    let mut reasons = Vec::new();
     for path in candidates {
         match roots.normalize(&path, &invocation.cwd) {
             Ok(logical_path) => inputs.push(digest_file(
@@ -1012,9 +1066,23 @@ fn discover_inputs(
     Ok((inputs, reasons))
 }
 
-fn extern_path(value: &OsString) -> Option<PathBuf> {
-    let text = value.to_string_lossy();
-    text.split_once('=').map(|(_, path)| PathBuf::from(path))
+/// The artifact paths of the `--extern NAME=PATH` and `--extern=NAME=PATH`
+/// arguments. An `--extern NAME` without a path names a sysroot crate,
+/// which the compiler's identity covers.
+fn extern_paths(args: &[OsString]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut arguments = args.iter().map(|argument| argument.to_string_lossy());
+    while let Some(argument) = arguments.next() {
+        let value = if argument == "--extern" {
+            arguments.next().map(std::borrow::Cow::into_owned)
+        } else {
+            argument.strip_prefix("--extern=").map(str::to_owned)
+        };
+        if let Some((_, path)) = value.as_deref().and_then(|value| value.split_once('=')) {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    paths
 }
 
 /// Whether the walk over a package's files skips `entry`: Cargo's target

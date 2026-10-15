@@ -116,8 +116,9 @@ impl RustcInvocation {
     }
 
     /// Why the command line asks for something a cached compile cannot
-    /// reproduce, if it does: arguments read from a response file, which are
-    /// not analysed; an emit kind other than the dep-info, metadata and link
+    /// reproduce, if it does: arguments read from a response file, or an
+    /// unstable `-Z` option, which are not analysed; an emit kind other than
+    /// the dep-info, metadata and link
     /// outputs the cache declares; or a codegen option outside
     /// [`CACHEABLE_CODEGEN_OPTIONS`], or with a value that writes undeclared
     /// outputs or depends on the machine.
@@ -129,6 +130,18 @@ impl RustcInvocation {
         {
             return Some(format!(
                 "arguments from the response file {} are not analysed",
+                argument.to_string_lossy()
+            ));
+        }
+        // An unstable option can read or write files the cache does not
+        // account for, and none has been analysed.
+        if let Some(argument) = self
+            .args
+            .iter()
+            .find(|argument| argument.as_encoded_bytes().starts_with(b"-Z"))
+        {
+            return Some(format!(
+                "the unstable option {} is not analysed",
                 argument.to_string_lossy()
             ));
         }
@@ -605,6 +618,8 @@ mod tests {
             "/work/foo-assets/data",
             "/work/food",
             "/elsewhere/work/foo/data",
+            "/work/foo assets/data",
+            "/work/foo,v2/data",
         ] {
             assert_eq!(
                 relocated_environment_value(OsStr::new(unrelated), roots).expect("relocate"),
@@ -613,16 +628,18 @@ mod tests {
             );
         }
 
+        // A root followed by a delimiter could be the start of a sibling's
+        // name, so only one followed by `/` or the end is relocated.
         let slot = execution_slot("/work/foo").unwrap();
         let relocated = relocated_environment_value(
-            OsStr::new("/work/foo:/work/foo-assets:/work/foo/data"),
+            OsStr::new("/work/foo:/work/foo-assets:/work/foo/data:/work/foo"),
             roots,
         )
         .expect("relocate")
         .expect("whole roots relocate");
         assert_eq!(
             relocated,
-            OsString::from(format!("{slot}:/work/foo-assets:{slot}data"))
+            OsString::from(format!("/work/foo:/work/foo-assets:{slot}data:{slot}"))
         );
     }
 

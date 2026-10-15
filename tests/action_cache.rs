@@ -195,12 +195,13 @@ fn an_action_entry_of_an_older_schema_is_a_miss_not_an_error() {
         .and_then(|action| action["action_key"].as_str().map(str::to_owned))
         .expect("a published action");
 
-    // Mark the entry as another version wrote it. It still parses, and its
-    // inputs still match, so only the version can make it a miss.
+    // Mark the entry as the previous version wrote it, before the publication
+    // checks tightened. It still parses, and its inputs still match, so only
+    // the version can make it a miss.
     let manifest = cache.path().join("actions").join(format!("{key}.json"));
     let mut entry: Value =
         serde_json::from_slice(&fs::read(&manifest).expect("manifest")).expect("JSON");
-    entry["schema_version"] = 1.into();
+    entry["schema_version"] = 3.into();
     fs::write(&manifest, serde_json::to_vec(&entry).expect("JSON")).expect("old manifest");
     fs::remove_dir_all(project.join("target")).expect("retire the target");
 
@@ -554,4 +555,135 @@ fn a_build_directory_inside_the_package_is_not_among_its_inputs() {
     assert_succeeded(&output);
     assert_eq!(library_executions(&second, "project"), ["cache-hit"]);
     assert_eq!(run_program(&second.join("target/debug/project")), "1");
+}
+
+/// The text of every dependency file Cargo's compiles wrote in `root`.
+fn dependency_files(root: &Path) -> String {
+    fs::read_dir(root.join("target/debug/deps"))
+        .expect("dependency directory")
+        .map(|entry| entry.expect("dependency entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "d"))
+        .map(|path| fs::read_to_string(path).expect("dependency file"))
+        .collect()
+}
+
+#[test]
+fn a_workspace_whose_path_holds_a_space_runs_uncached() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    // rustc writes the space in each path below the root as `\ ` in dep-info.
+    let library = "pub fn value() -> &'static str { \
+                   include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/data.txt\")) }\n";
+    for name in ["first tree", "second tree"] {
+        let project = roots.path().join(name);
+        write_package(&project, "project", library);
+        fs::write(project.join("data.txt"), "shared").expect("data");
+    }
+    let first = roots.path().join("first tree");
+    let second = roots.path().join("second tree");
+
+    assert_succeeded(&cargo_reapi(&first, cache.path(), &["build"], &[]));
+    let output = cargo_reapi(&second, cache.path(), &["build"], &[]);
+
+    assert_succeeded(&output);
+    assert_eq!(library_executions(&first, "project"), ["local-ineligible"]);
+    assert_eq!(library_executions(&second, "project"), ["local-ineligible"]);
+    assert!(
+        !dependency_files(&second).contains("first"),
+        "a dependency file in the second tree names the first"
+    );
+    assert_eq!(run_program(&second.join("target/debug/project")), "shared");
+}
+
+/// Compiles `helper.rs`, whose public constant is `value`, into
+/// `libhelper.rlib` in `directory`.
+fn write_prebuilt_helper(directory: &Path, value: u32) -> std::path::PathBuf {
+    fs::create_dir_all(directory).expect("prebuilt directory");
+    fs::write(
+        directory.join("helper.rs"),
+        format!("pub const VALUE: u32 = {value};\n"),
+    )
+    .expect("helper source");
+
+    let compiled = Command::new("rustc")
+        .current_dir(directory)
+        .args([
+            "--edition",
+            "2024",
+            "--crate-type",
+            "rlib",
+            "--crate-name",
+            "helper",
+            "helper.rs",
+        ])
+        .status()
+        .expect("run rustc");
+    assert!(compiled.success(), "rustc failed");
+    directory.join("libhelper.rlib")
+}
+
+#[test]
+fn an_extern_artifact_named_in_the_attached_spelling_keys_the_compile() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    let library = "pub fn value() -> u32 { helper::VALUE }\n";
+    for (name, value) in [("first", 1), ("second", 2)] {
+        let workspace = roots.path().join(name);
+        write_workspace_manifest(&workspace, "'member'");
+        write_package(&workspace.join("member"), "member", library);
+        write_prebuilt_helper(&workspace.join("prebuilt"), value);
+    }
+    let build = |name: &str| {
+        let workspace = roots.path().join(name);
+        let prebuilt = workspace.join("prebuilt");
+        // The binary finds the helper its library uses through `-L`.
+        let flags = format!(
+            "--extern=helper={} -L dependency={}",
+            prebuilt.join("libhelper.rlib").display(),
+            prebuilt.display()
+        );
+        let output = cargo_reapi(
+            &workspace,
+            cache.path(),
+            &["build"],
+            &[("RUSTFLAGS", flags.as_str())],
+        );
+        assert_succeeded(&output);
+        workspace
+    };
+
+    let first = build("first");
+    assert_eq!(library_executions(&first, "member"), ["local-cache-miss"]);
+    assert_eq!(run_program(&first.join("target/debug/member")), "1");
+
+    // The second workspace differs only in the helper's artifact.
+    let second = build("second");
+
+    assert_eq!(library_executions(&second, "member"), ["local-cache-miss"]);
+    assert_eq!(run_program(&second.join("target/debug/member")), "2");
+}
+
+#[test]
+fn an_extern_artifact_that_cannot_be_read_runs_uncached() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    let project = roots.path().join("project");
+    write_package(&project, "project", "pub fn value() -> u32 { 3 }\n");
+    // rustc reads an extern crate only when the source uses it.
+    let missing = roots.path().join("missing/libghost.rlib");
+    let flags = format!("--extern=ghost={}", missing.display());
+
+    let output = cargo_reapi(
+        &project,
+        cache.path(),
+        &["build"],
+        &[("RUSTFLAGS", flags.as_str())],
+    );
+
+    assert_succeeded(&output);
+    assert_eq!(
+        library_executions(&project, "project"),
+        ["local-ineligible"]
+    );
+    assert_eq!(run_program(&project.join("target/debug/project")), "3");
 }

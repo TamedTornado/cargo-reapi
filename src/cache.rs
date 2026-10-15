@@ -51,7 +51,11 @@ fn read_action_manifest(encoded: &[u8]) -> Option<ActionManifest> {
 }
 
 /// The version of the action manifest, which records dep-info inputs.
-const ACTION_MANIFEST_VERSION: u32 = 3;
+/// Raised whenever the rules for what may be stored tighten, so an entry an
+/// older cargo-reapi stored under looser rules is a miss: version 4 is the
+/// first stored only after its inputs were re-checked once the compile
+/// finished, and with dep-info roots that need no escaping.
+const ACTION_MANIFEST_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ActionManifest {
@@ -643,8 +647,10 @@ mod tests {
         let old = br#"{"schema_version":1,"action_key":"k","outputs":[]}"#;
         assert!(super::read_action_manifest(old).is_none());
         assert!(super::read_action_manifest(b"not json").is_none());
-        assert!(super::read_action_manifest(br#"{"schema_version":3}"#).is_none());
-        let current = br#"{"schema_version":3,"action_key":"k","outputs":[],"dep_inputs":[]}"#;
+        assert!(super::read_action_manifest(br#"{"schema_version":4}"#).is_none());
+        let previous = br#"{"schema_version":3,"action_key":"k","outputs":[],"dep_inputs":[]}"#;
+        assert!(super::read_action_manifest(previous).is_none());
+        let current = br#"{"schema_version":4,"action_key":"k","outputs":[],"dep_inputs":[]}"#;
         assert!(super::read_action_manifest(current).is_some());
     }
 

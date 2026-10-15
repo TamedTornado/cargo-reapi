@@ -212,3 +212,34 @@ fn a_codegen_option_outside_the_supported_list_runs_uncached() {
     assert_eq!(library_executions(&root), ["local-ineligible"]);
     assert_eq!(run_program(&root.join("target/debug/options")), "42");
 }
+
+#[test]
+fn an_unstable_option_runs_uncached() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    // `-Z dump-mir` writes MIR files that are not among the declared outputs,
+    // so a second, identical package must write its own.
+    for name in ["first", "second"] {
+        let root = roots.path().join(name);
+        write_package(&root, LIBRARY);
+        let flags = format!(
+            "-Zdump-mir=value -Zdump-mir-dir={}",
+            root.join("mir").display()
+        );
+
+        let output = cargo_reapi(
+            &root,
+            cache.path(),
+            &["build"],
+            &[("RUSTFLAGS", &flags), ("RUSTC_BOOTSTRAP", "1")],
+        );
+
+        assert_succeeded(&output);
+        assert_eq!(library_executions(&root), ["local-ineligible"]);
+        let dumped = fs::read_dir(root.join("mir"))
+            .expect("MIR directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".value."));
+        assert!(dumped, "the library's MIR was dumped in {name}");
+    }
+}

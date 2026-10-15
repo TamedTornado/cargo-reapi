@@ -802,6 +802,41 @@ fn a_sibling_of_the_package_named_in_a_variable_keeps_its_path() {
     }
 }
 
+#[test]
+fn a_sibling_of_the_package_separated_by_a_space_keeps_its_path() {
+    let roots = tempdir().expect("worktree roots");
+    let cache = tempdir().expect("shared cache");
+    // `foo assets` begins with the package root `foo` and a space, which may
+    // be part of a file name, so it is not beneath the package either.
+    let build_script = "fn main() {\n\
+         let manifest = std::env::var(\"CARGO_MANIFEST_DIR\").unwrap();\n\
+         println!(\"cargo::rustc-env=ASSET_DIR={manifest} assets/data\");\n\
+         }\n";
+    for name in ["foo", "bar"] {
+        write_package(
+            &roots.path().join(name),
+            "envkey-spaced-sibling",
+            "env!(\"ASSET_DIR\")",
+            Some(build_script),
+        );
+    }
+
+    for name in ["foo", "bar"] {
+        let root = roots.path().join(name);
+        let built = cached_build(&root, cache.path(), &[]);
+        assert!(built.succeeded(), "{}", built.stderr());
+
+        let expected = format!(
+            "{} assets/data",
+            root.canonicalize().expect("package root").display()
+        );
+        assert_eq!(
+            run_binary(&root.join("target/debug/envkey-spaced-sibling")),
+            expected
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn variables_that_are_not_utf8_neither_stop_the_wrapper_nor_share_a_key() {
