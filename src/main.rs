@@ -273,7 +273,7 @@ fn run_cli(cli: &Cli) -> Result<i32> {
 
     // cargo-reapi is Cargo's compiler wrapper, so a wrapper the user already
     // set would be replaced: that invocation runs as plain Cargo.
-    if let Some(reason) = user_wrapper(&workspace_root) {
+    if let Some(reason) = user_wrapper(&workspace_root, &cli.cargo_args) {
         eprintln!("cargo-reapi: not caching ({reason}); running Cargo uncached");
         let status = Command::new("cargo")
             .args(&cli.cargo_args)
@@ -336,11 +336,11 @@ fn run_cargo(
 
 /// Why this invocation cannot use cargo-reapi as its compiler wrapper, when
 /// the user's own configuration already names one.
-fn user_wrapper(workspace_root: &Path) -> Option<String> {
+fn user_wrapper(workspace_root: &Path, cargo_args: &[OsString]) -> Option<String> {
     if let Some(name) = crate::cargo_config::wrapper_environment() {
         return Some(format!("{name} already names a compiler wrapper"));
     }
-    match crate::cargo_config::wrapper_setting(workspace_root) {
+    match crate::cargo_config::wrapper_setting(workspace_root, cargo_args) {
         Ok(None) => None,
         Ok(Some((origin, key))) => Some(format!("{origin} sets {key}, a compiler wrapper")),
         Err(error) => Some(one_line(&format!(

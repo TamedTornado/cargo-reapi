@@ -75,11 +75,11 @@ const WRAPPER_SETTINGS: [(&str, &str); 2] = [
     ("build", "rustc-workspace-wrapper"),
 ];
 
-/// The first configuration file that sets a compiler wrapper, as
-/// `(origin, key)`. Fails when a file cannot be read completely.
-pub fn wrapper_setting(cwd: &Path) -> Result<Option<(String, String)>> {
-    for path in files(cwd) {
-        let layer = read_file(&path)?;
+/// The first configuration source, a `--config` argument or a file, that sets
+/// a compiler wrapper, as `(origin, key)`. Fails when a source cannot be read
+/// completely.
+pub fn wrapper_setting(cwd: &Path, cargo_args: &[OsString]) -> Result<Option<(String, String)>> {
+    for layer in layers(cwd, cargo_args)? {
         for (table, key) in WRAPPER_SETTINGS {
             let set = layer
                 .table

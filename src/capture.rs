@@ -250,33 +250,100 @@ fn unescape_spaces(text: &str) -> String {
     text.replace("\\ ", " ")
 }
 
-/// Why a compile is never cached for want of knowing its native inputs.
+/// What a compile's native arguments read: the files it keys, or why it
+/// cannot be cached.
+struct NativeInputs {
+    /// Every file directly in a `-L` search directory inside the workspace,
+    /// the build output or the package, where rustc may find a static
+    /// library an rlib bundles (`-l static=...` or `#[link(kind = "static")]`).
+    files: Vec<PathBuf>,
+    /// Why the compile reads native inputs cargo-reapi does not key.
+    outside: Option<String>,
+}
+
+/// The native inputs of a compile.
 ///
 /// A link step (a binary, test, proc macro or other dynamic library) lets
 /// the linker pick libraries, start files and itself from places cargo-reapi
-/// does not key, so it always runs. So does a compile whose `-L` or `-l`
-/// arguments reach a file it cannot show to lie in the workspace, the build
-/// output or the compiler's own sysroot, such as a static library an rlib
-/// bundles. Whatever cannot be told cheaply counts as outside.
-fn native_input_reason(invocation: &RustcInvocation, roots: &CaptureRoots) -> Option<String> {
+/// does not key, so it always runs. So does a compile with a `-L` directory
+/// outside the workspace, the build output, the package and the compiler's
+/// own sysroot, or a `-l` library not found in an inside `-L` directory.
+/// Every file directly in an inside `-L` directory outside the sysroot is
+/// keyed by content, so a static library an rlib bundles is part of its key.
+fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<NativeInputs> {
+    let mut native = NativeInputs {
+        files: Vec::new(),
+        outside: None,
+    };
     if invocation.requires_native_linker() {
-        return Some(
+        native.outside = Some(
             "a link step reads libraries and a linker that are not keyed, so it always runs"
                 .to_owned(),
         );
+        return Ok(native);
     }
-    let inside = |path: &Path| {
-        let path = absolute(path, &invocation.cwd);
-        [
+
+    let (search_directories, libraries) = native_arguments(invocation);
+    let mut inside_directories = Vec::new();
+    let mut toolchain_directories = Vec::new();
+    for (argument, directory) in search_directories {
+        // A directory that does not exist holds nothing the compile can read.
+        let Ok(directory) = absolute(&directory, &invocation.cwd).canonicalize() else {
+            continue;
+        };
+        let keyed_root = [
             Some(&roots.workspace),
             Some(&roots.target),
-            Some(&roots.toolchain),
             roots.package.as_ref(),
         ]
         .into_iter()
         .flatten()
-        .any(|root| path.starts_with(root))
-    };
+        .any(|root| directory.starts_with(root));
+        if keyed_root {
+            inside_directories.push(directory);
+        } else if directory.starts_with(&roots.toolchain) {
+            // The compiler's identity covers its own sysroot.
+            toolchain_directories.push(directory);
+        } else {
+            native.outside = Some(format!(
+                "-L {argument} reaches outside the workspace and toolchain"
+            ));
+            return Ok(native);
+        }
+    }
+
+    for library in libraries {
+        if !library_is_found(&library, &inside_directories)
+            && !library_is_found(&library, &toolchain_directories)
+        {
+            native.outside = Some(format!(
+                "-l {library} is not found beside a -L directory inside the workspace, so it \
+                 may be a system library"
+            ));
+            return Ok(native);
+        }
+    }
+
+    for directory in inside_directories {
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("listing native search directory {}", directory.display()))?
+        {
+            let path = entry
+                .with_context(|| {
+                    format!("listing native search directory {}", directory.display())
+                })?
+                .path();
+            if path.is_file() {
+                native.files.push(path);
+            }
+        }
+    }
+    Ok(native)
+}
+
+/// The `-L` search directories other than Cargo's own crate directories,
+/// each with the argument that named it, and the `-l` libraries.
+fn native_arguments(invocation: &RustcInvocation) -> (Vec<(String, PathBuf)>, Vec<String>) {
     let mut search_directories = Vec::new();
     let mut libraries = Vec::new();
     let mut arguments = invocation
@@ -297,43 +364,33 @@ fn native_input_reason(invocation: &RustcInvocation, roots: &CaptureRoots) -> Op
         };
         if argument.starts_with("-L") {
             let (kind, path) = value.split_once('=').unwrap_or(("all", value.as_str()));
-            if kind == "dependency" || kind == "crate" {
-                continue;
+            if kind != "dependency" && kind != "crate" {
+                search_directories.push((value.clone(), PathBuf::from(path)));
             }
-            if !inside(Path::new(path)) {
-                return Some(format!(
-                    "-L {value} reaches outside the workspace and toolchain"
-                ));
-            }
-            search_directories.push(PathBuf::from(path));
-        } else if argument.starts_with("-l") {
+        } else {
             libraries.push(value);
         }
     }
-    for library in libraries {
-        let (kind, name) = library
-            .split_once('=')
-            .unwrap_or(("dylib", library.as_str()));
-        let name = name.split(':').next().unwrap_or(name);
-        let found = kind != "framework"
-            && search_directories.iter().any(|directory| {
-                ["a", "so", "dylib", "lib"].iter().any(|extension| {
-                    absolute(directory, &invocation.cwd)
-                        .join(format!("lib{name}.{extension}"))
-                        .exists()
-                        || absolute(directory, &invocation.cwd)
-                            .join(format!("{name}.{extension}"))
-                            .exists()
-                })
-            });
-        if !found {
-            return Some(format!(
-                "-l {library} is not found beside a -L directory inside the workspace, so it \
-                 may be a system library"
-            ));
-        }
+    (search_directories, libraries)
+}
+
+/// Whether a `-l` library is a file in one of `directories`.
+fn library_is_found(library: &str, directories: &[PathBuf]) -> bool {
+    let (kind, name) = library.split_once('=').unwrap_or(("dylib", library));
+    let name = name.split(':').next().unwrap_or(name);
+    if kind.starts_with("framework") {
+        return false;
     }
-    None
+    let verbatim = kind.contains("+verbatim");
+    directories.iter().any(|directory| {
+        if verbatim {
+            return directory.join(name).is_file();
+        }
+        ["a", "so", "dylib", "lib"].iter().any(|extension| {
+            directory.join(format!("lib{name}.{extension}")).is_file()
+                || directory.join(format!("{name}.{extension}")).is_file()
+        })
+    })
 }
 
 /// Records the action and runs the compiler with the caller's whole
@@ -362,8 +419,9 @@ pub fn prepare_invocation(
     if should_record_path_mappings(invocation) {
         record_path_mappings(&roots.path_mappings())?;
     }
-    let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots)?;
-    eligibility_reasons.extend(native_input_reason(invocation, &roots));
+    let native = native_inputs(invocation, &roots)?;
+    let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots, native.files)?;
+    eligibility_reasons.extend(native.outside);
     let paths = prepare_paths(invocation, &roots, &mut eligibility_reasons)?;
     let toolchain = toolchain_identity(&invocation.compiler)?;
     let platform = PlatformIdentity {
@@ -708,8 +766,9 @@ impl CaptureRoots {
 fn discover_inputs(
     invocation: &RustcInvocation,
     roots: &CaptureRoots,
+    native_files: Vec<PathBuf>,
 ) -> Result<(Vec<PreparedInput>, Vec<String>)> {
-    let mut candidates = BTreeSet::new();
+    let mut candidates = native_files.into_iter().collect::<BTreeSet<_>>();
     for (index, arg) in invocation.args.iter().enumerate() {
         let path = PathBuf::from(arg);
         if path.is_file() {
@@ -771,8 +830,9 @@ fn extern_path(value: &OsString) -> Option<PathBuf> {
 }
 
 /// Whether the walk over a package's files skips `path`: Cargo's target
-/// directory itself, which is output, and any entry named `.git`, which the
-/// strict sandbox denies reads of. No other name is skipped.
+/// directory itself, which is output, and any entry named `.git`: build
+/// scripts run every time, and proc macros declare what they read (see the
+/// README). No other name is skipped.
 fn is_ignored(path: &Path, target: &Path) -> bool {
     path.starts_with(target) || path.file_name().is_some_and(|name| name == ".git")
 }
