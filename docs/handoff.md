@@ -1,16 +1,55 @@
 # cargo-reapi handoff: per-compile caching (read this first)
 
-State as of 2026-10-15. The narrowing is finished and merged to `main`. The
-native-rule narrowing and scheduling-key fix are merged to `main` at 33892a4;
-the pre-release review of 33892a4
-(`scratchpad/astra/reapi-0217.md`) found 6 ORDINARY and 5 EDGE findings. The
-fixes for all but finding 9 are on branch `prerelease-0217` (see "Pre-release
-fixes" below), followed there by the fixes for the re-review of 9c47a94 (see
-"Re-review fixes"), pushed and **awaiting the coordinator's go-ahead to
-fast-forward `main`**. None of it is **released**: the version is still 0.2.10,
-there is no tag, nothing is published and nothing is installed. The
-whole-gate design and its review history are in Git (`main` at 86d3e1c and
-earlier, including the previous version of this file).
+State as of 2026-10-15: **0.3.0 is released.** `main` was fast-forwarded to
+c5e81a2 (the pre-release and re-review fixes below), then 8a6fee9 bumped the
+version and moved the CHANGELOG to `[0.3.0] - 2026-10-15`; tag `v0.3.0`.
+Published to crates.io from a clean clone of the tag and installed with
+`cargo install cargo-reapi --version 0.3.0 --locked` (`cargo-reapi
+--version` reports 0.3.0; the install removed the 0.2.10 auditor binaries).
+The final focused review of 9c47a94..c5e81a2
+(`scratchpad/astra/reapi-0219.md`) found 0 ORDINARY and 2 EDGE findings, both
+filed and deferred. The whole-gate design and its review history are in Git
+(`main` at 86d3e1c and earlier, including an older version of this file).
+
+Open `review-finding` issues (all deferred, none affects Moria today):
+
+- [#7](https://github.com/TamedTornado/cargo-reapi/issues/7): computed values
+  from relocated paths.
+- [#8](https://github.com/TamedTornado/cargo-reapi/issues/8): symlink
+  retargeting during a compile.
+- [#9](https://github.com/TamedTornado/cargo-reapi/issues/9): an unreadable
+  (not missing) `--extern` file aborts the wrapper instead of running
+  uncached (`src/capture.rs` `digest_file(...)?`).
+- [#10](https://github.com/TamedTornado/cargo-reapi/issues/10): `--Z=` and
+  clustered short options (`-gZ...`) bypass the `-Z` exclusion. Moria passes
+  no `-Z`.
+
+Deferred design: proc-macro and dylib caching (see its section below; costs
+about 42 proc-macro link units, 54 s of summed unit time and a 5 to 23 crate
+miss cascade per fresh Moria checkout).
+
+### After the release (done)
+
+- `/mnt/build/g1-tools/moria-env.sh`: `CARGO_REAPI_SRT` and the
+  `CARGO_REAPI_TARGET_ROOT` export in `moria_cargo` removed (the driver now
+  sets the target root itself, from `cargo metadata`). `CARGO_TARGET_DIR`,
+  `CARGO_REAPI_ACTION_LOG`, `_CACHE_DIR`, `_RESOURCE_LEDGER`,
+  `_RESOURCE_CPU_CAPACITY` and `_BACKEND` are still read.
+  `moria-v2/scripts/trim-cache.sh` works unchanged with 0.3.0's `cache gc`
+  (report schema 2, `capacity_satisfied`).
+- Smoke test at Moria 2bbd3eb2 in fresh worktrees: `check -p moria-core`
+  missed once (new key namespace), logged nothing on a rerun in the same
+  checkout (Cargo fresh), and hit in a second worktree. `check --workspace
+  --all-targets`: first worktree 6 hits, 622 misses, 138 uncached; second
+  worktree 605 hits, 23 misses, 138 uncached (119 link steps; misses are the
+  proc-macro and libspa cascades below).
+- Moria skill `.agents/skills/cargo-reapi/SKILL.md` rewritten for 0.3.0
+  (moria-v2 master d0d6705e).
+- Not done (outside this lane): moria-v2 `.bro/environment/Dockerfile` still
+  installs cargo-reapi `=0.2.2` and sets `CARGO_REAPI_SRT` and
+  `CARGO_REAPI_TARGET_ROOT`; `scripts/local-gate.sh` passes
+  `CARGO_REAPI_TARGET_ROOT`. Both are harmless with 0.3.0 (unread or
+  overridden) but stale.
 
 ## Jason's decision (via the coordinator)
 
@@ -323,9 +362,8 @@ environment, compile_options and action_cache also pass under
 (`/mnt/build/cargo-reapi-target-0218`, `-0218-197`) because of the stuck
 process below.
 
-Next: the coordinator reviews the range; after the go-ahead, fast-forward
-`main`, then the release rule below (Astra review of the exact commit before
-any bump).
+The coordinator approved the range after the 0-ORDINARY review of
+9c47a94..c5e81a2; it was released as 0.3.0 (see the top).
 
 Unrelated: a `capture` test binary from an earlier run in this worktree
 (`target/debug/deps/capture-21da24fa96b372a7`, PID 139366, started 00:43,
@@ -345,7 +383,7 @@ proc-macro link units, 54 s of summed unit time, plus the 5 to 6 dependent
 misses (a relinked proc-macro `.so` differs across checkouts, so its
 dependents' `--extern` digests differ).
 
-## Release follow-ons (not this lane's)
+## Release rules for the next version
 
 - Before a release, run the native tests under the newest stable toolchain
   (`cargo +<newest> test --features test-hooks --test native_libraries`) as
@@ -354,11 +392,7 @@ dependents' `--extern` digests differ).
   findings and repeat; then bump `Cargo.toml`, `Cargo.lock` and the CHANGELOG,
   tag, push, `cargo publish`, `cargo install --version <v> --locked`. Never
   install a branch build. Check the clone has no untracked files first.
-- Only after the new version is installed: `/mnt/build/g1-tools/moria-env.sh`
-  drops `CARGO_REAPI_SRT` and `CARGO_REAPI_TARGET_ROOT` (0.2.10 still reads
-  them). `CARGO_REAPI_CACHE_DIR`, `_ACTION_LOG`, `_RESOURCE_LEDGER`,
-  `_RESOURCE_CPU_CAPACITY` and `_BACKEND` are still read.
-- Update the Moria skill `.agents/skills/cargo-reapi/SKILL.md` for the new
-  behavior: link steps and outside-native compiles run uncached.
+- After installing, update the Moria skill
+  `.agents/skills/cargo-reapi/SKILL.md` if behavior changed.
 - `RUSTC_WRAPPER` is still keyed through the `RUST*` family; no misses came
   from it in the measurement.
