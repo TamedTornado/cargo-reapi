@@ -52,9 +52,17 @@ impl RemoteEligibility {
     }
 }
 
+/// The version of the action cache layout that keys belong to.
+const ACTION_KEY_NAMESPACE: &str = "cargo-reapi-action-v2\0";
+
 pub fn action_key(action: &DeterministicAction) -> Result<String> {
     let encoded = serde_json::to_vec(action).context("serializing deterministic action")?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    // Keys are namespaced by the cache layout's version, so an entry an older
+    // cargo-reapi wrote under the same action is never looked up.
+    let mut hasher = Sha256::new();
+    hasher.update(ACTION_KEY_NAMESPACE.as_bytes());
+    hasher.update(encoded);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]

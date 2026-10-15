@@ -31,6 +31,23 @@ impl CacheOptions {
     }
 }
 
+/// Only the version of an action manifest, which every layout carries.
+#[derive(Deserialize)]
+struct ManifestVersion {
+    schema_version: u32,
+}
+
+/// The manifest in `encoded` when it is of the current version and
+/// readable, and `None` for anything else: an unsupported version, or a
+/// damaged entry, is a cache miss.
+fn read_action_manifest(encoded: &[u8]) -> Option<ActionManifest> {
+    let version: ManifestVersion = serde_json::from_slice(encoded).ok()?;
+    if version.schema_version != ACTION_MANIFEST_VERSION {
+        return None;
+    }
+    serde_json::from_slice(encoded).ok()
+}
+
 /// The version of the action manifest, which records dep-info inputs.
 const ACTION_MANIFEST_VERSION: u32 = 2;
 
@@ -344,7 +361,7 @@ fn withheld_by_cached_entry(
     let Ok(encoded) = fs::read(action_manifest_path(options, &prepared.action_key)) else {
         return BTreeSet::new();
     };
-    let Ok(manifest) = serde_json::from_slice::<ActionManifest>(&encoded) else {
+    let Some(manifest) = read_action_manifest(&encoded) else {
         return BTreeSet::new();
     };
     let Some(cached) = manifest
@@ -1098,11 +1115,12 @@ fn restore(
     let Ok(encoded) = fs::read(&manifest_path) else {
         return Ok(false);
     };
-    let manifest: ActionManifest = serde_json::from_slice(&encoded)
-        .with_context(|| format!("reading action manifest {}", manifest_path.display()))?;
-    if manifest.schema_version != ACTION_MANIFEST_VERSION
-        || manifest.action_key != prepared.action_key
-    {
+    // The version is read before the rest: an entry an older or newer
+    // cargo-reapi wrote has another schema, and is a miss, never an error.
+    let Some(manifest) = read_action_manifest(&encoded) else {
+        return Ok(false);
+    };
+    if manifest.action_key != prepared.action_key {
         return Ok(false);
     }
     if manifest.outputs.len() != prepared.output_files.len() {
@@ -1354,6 +1372,16 @@ fn set_unix_mode(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_action_manifest_of_another_version_or_damaged_is_a_miss() {
+        let old = br#"{"schema_version":1,"action_key":"k","outputs":[]}"#;
+        assert!(super::read_action_manifest(old).is_none());
+        assert!(super::read_action_manifest(b"not json").is_none());
+        assert!(super::read_action_manifest(br#"{"schema_version":2}"#).is_none());
+        let current = br#"{"schema_version":2,"action_key":"k","outputs":[],"dep_inputs":[]}"#;
+        assert!(super::read_action_manifest(current).is_some());
+    }
+
     use super::{
         LinkDiscovery, LinkInput, discovered_action_key, resolve_linker_candidate,
         traced_path_matches_library, write_atomic,

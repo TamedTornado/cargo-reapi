@@ -1759,3 +1759,39 @@ fn an_unavailable_sandbox_is_an_error_not_a_decline() {
     assert!(!stderr(&output).contains(DECLINE), "{}", stderr(&output));
     assert!(!project.join("target/debug/project").exists());
 }
+
+/// Astra 0.2.13 finding 10: an entry an older cargo-reapi wrote is a miss.
+#[test]
+fn an_action_entry_of_an_older_schema_is_a_miss_not_an_error() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "rebuilt", "");
+    fixture.lock(&project);
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    let log = fs::read_to_string(project.join("target/cargo-reapi/actions.jsonl")).expect("log");
+    let key = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|action| action["execution"] == "local-cache-miss")
+        .and_then(|action| action["action_key"].as_str().map(str::to_owned))
+        .expect("a published action");
+
+    // Rewrite the entry as schema 1 wrote it: no dep-info inputs.
+    let manifest = fixture.cache.join("actions").join(format!("{key}.json"));
+    let mut entry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).expect("manifest")).expect("JSON");
+    entry["schema_version"] = 1.into();
+    entry.as_object_mut().expect("object").remove("dep_inputs");
+    fs::write(&manifest, serde_json::to_vec(&entry).expect("JSON")).expect("old manifest");
+
+    // A target that is occupied skips the gate, so the action cache decides.
+    fs::remove_dir_all(project.join("target")).expect("retire the target");
+    fs::create_dir_all(project.join("target")).expect("target");
+    fs::write(project.join("target/occupied"), "").expect("occupy the target");
+    let output = fixture.cargo_reapi(&project, &["build"]);
+
+    assert_succeeded(&output);
+    assert_eq!(run(&project.join("target/debug/project")), "rebuilt");
+    let log = fs::read_to_string(project.join("target/cargo-reapi/actions.jsonl")).expect("log");
+    assert!(log.contains("\"local-cache-miss\""), "{log}");
+}
