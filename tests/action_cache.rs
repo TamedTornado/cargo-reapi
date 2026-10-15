@@ -633,20 +633,17 @@ fn an_extern_artifact_named_in_the_attached_spelling_keys_the_compile() {
         write_package(&workspace.join("member"), "member", library);
         write_prebuilt_helper(&workspace.join("prebuilt"), value);
     }
+    // Cargo runs a member's compiles in the workspace root. The same text in
+    // both workspaces keeps Cargo's `-C metadata` the same; the binary finds
+    // the helper its library uses through `-L`.
+    let flags = "--extern=helper=prebuilt/libhelper.rlib -L dependency=prebuilt";
     let build = |name: &str| {
         let workspace = roots.path().join(name);
-        let prebuilt = workspace.join("prebuilt");
-        // The binary finds the helper its library uses through `-L`.
-        let flags = format!(
-            "--extern=helper={} -L dependency={}",
-            prebuilt.join("libhelper.rlib").display(),
-            prebuilt.display()
-        );
         let output = cargo_reapi(
             &workspace,
             cache.path(),
             &["build"],
-            &[("RUSTFLAGS", flags.as_str())],
+            &[("RUSTFLAGS", flags)],
         );
         assert_succeeded(&output);
         workspace
