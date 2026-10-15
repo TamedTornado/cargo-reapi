@@ -166,8 +166,10 @@ enum Bundling {
     LinkAttribute,
     /// `cargo::rustc-link-lib=static=answer` from the build script.
     LinkLibArgument,
-    /// Nothing: the library only searches the directory and returns 7.
-    Nothing,
+    /// Nothing: the library searches the directory, names the system `libm`
+    /// with a default-kind `-l m`, which only the link step reads, and
+    /// returns 7.
+    DynamicOnly,
 }
 
 /// A library that searches `search` (relative to the package) for native
@@ -178,7 +180,8 @@ fn write_native_library(root: &Path, search: &str, bundling: Bundling) {
 
     let link_lib = match bundling {
         Bundling::LinkLibArgument => "println!(\"cargo::rustc-link-lib=static=answer\");\n",
-        Bundling::LinkAttribute | Bundling::Nothing => "",
+        Bundling::DynamicOnly => "println!(\"cargo::rustc-link-lib=m\");\n",
+        Bundling::LinkAttribute => "",
     };
     fs::write(
         root.join("build.rs"),
@@ -204,7 +207,7 @@ fn write_native_library(root: &Path, search: &str, bundling: Bundling) {
             "unsafe extern \"C\" { fn answer() -> i32; }\n\
              pub fn value() -> i32 { unsafe { answer() } }\n"
         }
-        Bundling::Nothing => "pub fn value() -> i32 { 7 }\n",
+        Bundling::DynamicOnly => "pub fn value() -> i32 { 7 }\n",
     };
     fs::write(root.join("src/lib.rs"), library).expect("library source");
     fs::write(
@@ -309,9 +312,10 @@ fn a_static_archive_bundled_from_inside_the_workspace_keys_the_compile() {
     );
 }
 
-/// A workspace of `native-library`, which searches `../../outside` and
-/// bundles nothing from it, and `native-user`, a library that calls it and
-/// so inherits its `-L` directory from Cargo.
+/// A workspace of `native-library`, which names `libanswer.a` in
+/// `../../outside` with `-l static=answer`, and `native-user`, a library that
+/// calls it and so inherits its `-L` directory from Cargo. A check reads
+/// neither.
 fn write_propagating_workspace(root: &Path) {
     fs::create_dir_all(root).expect("workspace directory");
     fs::write(
@@ -319,7 +323,11 @@ fn write_propagating_workspace(root: &Path) {
         "[workspace]\nmembers = ['native', 'user']\nresolver = '3'\n",
     )
     .expect("workspace manifest");
-    write_native_library(&root.join("native"), "../../outside", Bundling::Nothing);
+    write_native_library(
+        &root.join("native"),
+        "../../outside",
+        Bundling::LinkLibArgument,
+    );
 
     let user = root.join("user");
     write_manifest(&user, "native-user");
@@ -376,8 +384,8 @@ fn a_library_searching_an_outside_directory_without_bundling_is_cached() {
     write_answer_archive(&roots.path().join("outside"), 42);
     let first = roots.path().join("first");
     let second = roots.path().join("second");
-    write_native_library(&first, "../outside", Bundling::Nothing);
-    write_native_library(&second, "../outside", Bundling::Nothing);
+    write_native_library(&first, "../outside", Bundling::DynamicOnly);
+    write_native_library(&second, "../outside", Bundling::DynamicOnly);
 
     let built = cached_build(&first, cache.path());
     built.assert_succeeded();
