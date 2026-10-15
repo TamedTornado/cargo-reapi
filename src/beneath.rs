@@ -1,8 +1,7 @@
-//! Writes the driver makes inside the target after untrusted code has run.
+//! Writes cargo-reapi makes where build scripts and proc macros can write.
 //!
-//! The target is writable by build scripts and proc macros, so any path in it
-//! may become a symlink while a build runs. Everything the driver writes
-//! there afterwards, outside the sandbox, goes through a directory handle
+//! Any path such code can write may become a symlink while a build runs.
+//! Everything cargo-reapi writes there goes through a directory handle
 //! opened on the canonical target and one `openat` per path component with
 //! `O_NOFOLLOW`, so no symlink anywhere on the path can send a write
 //! elsewhere.

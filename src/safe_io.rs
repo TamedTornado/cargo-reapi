@@ -2,8 +2,7 @@
 //!
 //! A build may plant, anywhere it can write, a symlink or a hard link to a
 //! file it cannot write, such as `Cargo.lock`. cargo-reapi's own writes, in the
-//! driver outside the sandbox and in the compiler wrapper inside it, must
-//! never land there. The policy, for every such write:
+//! driver and in the compiler wrapper, must never land there. The policy, for every such write:
 //!
 //! - a link is never followed;
 //! - a file is changed in place only when it is a regular file with a single

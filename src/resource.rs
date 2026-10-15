@@ -16,7 +16,7 @@ const CPU_CAPACITY_ENV: &str = "CARGO_REAPI_RESOURCE_CPU_CAPACITY";
 const MEMORY_CAPACITY_ENV: &str = "CARGO_REAPI_RESOURCE_MEMORY_GIB_CAPACITY";
 
 /// One explicitly selected host ledger can coordinate separate artifact caches.
-/// Resolve it once by the same rule at every driver and sandbox boundary.
+/// The driver and every wrapper resolve it by the same rule.
 pub fn ledger_root(cache_root: &Path) -> Result<PathBuf> {
     let root = std::env::var_os("CARGO_REAPI_RESOURCE_LEDGER")
         .map_or_else(|| cache_root.join("resource-ledger-v1"), PathBuf::from);
@@ -75,8 +75,8 @@ impl ResourceCapacity {
     }
 
     pub fn apply_to(self, command: &mut std::process::Command) {
-        // Resolve outside the strict sandbox, whose proc view may hide host
-        // discovery. Every wrapper must use the same selected ledger capacity.
+        // Resolved once in the driver: every wrapper must use the same
+        // selected ledger capacity.
         command.env(CPU_CAPACITY_ENV, self.cpu.to_string());
         command.env(MEMORY_CAPACITY_ENV, self.memory_gib.to_string());
     }

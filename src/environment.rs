@@ -9,7 +9,7 @@
 //!
 //! - the families rustc, Cargo, Clippy, the C toolchain and the native linker
 //!   are documented to read ([`is_toolchain_environment`]);
-//! - every variable Cargo or the sandbox added or changed relative to the
+//! - every variable Cargo added or changed relative to the
 //!   driver's caller: Cargo's crate variables and build-script `rustc-env`
 //!   values;
 //! - every name Cargo's `[env]` configuration defines, whatever its value;
@@ -349,7 +349,7 @@ impl CallerEnvironment {
         Some(Self { digests })
     }
 
-    /// Whether Cargo or the sandbox added this variable or changed its value.
+    /// Whether Cargo added this variable or changed its value.
     fn changed(&self, name: &str, value: &OsStr) -> bool {
         self.digests
             .get(name)

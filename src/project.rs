@@ -50,8 +50,7 @@ pub fn canonical(path: &Path) -> Result<PathBuf> {
 
 /// The target directory `cargo metadata --no-deps` reports for the selected
 /// project, or `None` where Cargo cannot describe one, as for commands that
-/// run outside a project. Only for invocations that do not use the strict
-/// sandbox, which resolve the full [`Project`] instead.
+/// run outside a project.
 pub fn target_directory(cwd: &Path, metadata_arguments: &[OsString]) -> Option<PathBuf> {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])

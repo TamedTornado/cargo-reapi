@@ -1,8 +1,8 @@
 //! The physical disk footprint of a set of files.
 //!
-//! Copy-on-write file systems let files share physical blocks: a reflinked gate
-//! snapshot occupies almost no new disk although every file keeps its full
-//! length. Summing lengths counts each snapshot again in full, so a collector
+//! Copy-on-write file systems let files share physical blocks: a file reflinked
+//! from the cache occupies almost no new disk although it keeps its full
+//! length. Summing lengths counts each copy again in full, so a collector
 //! working from that sum evicts reusable entries to free space that was never
 //! used. The footprint instead counts each physical byte once, from the file
 //! system's extent map, and knows which bytes deleting a set of files frees.
@@ -19,8 +19,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Identifies a set of files that are removed together, such as one action or
-/// one gate snapshot. Bytes held by an owner that is never released stay in
+/// Identifies a set of files that are removed together, such as one cache
+/// entry. Bytes held by an owner that is never released stay in
 /// the footprint.
 pub type OwnerId = usize;
 

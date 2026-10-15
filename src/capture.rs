@@ -412,8 +412,7 @@ pub fn prepare_invocation(
 ) -> Result<PreparedInvocation> {
     let roots = CaptureRoots::from_env(invocation)?;
     // Cargo probes rustc through the wrapper with control invocations such as
-    // `rustc -vV`. Those invocations produce no artifact and may run while the
-    // outer target is deliberately mounted read-only by the sandbox. Path
+    // `rustc -vV`. Those invocations produce no artifact. Path
     // mappings are restore metadata, so only artifact-producing compilations
     // need to persist them.
     if should_record_path_mappings(invocation) {
