@@ -38,12 +38,23 @@ compiles it is asked to run.
 - Only dep-info, metadata and link outputs and a fixed list of codegen
   options are cached. Other `--emit` kinds, unpacked split debuginfo,
   `-C save-temps`, profile-guided options, `-C target-cpu=native`, unlisted
-  codegen options and response-file arguments run uncached.
+  codegen options, response-file arguments and unstable `-Z` options run
+  uncached.
+- Both `--extern NAME=PATH` and `--extern=NAME=PATH` artifacts are keyed; an
+  extern artifact that cannot be read makes the compile run uncached.
+- A compile whose workspace, target, package or toolchain path contains a
+  character rustc escapes in dep-info (space, backslash, newline, carriage
+  return) runs uncached.
+- `-L` native search directories are resolved as rustc opens them, without
+  collapsing `..` before following links.
+- The action-key namespace and manifest version are raised, so entries
+  stored before these rules are misses.
 - A compile whose keyed package files changed while it ran, or whose keyed or
   dep-info files were modified at or after it started, is not stored
   (`local-input-changed`).
-- Worktree roots are relocated and keyed only as whole path components, so
-  a sibling such as `<package>-assets` keeps its path.
+- Worktree roots are relocated and keyed only as whole path components
+  followed by `/` or the end of the value, so a sibling such as
+  `<package>-assets` or `<package> assets` keeps its path.
 - Target discovery honours `--config` arguments, and the package walk skips
   directories Cargo marks with `CACHEDIR.TAG`, such as a `build.build-dir`
   inside the package.

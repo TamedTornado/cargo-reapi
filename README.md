@@ -52,8 +52,16 @@ uses codegen options from a fixed list whose effect the key covers. Another
 `--emit` kind, `-C save-temps`, `-C split-debuginfo=unpacked` (anything but
 `off` or `packed`), the profile-guided options, `-C target-cpu=native` (the
 CPU it resolves to is not keyed) and any codegen option not on the list run
-uncached. So do arguments read from a response file (`@file`), which are not
-analysed.
+uncached. So do arguments read from a response file (`@file`) and unstable
+`-Z` options, which are not analysed, and an `--extern` artifact that cannot
+be read to key it.
+
+**Run uncached: worktree paths rustc escapes in dep-info.** rustc writes a
+space in a dependency path as `\ `, and escapes a backslash, newline or
+carriage return in an environment value it records. A compile whose
+workspace, target, package or toolchain directory contains one of those
+characters runs uncached, since its dep-info could not be relocated to
+another worktree.
 
 **Plain Cargo: a wrapper you already chose.** When `RUSTC_WRAPPER`,
 `RUSTC_WORKSPACE_WRAPPER`, their `CARGO_BUILD_*` forms, or
@@ -78,8 +86,15 @@ A compile's key covers:
 - for an rlib compile, every file directly in each `-L` native search
   directory inside the workspace, target or package, so a static library an
   rlib bundles from another package's output, or from a directory of the
-  workspace, is keyed by content;
-- every `--extern` artifact by content.
+  workspace, is keyed by content (each directory is resolved as rustc opens
+  it, a link followed by `..` included);
+- every `--extern` artifact (`--extern NAME=PATH` or `--extern=NAME=PATH`)
+  by content.
+
+A worktree root in an argument or environment value is normalized only when
+it is followed by `/` or ends the value, so `<root> assets` or `<root>,v2`
+keeps its path; the two paths of a `--remap-path-prefix` value are
+normalized separately.
 
 An entry is a hit only while every file rustc's own dep-info listed when the
 entry was made still resolves to the same file with the same content. Paths

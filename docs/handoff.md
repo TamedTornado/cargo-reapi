@@ -5,7 +5,8 @@ native-rule narrowing and scheduling-key fix are merged to `main` at 33892a4;
 the pre-release review of 33892a4
 (`scratchpad/astra/reapi-0217.md`) found 6 ORDINARY and 5 EDGE findings. The
 fixes for all but finding 9 are on branch `prerelease-0217` (see "Pre-release
-fixes" below), pushed and **awaiting the coordinator's go-ahead to
+fixes" below), followed there by the fixes for the re-review of 9c47a94 (see
+"Re-review fixes"), pushed and **awaiting the coordinator's go-ahead to
 fast-forward `main`**. None of it is **released**: the version is still 0.2.10,
 there is no tag, nothing is published and nothing is installed. The
 whole-gate design and its review history are in Git (`main` at 86d3e1c and
@@ -268,14 +269,68 @@ pipelining 1, reinstall 1); fmt and clippy `-D warnings` clean on 1.93. The
 native, environment and compile-option tests also pass under
 `cargo +1.97.1`. README and CHANGELOG `[Unreleased]` describe the new rules.
 
+## Re-review fixes (same branch, after 9c47a94)
+
+The Astra re-review of 9c47a94 (`scratchpad/astra/reapi-0218.md`) found 3
+ORDINARY and 4 EDGE findings. Each was checked against the code and fixed on
+`prerelease-0217`, failing closed, with a regression test shown failing under
+a targeted mutation (reverted with `git apply -R` of its own diff):
+
+1. Old entries: `ACTION_KEY_NAMESPACE` is `cargo-reapi-action-v3`,
+   `ACTION_MANIFEST_VERSION` is 4. Unit test
+   `an_action_keyed_under_the_previous_namespace_has_another_key`
+   (src/action.rs); `an_action_entry_of_an_older_schema_is_a_miss_not_an_error`
+   now writes version 3.
+2. Roots end only before `/` or the end of the value
+   (`relocation::is_whole_root_at`, shared by compile relocation, keys and the
+   dep-info rewrite). Cargo-reapi's own `--remap-path-prefix FROM=TO`
+   arguments therefore have each side normalized separately
+   (`capture::logical_arguments`, split at the last `=` as rustc does);
+   without it no cross-worktree hit survives
+   (`a_build_directory_inside_the_package_is_not_among_its_inputs` fails).
+   `a_sibling_of_the_package_separated_by_a_space_keeps_its_path`
+   (tests/environment.rs).
+3. Dep-info escaping: verified with rustc 1.93 and 1.97.1 that prerequisite
+   paths escape only a space (`\ `; `#`, `$`, `:`, tab and others are
+   written raw, a newline breaks the line), and `env-dep` values escape `\`,
+   newline and carriage return. A package, workspace, target or toolchain
+   root containing any of space, `\`, newline or CR makes the compile
+   ineligible (`CaptureRoots::dep_info_escaping_reason`), on producer and
+   consumer alike. `a_workspace_whose_path_holds_a_space_runs_uncached`
+   (tests/action_cache.rs).
+4. `-L` directories are canonicalized from `cwd.join(path)`, not after the
+   lexical `absolute()`.
+   `a_search_directory_reached_through_a_link_and_its_parent_keys_the_compile`
+   (tests/native_libraries.rs).
+5. Deferred: symlink retargeting during a compile, filed as
+   [cargo-reapi#8](https://github.com/TamedTornado/cargo-reapi/issues/8).
+6. `capture::extern_paths` parses `--extern NAME=PATH` and
+   `--extern=NAME=PATH`; an extern path that is not a readable file is an
+   eligibility reason. `an_extern_artifact_named_in_the_attached_spelling_keys_the_compile`
+   (under the mutation the stale member rlib is restored and the binary fails
+   with E0460), `an_extern_artifact_that_cannot_be_read_runs_uncached`.
+7. Any `-Z` argument is ineligible (`invocation::unsupported_reason`).
+   Moria passes none (no `.cargo/config`, no rustflags in moria-env.sh,
+   stable 1.97.1 toolchain). `an_unstable_option_runs_uncached`
+   (tests/compile_options.rs).
+
+Suite: 139 tests pass with `--features test-hooks` (unit 65, action_cache
+14, capture 22, coalescing 1, compile_options 6, dependency_relocation 1,
+environment 14, maintenance 4, native_libraries 10, pipelining 1,
+reinstall 1); fmt and clippy `-D warnings` clean on 1.93. native_libraries,
+environment, compile_options and action_cache also pass under
+`cargo +1.97.1`. These runs used separate target directories
+(`/mnt/build/cargo-reapi-target-0218`, `-0218-197`) because of the stuck
+process below.
+
 Next: the coordinator reviews the range; after the go-ahead, fast-forward
 `main`, then the release rule below (Astra review of the exact commit before
 any bump).
 
 Unrelated: a `capture` test binary from an earlier run in this worktree
-(`target/debug/deps/capture-21da24fa96b372a7`, started 00:43, its fixture
-build script `network-input-fixture` hung) was still running; killing it was
-denied by the permission system, so it is left for Jason.
+(`target/debug/deps/capture-21da24fa96b372a7`, PID 139366, started 00:43,
+its fixture build script `network-input-fixture` hung) was still running;
+killing it was denied by the permission system, so it is left for Jason.
 
 ## Deferred (not approved): proc-macro and dylib caching
 
