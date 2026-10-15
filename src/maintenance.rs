@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,12 +42,7 @@ pub fn acquire_shared(cache_root: &Path) -> Result<CacheSharedGuard> {
 }
 
 fn open_lock(cache_root: &Path, name: &str) -> Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(cache_root.join(name))
+    crate::safe_io::open_lock(&cache_root.join(name))
         .context("opening cargo-reapi cache maintenance lock")
 }
 
@@ -80,7 +75,7 @@ pub fn record_access(cache_root: &Path, kind: AccessKind, key: &str) -> Result<(
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
         .as_millis();
-    fs::write(directory.join(key), format!("{timestamp}\n"))?;
+    crate::safe_io::write_replacing(&directory.join(key), format!("{timestamp}\n").as_bytes())?;
     Ok(())
 }
 
@@ -718,6 +713,7 @@ fn path_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;

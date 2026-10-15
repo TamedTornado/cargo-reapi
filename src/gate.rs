@@ -32,12 +32,6 @@ struct GateSnapshotManifest {
     relocation_files: Vec<PathBuf>,
     executable_relocations: Vec<ExecutableRelocation>,
     observed_inputs: Vec<ObservedGateInput>,
-    /// Files beneath `cargo-reapi/` that rustc's dep-info lists as read,
-    /// such as a generator's file in the build's temporary directory, with
-    /// their digests. They are not part of the target's identity check, so
-    /// they are checked by content. A snapshot that has any restores nowhere:
-    /// a consumer cannot have them.
-    administrative_inputs: BTreeMap<PathBuf, String>,
     /// The content digest of every file the snapshot holds, taken when it
     /// was published and verified before any restore.
     outputs: BTreeMap<PathBuf, String>,
@@ -63,8 +57,6 @@ struct ObservedGateInput {
 struct TargetMarker {
     key: String,
     outputs: BTreeMap<PathBuf, FileIdentity>,
-    /// See [`GateSnapshotManifest::administrative_inputs`].
-    administrative_inputs: BTreeMap<PathBuf, String>,
 }
 
 /// What identifies one file or link as the one a restore wrote: replacing
@@ -309,8 +301,9 @@ fn snapshot_files(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// The names cargo-reapi itself writes in its directory in a target.
-const ADMINISTRATIVE_ENTRIES: [&str; 6] = [
+const ADMINISTRATIVE_ENTRIES: [&str; 7] = [
     "actions.jsonl",
+    "gate-inputs.jsonl",
     "gate-state-v19",
     "hermetic-tmp",
     "output-records",
@@ -331,42 +324,6 @@ fn administrative_directory_is_ours(target: &Path) -> bool {
                 .to_str()
                 .is_some_and(|name| ADMINISTRATIVE_ENTRIES.contains(&name))
     })
-}
-
-/// The files beneath `cargo-reapi/` that the dependency files in the target
-/// list, with digests. Everything else the dependency files list is either
-/// hashed in the key or part of the target's identity check.
-fn collect_administrative_inputs(
-    target: &Path,
-    workspace: &Path,
-) -> Result<BTreeMap<PathBuf, String>> {
-    let administrative = target.join(ADMINISTRATIVE_DIRECTORY);
-    let mut inputs = BTreeMap::new();
-    for entry in WalkDir::new(target)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_administrative(target, entry.path()))
-    {
-        let entry = entry?;
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "d") {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&fs::read(entry.path())?).into_owned();
-        for listed in crate::capture::dep_info_paths(&text) {
-            let Ok(resolved) = workspace.join(&listed).canonicalize() else {
-                continue;
-            };
-            if resolved.is_file()
-                && let Ok(relative) = resolved.strip_prefix(&administrative)
-            {
-                inputs.insert(
-                    Path::new(ADMINISTRATIVE_DIRECTORY).join(relative),
-                    digest_file(&resolved)?,
-                );
-            }
-        }
-    }
-    Ok(inputs)
 }
 
 /// The digest of each file or link, a link by what it points to.
@@ -455,6 +412,19 @@ pub struct GateSnapshot {
     /// differently once it changes, so the gate is keyed on it and is not
     /// published if it changed while the gate ran.
     learned_environment: String,
+    /// Where the inputs a build observed are found.
+    scope: InputScope,
+}
+
+/// What publication needs to find and judge the inputs a build observed.
+#[derive(Default)]
+struct InputScope {
+    /// Every package of the resolve by name and root: Cargo records a
+    /// build script's `rerun-if-changed` paths relative to its package.
+    packages: Vec<(String, PathBuf)>,
+    /// Trees the gate key hashes or that are immutable by their lockfile
+    /// entry: an input beneath one needs no record of its own.
+    covered: Vec<PathBuf>,
 }
 
 impl GateSnapshot {
@@ -503,7 +473,9 @@ impl GateSnapshot {
             clone_method: "none",
             relocation_ms: 0,
             learned_environment,
+            scope: InputScope::of(project, declared_inputs, workspace),
         };
+        gate.forget_previous_link_inputs()?;
         if gate.is_published() && gate.observed_inputs_match()? {
             gate.restore_published()?;
             if gate.restored.happened() {
@@ -525,12 +497,7 @@ impl GateSnapshot {
         drop(maintenance);
 
         let lock_path = root.join("locks").join(format!("{key}.lock"));
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
+        let lock = crate::safe_io::open_lock(&lock_path)
             .with_context(|| format!("opening gate snapshot lock {}", lock_path.display()))?;
         let waited = match lock.try_lock_exclusive() {
             Ok(()) => false,
@@ -583,7 +550,7 @@ impl GateSnapshot {
             .prefix(GATE_STAGING_PREFIX)
             .tempdir_in(parent)?;
         let temporary = staging.path();
-        let observed_inputs = collect_observed_inputs(&self.target)?;
+        let observed_inputs = collect_observed_inputs(&self.target, &self.workspace, &self.scope)?;
         fs::create_dir_all(temporary.join("target"))?;
         clone_tree(&self.target, &temporary.join("target"))?;
         let generated = temporary.join("target/cargo-reapi");
@@ -608,7 +575,6 @@ impl GateSnapshot {
         )?;
         let produced = snapshot_files(&temporary.join("target"))?;
         let outputs = digest_files(&temporary.join("target"), &produced)?;
-        let administrative_inputs = collect_administrative_inputs(&self.target, &self.workspace)?;
         let manifest = GateSnapshotManifest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             key: self.key.clone(),
@@ -618,7 +584,6 @@ impl GateSnapshot {
             relocation_files,
             executable_relocations,
             observed_inputs,
-            administrative_inputs: administrative_inputs.clone(),
             outputs,
         };
         fs::write(
@@ -635,7 +600,7 @@ impl GateSnapshot {
         // The producer's target now holds exactly what was published, so the
         // next identical gate finds it and restores nothing.
         if target_files(&self.target)? == produced {
-            self.write_target_marker(&self.key, &produced, administrative_inputs)?;
+            self.write_target_marker(&self.key, &produced)?;
         }
         record_access(&self.cache_root, AccessKind::Gate, &self.key)?;
         self.unlock()
@@ -713,11 +678,6 @@ impl GateSnapshot {
                 manifest.key
             );
         }
-        if !manifest.administrative_inputs.is_empty() {
-            // The build read files beneath cargo-reapi's directory, which a
-            // consumer cannot have: there is nothing to check them against.
-            return Ok(());
-        }
         let produced = snapshot_files(&selected.join("target"))?;
         if !snapshot_matches_digests(&selected.join("target"), &produced, &manifest.outputs) {
             eprintln!(
@@ -740,7 +700,7 @@ impl GateSnapshot {
             &self.resource_ledger,
         )?;
         self.relocation_ms = relocation_started.elapsed().as_millis();
-        self.write_target_marker(&manifest.key, &produced, BTreeMap::new())?;
+        self.write_target_marker(&manifest.key, &produced)?;
         self.restored = Restoration::Cloned;
         Ok(())
     }
@@ -776,10 +736,6 @@ impl GateSnapshot {
         };
         marker.key == selected_key
             && administrative_directory_is_ours(&self.target)
-            && marker.administrative_inputs.iter().all(|(path, digest)| {
-                let path = self.target.join(path);
-                is_regular_file(&path) && digest_file(&path).is_ok_and(|actual| actual == *digest)
-            })
             && present.iter().eq(marker.outputs.keys())
             && marker.outputs.iter().all(|(path, recorded)| {
                 fs::symlink_metadata(self.target.join(path))
@@ -787,12 +743,7 @@ impl GateSnapshot {
             })
     }
 
-    fn write_target_marker(
-        &self,
-        selected_key: &str,
-        produced: &[PathBuf],
-        administrative_inputs: BTreeMap<PathBuf, String>,
-    ) -> Result<()> {
+    fn write_target_marker(&self, selected_key: &str, produced: &[PathBuf]) -> Result<()> {
         let mut outputs = BTreeMap::new();
         for path in produced {
             let metadata = fs::symlink_metadata(self.target.join(path))
@@ -803,7 +754,6 @@ impl GateSnapshot {
         let marker = serde_json::to_vec(&TargetMarker {
             key: selected_key.to_owned(),
             outputs,
-            administrative_inputs,
         })?;
         write_beneath_target(&self.target, &marker_relative(), &marker)
     }
@@ -1060,15 +1010,9 @@ fn hash_tree(
                 use std::os::unix::fs::PermissionsExt;
                 hash_field(hasher, &metadata.permissions().mode().to_le_bytes());
             }
-            let mut file = File::open(entry.path())?;
-            let mut buffer = vec![0_u8; 128 * 1024];
-            loop {
-                let count = file.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..count]);
-            }
+            // A file's contents are hashed apart and framed as one field, so
+            // that no two files' bytes can be rearranged into one another.
+            hash_field(hasher, digest_file(entry.path())?.as_bytes());
         }
     }
     Ok(())
@@ -1321,21 +1265,30 @@ fn hash_git_repository(hasher: &mut Sha256, repository: &Path, name: &Path) -> R
     Ok(())
 }
 
-/// Whether a file under `objects` is named by what it holds: a loose object,
-/// or a pack's data.
+/// Whether a file under `objects` is named by what it holds. Only two shapes
+/// are: a loose object, `xx/` and thirty-eight hex digits, and a pack's data,
+/// `pack/pack-<hex>.pack`. Everything else (`info`, indexes, `.keep` and
+/// `.rev` files, `multi-pack-index`, anything a later Git adds) is state its
+/// name does not identify, and is hashed by content.
 fn is_content_addressed_object(path: &Path, objects: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(objects) else {
         return false;
     };
-    if relative.starts_with("info") {
-        return false;
+    let parts = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    let is_hex = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit());
+    match parts.as_slice() {
+        ["pack", name] => name
+            .strip_prefix("pack-")
+            .and_then(|rest| rest.strip_suffix(".pack"))
+            .is_some_and(is_hex),
+        [directory, name] => {
+            directory.len() == 2 && is_hex(directory) && name.len() == 38 && is_hex(name)
+        }
+        _ => false,
     }
-    let by_content = path.extension().is_some_and(|extension| {
-        ["idx", "keep", "rev", "bitmap", "mtimes"]
-            .iter()
-            .any(|own| extension == *own)
-    });
-    !by_content
 }
 
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
@@ -1979,57 +1932,194 @@ fn unix_ms() -> u128 {
         .as_millis()
 }
 
-fn collect_observed_inputs(target: &Path) -> Result<Vec<ObservedGateInput>> {
-    let mut inputs = Vec::new();
-    for entry in WalkDir::new(target).follow_links(false) {
+/// Every input any action of the build observed outside the trees the gate
+/// key hashes, each with its digest, so a hit can check them all by content:
+///
+/// - the paths and variables build scripts declared (`rerun-if-changed` paths
+///   are relative to their package in Cargo's fingerprints, so each is
+///   resolved against every package of that name);
+/// - every file the compiles' own dependency files list that lies outside the
+///   hashed trees, or beneath cargo-reapi's directory in the target;
+/// - the native inputs the action cache discovered for links, and the linker.
+///
+/// A hit that cannot verify one of them is a miss.
+fn collect_observed_inputs(
+    target: &Path,
+    workspace: &Path,
+    scope: &InputScope,
+) -> Result<Vec<ObservedGateInput>> {
+    let administrative = target.join(ADMINISTRATIVE_DIRECTORY);
+    let mut paths = BTreeSet::new();
+    let mut variables = BTreeSet::new();
+    for entry in WalkDir::new(target)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.path() != administrative)
+    {
         let entry = entry?;
-        if !entry.file_type().is_file()
-            || entry
-                .path()
-                .extension()
-                .is_none_or(|extension| extension != "json")
-            || !entry
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_fingerprint = entry.path().extension().is_some_and(|e| e == "json")
+            && entry
                 .path()
                 .components()
-                .any(|component| component.as_os_str() == ".fingerprint")
-        {
-            continue;
+                .any(|component| component.as_os_str() == ".fingerprint");
+        if is_fingerprint {
+            collect_build_script_inputs(entry.path(), scope, &mut paths, &mut variables)?;
+        } else if entry.path().extension().is_some_and(|e| e == "d") {
+            collect_dependency_file_inputs(entry.path(), target, workspace, scope, &mut paths)?;
         }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&fs::read(entry.path())?)
-        else {
-            continue;
-        };
-        for local in value["local"].as_array().into_iter().flatten() {
-            if let Some(changed) = local.get("RerunIfChanged") {
-                for path in changed["paths"].as_array().into_iter().flatten() {
-                    let Some(path) = path.as_str() else {
-                        continue;
-                    };
-                    let path = PathBuf::from(path);
-                    if path.is_absolute() {
-                        let name = path.to_string_lossy().into_owned();
-                        inputs.push(ObservedGateInput {
-                            kind: "path".to_owned(),
-                            sha256: observed_input_digest("path", &name),
-                            name,
-                        });
-                    }
-                }
-            }
-            if let Some(changed) = local.get("RerunIfEnvChanged")
-                && let Some(name) = changed["var"].as_str()
+    }
+    if let Ok(recorded) = fs::read_to_string(administrative.join(LINK_INPUTS_FILE)) {
+        for line in recorded.lines() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(path) = value["path"].as_str()
             {
-                inputs.push(ObservedGateInput {
-                    kind: "environment".to_owned(),
-                    name: name.to_owned(),
-                    sha256: observed_input_digest("environment", name),
-                });
+                paths.insert(PathBuf::from(path));
             }
         }
+    }
+
+    let mut inputs = Vec::new();
+    for path in paths {
+        let name = path.to_string_lossy().into_owned();
+        inputs.push(ObservedGateInput {
+            kind: "path".to_owned(),
+            sha256: observed_input_digest("path", &name),
+            name,
+        });
+    }
+    for name in variables {
+        inputs.push(ObservedGateInput {
+            kind: "environment".to_owned(),
+            sha256: observed_input_digest("environment", &name),
+            name,
+        });
     }
     inputs.sort();
     inputs.dedup();
     Ok(inputs)
+}
+
+/// The file in cargo-reapi's directory where the compiler wrapper records the
+/// native inputs of every link it makes, one JSON line each.
+pub const LINK_INPUTS_FILE: &str = "gate-inputs.jsonl";
+
+fn collect_build_script_inputs(
+    fingerprint: &Path,
+    scope: &InputScope,
+    paths: &mut BTreeSet<PathBuf>,
+    variables: &mut BTreeSet<String>,
+) -> Result<()> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&fs::read(fingerprint)?) else {
+        return Ok(());
+    };
+    for local in value["local"].as_array().into_iter().flatten() {
+        if let Some(changed) = local.get("RerunIfChanged") {
+            // `build/<package>-<hash>/output` names the package.
+            let package = changed["output"]
+                .as_str()
+                .and_then(|output| Path::new(output).parent())
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.rsplit_once('-'))
+                .map(|(name, _)| name);
+            for path in changed["paths"].as_array().into_iter().flatten() {
+                let Some(path) = path.as_str().map(PathBuf::from) else {
+                    continue;
+                };
+                if path.is_absolute() {
+                    paths.insert(path);
+                    continue;
+                }
+                for (name, root) in &scope.packages {
+                    if Some(name.as_str()) == package {
+                        paths.insert(root.join(&path));
+                    }
+                }
+            }
+        }
+        if let Some(changed) = local.get("RerunIfEnvChanged")
+            && let Some(name) = changed["var"].as_str()
+        {
+            variables.insert(name.to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn collect_dependency_file_inputs(
+    dependency_file: &Path,
+    target: &Path,
+    workspace: &Path,
+    scope: &InputScope,
+    paths: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let text = String::from_utf8_lossy(&fs::read(dependency_file)?).into_owned();
+    let administrative = target.join(ADMINISTRATIVE_DIRECTORY);
+    for listed in crate::capture::dep_info_paths(&text) {
+        let Ok(resolved) = workspace.join(&listed).canonicalize() else {
+            continue;
+        };
+        let record = if resolved.starts_with(&administrative) {
+            // Beneath cargo-reapi's directory, which the target's identity
+            // check leaves out.
+            true
+        } else if resolved.starts_with(target) {
+            // Part of the target's identity check.
+            false
+        } else {
+            !scope.covered.iter().any(|root| resolved.starts_with(root))
+        };
+        if record {
+            paths.insert(resolved);
+        }
+    }
+    Ok(())
+}
+
+impl InputScope {
+    fn of(project: &Project, declared_inputs: &[PathBuf], workspace: &Path) -> Self {
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut covered = vec![canonical(workspace), project.workspace_root.clone()];
+        covered.extend(
+            project
+                .packages
+                .iter()
+                .filter(|package| package.local)
+                .map(|package| package.root.clone()),
+        );
+        covered.extend(
+            declared_inputs
+                .iter()
+                .map(|input| canonical(&workspace.join(input))),
+        );
+        if let Some(home) = crate::cargo_config::cargo_home() {
+            let home = canonical(&home);
+            covered.push(home.join("registry"));
+            covered.push(home.join("git/checkouts"));
+        }
+        Self {
+            packages: project
+                .packages
+                .iter()
+                .map(|package| (package.name.clone(), package.root.clone()))
+                .collect(),
+            covered,
+        }
+    }
+}
+
+impl GateSnapshot {
+    /// Clears the record of the last run's link inputs, which this run writes
+    /// afresh.
+    fn forget_previous_link_inputs(&self) -> Result<()> {
+        remove_beneath_target(
+            &self.target,
+            &Path::new(ADMINISTRATIVE_DIRECTORY).join(LINK_INPUTS_FILE),
+        )
+    }
 }
 
 fn observed_input_digest(kind: &str, name: &str) -> String {
@@ -2121,6 +2211,49 @@ mod tests {
         assert_ne!(super::observed_input_digest("path", &name), before);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tree_hashing_frames_file_contents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Files `a.bin` and `b.bin`, then `a.bin` grown by what hashing
+        // contributes for `b.bin` and `b.bin` deleted. Unframed contents made
+        // the two trees hash the same bytes.
+        let root = tempfile::tempdir().expect("root");
+        let target = root.path().join("target");
+        let log = root.path().join("log");
+        let tree = |name: &str| {
+            let mut hasher = Sha256::new();
+            super::hash_tree(&mut hasher, &root.path().join(name), "tree", &target, &log)
+                .expect("hash");
+            format!("{:x}", hasher.finalize())
+        };
+        let frame = |value: &[u8]| {
+            let mut framed = value.len().to_le_bytes().to_vec();
+            framed.extend_from_slice(value);
+            framed
+        };
+        let first = root.path().join("first");
+        fs::create_dir_all(&first).expect("first");
+        fs::write(first.join("a.bin"), "A").expect("a");
+        fs::write(first.join("b.bin"), "B").expect("b");
+        let mode = fs::metadata(first.join("b.bin"))
+            .expect("metadata")
+            .permissions()
+            .mode();
+
+        let mut crafted = b"A".to_vec();
+        crafted.extend(frame(b"tree"));
+        crafted.extend(frame(b"b.bin"));
+        crafted.extend(frame(&mode.to_le_bytes()));
+        crafted.extend(b"B");
+        let second = root.path().join("second");
+        fs::create_dir_all(&second).expect("second");
+        fs::write(second.join("a.bin"), &crafted).expect("a");
+
+        assert_ne!(tree("first"), tree("second"));
+    }
+
     #[test]
     fn git_object_metadata_is_hashed_by_content_and_objects_by_name() {
         use sha2::{Digest, Sha256};
@@ -2130,6 +2263,7 @@ mod tests {
         fs::create_dir_all(repository.join("objects/info")).expect("info");
         fs::create_dir_all(repository.join("objects/pack")).expect("pack");
         fs::create_dir_all(repository.join("objects/ab")).expect("loose");
+        const LOOSE: &str = "0123456789abcdef0123456789abcdef01234567";
         let hash = |repository: &Path| {
             let mut hasher = Sha256::new();
             super::hash_git_repository(&mut hasher, repository, Path::new("checkouts/x"))
@@ -2142,8 +2276,15 @@ mod tests {
         write("objects/info/alternates", "/pool/one");
         write("objects/pack/pack-1.idx", "index one");
         write("objects/pack/pack-1.pack", "data one");
-        write("objects/ab/cdef", "loose one");
+        write(&format!("objects/ab/{LOOSE}"), "loose one");
+        write("objects/pack/multi-pack-index", "preferred one");
         let original = hash(&repository);
+
+        // The multi-pack index is no object name: other content of the same
+        // length changes the hash.
+        write("objects/pack/multi-pack-index", "preferred two");
+        assert_ne!(hash(&repository), original);
+        write("objects/pack/multi-pack-index", "preferred one");
 
         // Same length, other content: metadata changes the hash.
         write("objects/info/alternates", "/pool/two");
@@ -2154,7 +2295,7 @@ mod tests {
 
         // Content-addressed files are named by what they hold.
         write("objects/pack/pack-1.pack", "data two");
-        write("objects/ab/cdef", "loose two");
+        write(&format!("objects/ab/{LOOSE}"), "loose two");
         let named = hash(&repository);
         write("objects/pack/pack-1.pack", "data 333");
         assert_eq!(hash(&repository), named);

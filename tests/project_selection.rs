@@ -2475,3 +2475,212 @@ fn a_hard_linked_action_log_is_replaced_never_appended_to() {
         "the hit was not recorded"
     );
 }
+
+/// Astra 0.2.15 finding 1: a declared directory in the build's temporary
+/// directory, which Cargo records relative to the package.
+#[test]
+fn a_declared_directory_in_the_temporary_directory_is_checked_on_a_hit() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("build.rs"),
+        r#"fn main() {
+    let directory = std::env::temp_dir().join("schemas");
+    std::fs::create_dir_all(&directory).expect("directory");
+    let first = directory.join("one.txt");
+    if !first.exists() {
+        std::fs::write(&first, "v1").expect("generate");
+    }
+    let mut contents = std::fs::read_dir(&directory)
+        .expect("read")
+        .flatten()
+        .map(|entry| std::fs::read_to_string(entry.path()).expect("read file"))
+        .collect::<Vec<_>>();
+    contents.sort();
+    println!("cargo:rerun-if-changed={}", directory.display());
+    println!("cargo:rustc-env=SCHEMAS={}", contents.join(","));
+}
+"#,
+    )
+    .expect("build script");
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"SCHEMAS\")); }\n",
+    )
+    .expect("main source");
+    fixture.lock(&project);
+    let binary = project.join("target/debug/project");
+
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    assert_eq!(run(&binary), "v1");
+    fs::write(
+        project.join("target/cargo-reapi/hermetic-tmp/schemas/one.txt"),
+        "v2",
+    )
+    .expect("edit the generated file");
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+
+    assert_eq!(run(&binary), "v2");
+}
+
+/// Astra 0.2.15 finding 2: a static library outside the project, replaced
+/// between runs, with the target removed so that only a whole-gate restore
+/// could return the old binary.
+#[cfg(unix)]
+#[test]
+fn a_native_library_replaced_between_runs_is_never_restored_stale() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    let native = fixture.cache.join("native");
+    fs::create_dir_all(&native).expect("native directory");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("build.rs"),
+        format!(
+            "fn main() {{\n    println!(\"cargo:rustc-link-search=native={}\");\n}}\n",
+            native.display()
+        ),
+    )
+    .expect("build script");
+    fs::write(
+        project.join("src/main.rs"),
+        "#[link(name = \"answer\", kind = \"static\")]\nunsafe extern \"C\" {\n    fn answer() -> i32;\n}\n\nfn main() {\n    println!(\"{}\", unsafe { answer() });\n}\n",
+    )
+    .expect("main source");
+    fixture.lock(&project);
+    let install = |value: u8| {
+        fs::write(
+            native.join("answer.c"),
+            format!("int answer(void) {{ return {value}; }}\n"),
+        )
+        .expect("C source");
+        for arguments in [
+            vec!["cc", "-c", "answer.c", "-o", "answer.o"],
+            vec!["ar", "rcs", "libanswer.a", "answer.o"],
+        ] {
+            let status = Command::new(arguments[0])
+                .args(&arguments[1..])
+                .current_dir(&native)
+                .status()
+                .expect("run the C toolchain");
+            assert!(status.success(), "{arguments:?} failed");
+        }
+    };
+    install(1);
+    let binary = project.join("target/debug/project");
+
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    assert_eq!(run(&binary), "1");
+    install(2);
+    fs::remove_dir_all(project.join("target")).expect("retire the target");
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+
+    assert_eq!(run(&binary), "2");
+}
+
+/// Astra 0.2.15 findings 3 and 4: the action log and the sandbox policy file
+/// are hard-linked to the lockfile before a run that misses the gate.
+#[cfg(unix)]
+#[test]
+fn hard_linked_log_and_policy_files_never_reach_the_lockfile_on_a_miss() {
+    for file in ["actions.jsonl", "srt-policy-v1.json"] {
+        let fixture = Fixture::new();
+        let project = fixture.path("project");
+        write_package(&project, "project", "unused", "");
+        fixture.lock(&project);
+        assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+        let lockfile = fs::read(project.join("Cargo.lock")).expect("lockfile");
+        let planted = project.join("target/cargo-reapi").join(file);
+        fs::remove_file(&planted).expect("remove the file");
+        fs::hard_link(project.join("Cargo.lock"), &planted).expect("hard link");
+
+        // `check` is another gate, so this run misses and compiles.
+        let output = fixture.cargo_reapi(&project, &["check"]);
+
+        assert!(output.status.success(), "{file}: {}", stderr(&output));
+        assert_eq!(
+            fs::read(project.join("Cargo.lock")).expect("lockfile"),
+            lockfile,
+            "{file} reached the lockfile"
+        );
+    }
+}
+
+/// Astra 0.2.15 finding 9: the cache's maintenance lock is replaced by a link
+/// to a source file that does not exist.
+#[cfg(unix)]
+#[test]
+fn a_planted_lock_link_never_creates_a_source_file() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("build.rs"),
+        r#"use std::os::unix::fs::symlink;
+use std::path::Path;
+
+fn main() {
+    let cache = std::env::var("CARGO_REAPI_CACHE_DIR").expect("cache");
+    let lock = Path::new(&cache).join(".maintenance-admission.lock");
+    let created = Path::new(&std::env::var("CARGO_MANIFEST_DIR").expect("manifest")).join("src/created.rs");
+    let _ = std::fs::remove_file(&lock);
+    let _ = symlink(created, lock);
+}
+"#,
+    )
+    .expect("build script");
+    fixture.lock(&project);
+
+    let _ = fixture.cargo_reapi(&project, &["build"]);
+
+    assert!(
+        !project.join("src/created.rs").exists(),
+        "a lock open created a source file"
+    );
+}
+
+/// Astra 0.2.15 findings 7 and 8: options and arguments `run` cannot take.
+#[test]
+fn run_with_options_or_arguments_cargo_would_reject_is_declined_before_any_build() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "app", "");
+    fixture.lock(&project);
+
+    for arguments in [
+        &["run", "--all-targets"][..],
+        &["run", "--workspace"],
+        &["run", "hello"],
+        &["run", "--release", "hello", "world"],
+    ] {
+        let output = fixture.cargo_reapi(&project, arguments);
+        assert_declined(&output, "");
+        assert!(
+            !cache_holds_a_snapshot(&fixture),
+            "{arguments:?} built and published"
+        );
+    }
+}
+
+/// Astra 0.2.15 finding 10: a fully qualified package id.
+#[test]
+fn run_accepts_cargos_own_package_id() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "named", "");
+    fixture.lock(&project);
+    let pkgid = Command::new("cargo")
+        .args(["pkgid", "-p", "project"])
+        .current_dir(&project)
+        .env("CARGO_HOME", &fixture.cargo_home)
+        .output()
+        .expect("cargo pkgid");
+    let pkgid = String::from_utf8_lossy(&pkgid.stdout).trim().to_owned();
+
+    let output = fixture.cargo_reapi(&project, &["run", "-p", &pkgid, "--bin", "project"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "named");
+    assert_succeeded(&output);
+}

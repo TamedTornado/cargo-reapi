@@ -146,7 +146,7 @@ fn strict_cargo_command(
     };
     let policy = build_policy(&paths, &control_temporary, explicit_inputs)?;
     let policy_path = target.join("cargo-reapi/srt-policy-v1.json");
-    fs::write(&policy_path, canonical_policy_bytes(&policy)?)
+    crate::safe_io::write_replacing(&policy_path, &canonical_policy_bytes(&policy)?)
         .with_context(|| format!("writing srt policy {}", policy_path.display()))?;
 
     let cargo = resolve_toolchain_executable("cargo")
@@ -949,8 +949,28 @@ fn create_file_and_canonicalize(path: &Path, label: &str) -> Result<PathBuf> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating {label} parent {}", parent.display()))?;
     }
-    if !path.exists() {
-        fs::write(&path, b"").with_context(|| format!("creating {label} {}", path.display()))?;
+    // The sandbox binds this file into the build, so it must be a regular
+    // file nothing else is linked to: a hard link planted in an earlier run
+    // would otherwise be writable from inside. Anything else is replaced.
+    #[cfg(unix)]
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        use std::os::unix::fs::MetadataExt;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            fs::remove_file(&path)
+                .with_context(|| format!("replacing {label} {}", path.display()))?;
+        }
+    }
+    // Created, never truncated, and never through a link.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("creating {label} {}", path.display()));
+        }
     }
     canonical_or_absolute(&path)
 }

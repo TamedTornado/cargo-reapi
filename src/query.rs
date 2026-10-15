@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -87,12 +87,7 @@ fn cached_query(
     }
 
     let lock_path = root.join("locks").join(format!("{key}.lock"));
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
+    let lock = crate::safe_io::open_lock(&lock_path)?;
     lock.lock_exclusive()?;
     if let Some(response) = load_response(&object, &key)? {
         FileExt::unlock(&lock)?;

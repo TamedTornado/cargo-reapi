@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -847,14 +845,8 @@ fn append_capture(path: &Path, capture: &ActionCapture) -> Result<()> {
             .with_context(|| format!("creating action log directory {}", parent.display()))?;
     }
     let line = serde_json::to_string(capture).context("serializing action capture")?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening action log {}", path.display()))?;
-    file.lock_exclusive().context("locking action log")?;
-    writeln!(file, "{line}").context("writing action capture")?;
-    FileExt::unlock(&file).context("unlocking action log")
+    crate::safe_io::append_line(path, &line)
+        .with_context(|| format!("writing action log {}", path.display()))
 }
 
 fn display(path: &Path) -> String {

@@ -237,11 +237,19 @@ impl Project {
             }
             [spec] => {
                 require_exact(spec)?;
+                // A spec is a name, `name@version`, or Cargo's own package id
+                // from `cargo pkgid`; an id is matched whole, against the id
+                // `cargo metadata` gives the package.
                 let name = spec.split_once('@').map_or(spec.as_str(), |(name, _)| name);
                 let matching = self
                     .packages
                     .iter()
-                    .filter(|package| package.name == name && package.local)
+                    .filter(|package| {
+                        package.local
+                            && (package.name == name
+                                || package.id == *spec
+                                || package.id.strip_prefix("path+") == Some(spec.as_str()))
+                    })
                     .collect::<Vec<_>>();
                 if matching.len() != 1 {
                     bail!("-p {spec} names {} local packages", matching.len());

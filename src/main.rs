@@ -18,6 +18,7 @@ mod query;
 mod reclient;
 mod relocation;
 mod resource;
+mod safe_io;
 mod selection;
 
 use std::env;
@@ -536,7 +537,15 @@ fn run_with(cli: &Cli, context: DriverContext, cargo_args: &[OsString]) -> Resul
         )
         .env("CARGO_REAPI_ACTION_LOG", action_log)
         .env("CARGO_REAPI_WORKSPACE_ROOT", workspace_root)
-        .env("CARGO_REAPI_TARGET_ROOT", target_root);
+        .env("CARGO_REAPI_TARGET_ROOT", &target_root);
+    if project.is_some() {
+        cargo.env(
+            "CARGO_REAPI_GATE_INPUTS",
+            target_root
+                .join(crate::gate::ADMINISTRATIVE_DIRECTORY)
+                .join(crate::gate::LINK_INPUTS_FILE),
+        );
+    }
     if matches!(cli.backend, Backend::Cache) {
         let default_linker = cache::default_linker_for_sandbox()?;
         cargo.env("CARGO_REAPI_DEFAULT_LINKER", &default_linker);

@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -227,12 +227,7 @@ fn lock_action(options: &CacheOptions, action_key: &str) -> Result<(File, bool)>
         .root
         .join("locks")
         .join(format!("{action_key}.lock"));
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
+    let lock = crate::safe_io::open_lock(&lock_path)
         .with_context(|| format!("opening action lock {}", lock_path.display()))?;
     let coalesced = match lock.try_lock_exclusive() {
         Ok(()) => false,
@@ -423,6 +418,7 @@ fn execute_cached_link(
     let (lock, coalesced) = lock_action(cache_options, &base_action_key)?;
 
     if let Some(discovery) = load_link_discovery(cache_options, &base_action_key, &prepared)? {
+        record_link_inputs(&discovery);
         prepared.action_key = discovered_action_key(&base_action_key, &discovery)?;
         let withheld = withheld_by_cached_entry(cache_options, &prepared, environment);
         if !withheld.is_empty() {
@@ -485,6 +481,7 @@ fn execute_cached_link(
             &real_linker,
         ) {
             Ok(discovery) => {
+                record_link_inputs(&discovery);
                 prepared.action_key = discovered_action_key(&base_action_key, &discovery)?;
                 publish_link_discovery(cache_options, &discovery)?;
                 if publish(cache_options, invocation, &prepared)? {
@@ -515,6 +512,26 @@ fn execute_cached_link(
     };
     FileExt::unlock(&lock).context("unlocking linked action cache entry")?;
     Ok(result)
+}
+
+/// Tells the gate which native inputs this link read, outside the trees it
+/// hashes, so that a whole-gate hit can check them by content as the action
+/// cache does for the link itself. The linker is among them.
+fn record_link_inputs(discovery: &LinkDiscovery) {
+    let Some(record) = std::env::var_os("CARGO_REAPI_GATE_INPUTS") else {
+        return;
+    };
+    for input in &discovery.inputs {
+        let inside_roots = ["target/", "package/", "workspace/"]
+            .iter()
+            .any(|root| input.logical_path.starts_with(root));
+        if inside_roots {
+            continue;
+        }
+        let line = serde_json::json!({ "path": input.actual_path }).to_string();
+        // Best effort: without the record the gate cannot reuse this build.
+        let _ = crate::safe_io::append_line(Path::new(&record), &line);
+    }
 }
 
 fn resolve_real_linker(invocation: &RustcInvocation) -> Result<PathBuf> {

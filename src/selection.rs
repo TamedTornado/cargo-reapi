@@ -123,6 +123,10 @@ pub struct Selection {
     pub opens_viewer: bool,
     /// How many `--bin` and `--example` options were given.
     pub target_options: usize,
+    /// Arguments that are neither options nor their values.
+    pub positionals: usize,
+    /// The names of the long options given before `--`.
+    pub long_options: Vec<String>,
     /// `-p`, `--workspace` or `--exclude` was given.
     pub selects_packages: bool,
     /// `--help`, `-h`, `--version`, `-V` or `--list` was given: Cargo answers
@@ -147,10 +151,57 @@ impl Selection {
                  not --help or --version",
             );
         }
-        self.opens_viewer
-            .then_some("`--open` opens a viewer that a cache hit would skip")
+        if self.opens_viewer {
+            return Some("`--open` opens a viewer that a cache hit would skip");
+        }
+        if self
+            .command
+            .as_deref()
+            .is_some_and(|c| c == "run" || c == "r")
+        {
+            if self
+                .long_options
+                .iter()
+                .any(|option| RUN_REJECTED_OPTIONS.contains(&option.as_str()))
+            {
+                return Some(
+                    "`run` was given an option only `build` takes; Cargo's `run` rejects it, and \
+                     building first would compile what it never would",
+                );
+            }
+            if self.positionals > 0 {
+                return Some(
+                    "`run` has arguments after its options without `--`, which Cargo passes to \
+                     the program and cargo-reapi cannot tell from a build argument",
+                );
+            }
+        }
+        None
     }
 }
+
+/// Options the cached subcommands accept that `cargo run` does not: a `run`
+/// that is given one fails in Cargo, after a build of the same arguments
+/// would have compiled and published what `run` never builds.
+const RUN_REJECTED_OPTIONS: [&str; 17] = [
+    "all",
+    "all-targets",
+    "bench",
+    "benches",
+    "bins",
+    "doc",
+    "document-private-items",
+    "examples",
+    "exclude",
+    "lib",
+    "no-deps",
+    "no-fail-fast",
+    "no-run",
+    "open",
+    "test",
+    "tests",
+    "workspace",
+];
 
 /// A `--bin` or `--example` option: absent, given without a name, or named.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -251,6 +302,8 @@ struct Reader<'a> {
     example: NamedTarget,
     opens_viewer: bool,
     target_options: usize,
+    positionals: usize,
+    long_options: Vec<String>,
 }
 
 impl<'a> Reader<'a> {
@@ -271,6 +324,8 @@ impl<'a> Reader<'a> {
             example: NamedTarget::Absent,
             opens_viewer: false,
             target_options: 0,
+            positionals: 0,
+            long_options: Vec::new(),
         }
     }
 
@@ -334,12 +389,14 @@ impl<'a> Reader<'a> {
         {
             self.shorts(shorts, remaining)
         } else {
+            self.positionals += 1;
             Ok(())
         }
     }
 
     fn long(&mut self, long: &str, remaining: &mut Remaining<'_>) -> Result<()> {
         let (name, attached) = split_long(long);
+        self.long_options.push(name.to_owned());
         let attached_or_next =
             |remaining: &mut Remaining<'_>| attached.clone().or_else(|| remaining.next().cloned());
 
@@ -561,6 +618,8 @@ impl<'a> Reader<'a> {
             example: self.example,
             opens_viewer: self.opens_viewer,
             target_options: self.target_options,
+            positionals: self.positionals,
+            long_options: self.long_options,
             selects_packages: self.selects_packages,
             informational: self.informational,
         })

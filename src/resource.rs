@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -163,7 +163,10 @@ fn record_progress(marker: &Path) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     // Best effort: a lost write can only shorten a waiter's patience.
-    let _ = fs::write(marker, format!("{}:{nanos}", std::process::id()));
+    let _ = crate::safe_io::write_replacing(
+        marker,
+        format!("{}:{nanos}", std::process::id()).as_bytes(),
+    );
 }
 
 /// Retries `attempt` until it yields a value. Waiting behind other leases is
@@ -305,12 +308,7 @@ fn try_acquire_tokens(
     let initial = acquired.len();
     for index in 0..capacity {
         let path = root.join(format!("{index}.lock"));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
+        let file = crate::safe_io::open_lock(&path)
             .with_context(|| format!("opening resource token {}", path.display()))?;
         match file.try_lock_exclusive() {
             Ok(()) => acquired.push(file),
