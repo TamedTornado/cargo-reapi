@@ -36,6 +36,8 @@ pub struct Package {
     pub root: PathBuf,
     /// A package built from a local path rather than a registry or Git.
     pub local: bool,
+    /// A package built from a Git checkout in Cargo's home.
+    pub git: bool,
     /// The directories holding the package's target sources (`src`,
     /// `src/bin`, `examples`, `tests`, `benches` and any other), other than
     /// the package root itself.
@@ -213,6 +215,9 @@ impl Package {
             default_run: package["default_run"].as_str().map(str::to_owned),
             root,
             local: package["source"].is_null(),
+            git: package["source"]
+                .as_str()
+                .is_some_and(|source| source.starts_with("git+")),
             source_directories,
         })
     }

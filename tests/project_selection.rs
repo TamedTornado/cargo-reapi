@@ -1795,3 +1795,384 @@ fn an_action_entry_of_an_older_schema_is_a_miss_not_an_error() {
     let log = fs::read_to_string(project.join("target/cargo-reapi/actions.jsonl")).expect("log");
     assert!(log.contains("\"local-cache-miss\""), "{log}");
 }
+
+/// Astra 0.2.13 finding 1: a build script plants a link where the driver will
+/// write the marker once the build has finished.
+#[cfg(unix)]
+#[test]
+fn a_link_planted_during_the_build_never_redirects_the_marker() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("build.rs"),
+        r#"use std::os::unix::fs::symlink;
+use std::path::Path;
+
+fn main() {
+    let out = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let target = Path::new(&out).ancestors().nth(4).expect("target");
+    let source = Path::new(&std::env::var("CARGO_MANIFEST_DIR").expect("manifest")).join("src/main.rs");
+    let marker = target.join("cargo-reapi/gate-state-v19");
+    let _ = std::fs::remove_file(&marker);
+    symlink(source, marker).expect("plant the link");
+}
+"#,
+    )
+    .expect("build script");
+    let source = fs::read(project.join("src/main.rs")).expect("source");
+    fixture.lock(&project);
+
+    let output = fixture.cargo_reapi(&project, &["build"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read(project.join("src/main.rs")).expect("source"),
+        source
+    );
+}
+
+/// Astra 0.2.13 finding 2: a published snapshot holds an entry under cargo-reapi's
+/// own directory, which restoration would copy and the hit record would write
+/// through.
+#[cfg(unix)]
+#[test]
+fn a_snapshot_entry_that_was_never_verified_is_never_restored() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "intact", "");
+    fixture.lock(&project);
+    let first = fixture.path("first-target");
+    let second = fixture.path("second-target");
+    let lockfile = fs::read(project.join("Cargo.lock")).expect("lockfile");
+    assert_succeeded(&fixture.cargo_reapi_with(
+        &project,
+        &["build"],
+        &[("CARGO_TARGET_DIR", first.as_os_str())],
+    ));
+    let published = fs::read_dir(fixture.cache.join("gate-snapshots/objects"))
+        .expect("snapshots")
+        .next()
+        .expect("a snapshot")
+        .expect("entry")
+        .path();
+    let administrative = published.join("target/cargo-reapi");
+    fs::create_dir_all(&administrative).expect("administrative directory");
+    std::os::unix::fs::symlink(
+        project.join("Cargo.lock"),
+        administrative.join("actions.jsonl"),
+    )
+    .expect("link the log");
+
+    let output = fixture.cargo_reapi_with(
+        &project,
+        &["build"],
+        &[("CARGO_TARGET_DIR", second.as_os_str())],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("failed its content check"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        fs::read(project.join("Cargo.lock")).expect("lockfile"),
+        lockfile
+    );
+}
+
+/// Astra 0.2.13 finding 3: a directory of the project's own that is named
+/// `.fingerprint`.
+#[test]
+fn fingerprint_invalidation_removes_only_cargos_own_directories() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"{}\", include_str!(\"../target/data/.fingerprint/message.txt\")); }\n",
+    )
+    .expect("main source");
+    let message = project.join("target/data/.fingerprint/message.txt");
+    fs::create_dir_all(message.parent().expect("directory")).expect("directory");
+    fs::write(&message, "original").expect("message");
+    fixture.lock(&project);
+    let binary = project.join("target/debug/project");
+
+    // The second run plans again, which clears Cargo's own fingerprints.
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+
+    assert!(message.exists(), "the project's own input was removed");
+    assert_eq!(run(&binary), "original");
+}
+
+/// Astra 0.2.13 finding 4: an input under cargo-reapi's own directory name.
+#[test]
+fn an_input_beneath_the_administrative_directory_is_never_a_stale_hit() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"{}\", include_str!(\"../target/cargo-reapi/message.txt\")); }\n",
+    )
+    .expect("main source");
+    let message = project.join("target/cargo-reapi/message.txt");
+    fs::create_dir_all(message.parent().expect("directory")).expect("directory");
+    fs::write(&message, "original").expect("message");
+    fixture.lock(&project);
+    let binary = project.join("target/debug/project");
+
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    assert_eq!(run(&binary), "original");
+    fs::write(&message, "edited").expect("edit message");
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+
+    assert_eq!(run(&binary), "edited");
+}
+
+/// Astra 0.2.13 finding 5: the file rustc read is the one that is checked,
+/// whatever links and backslashes are in its name.
+#[cfg(unix)]
+#[test]
+fn dep_info_inputs_are_checked_as_rustc_read_them() {
+    let fixture = Fixture::new();
+    let workspace = fixture.path("workspace");
+    fs::create_dir_all(workspace.join("shared/subdir")).expect("shared directory");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = ['member']\nresolver = '3'\n",
+    )
+    .expect("workspace manifest");
+    write_package(&workspace.join("member"), "member", "unused", "");
+    // `link/../value.txt` is `shared/value.txt`, not `member/src/value.txt`.
+    std::os::unix::fs::symlink("../../shared/subdir", workspace.join("member/src/link"))
+        .expect("link");
+    fs::write(
+        workspace.join("member/src/main.rs"),
+        "fn main() { println!(\"{}{}\", include_str!(\"link/../value.txt\"), include_str!(\"../../shared/a\\\\b.txt\")); }\n",
+    )
+    .expect("main source");
+    let write = |link: &str, name: &str| {
+        fs::write(workspace.join("shared/value.txt"), link).expect("shared value");
+        fs::write(workspace.join("shared").join("a\\b.txt"), name).expect("backslash file");
+    };
+    fs::write(workspace.join("member/src/value.txt"), "decoy").expect("decoy");
+    fs::write(workspace.join("shared/ab.txt"), "decoy").expect("backslash decoy");
+    write("one", "uno");
+    fixture.lock(&workspace);
+    let binary = workspace.join("target/debug/member");
+
+    assert_succeeded(&fixture.cargo_reapi(&workspace, &["build"]));
+    assert_eq!(run(&binary), "oneuno");
+    write("two", "dos");
+    assert_succeeded(&fixture.cargo_reapi(&workspace, &["build"]));
+    assert_eq!(run(&binary), "twodos");
+}
+
+/// Astra 0.2.13 finding 6: a Git dependency's build script can query its
+/// checkout's repository, which Cargo needs open, so the gate keys all of it.
+#[test]
+fn a_git_dependencys_repository_state_is_keyed() {
+    let fixture = Fixture::new();
+    let upstream = fixture.path("upstream/dep");
+    write_package(&upstream, "dep", "unused", "");
+    fs::remove_file(upstream.join("src/main.rs")).expect("no binary");
+    fs::write(
+        upstream.join("src/lib.rs"),
+        "pub const TAGS: &str = env!(\"TAGS\");\n",
+    )
+    .expect("library");
+    fs::write(
+        upstream.join("build.rs"),
+        r#"fn main() {
+    let tags = std::process::Command::new("git")
+        .args(["tag", "--list"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).replace('\n', ","))
+        .unwrap_or_default();
+    println!("cargo:rustc-env=TAGS={tags}");
+}
+"#,
+    )
+    .expect("build script");
+    commit_all(&upstream);
+    let project = fixture.path("project");
+    write_package(
+        &project,
+        "project",
+        "unused",
+        &format!(
+            "\n[dependencies]\ndep = {{ git = 'file://{}' }}\n",
+            upstream.display()
+        ),
+    );
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"[{}]\", dep::TAGS); }\n",
+    )
+    .expect("main source");
+    fixture.lock(&project);
+    let binary = project.join("target/debug/project");
+
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+    assert_eq!(run(&binary), "[]");
+
+    // The checkout's repository changes while the locked revision does not.
+    let checkouts = fixture.cargo_home.join("git/checkouts");
+    let repository = fs::read_dir(&checkouts)
+        .expect("checkouts")
+        .flatten()
+        .flat_map(|entry| fs::read_dir(entry.path()).into_iter().flatten().flatten())
+        .map(|entry| entry.path())
+        .next()
+        .expect("a checkout");
+    let tagged = Command::new("git")
+        .args(["tag", "v1"])
+        .current_dir(&repository)
+        .status()
+        .expect("git tag");
+    assert!(tagged.success());
+    assert_succeeded(&fixture.cargo_reapi(&project, &["build"]));
+
+    assert_eq!(run(&binary), "[v1,]");
+}
+
+/// Astra 0.2.13 finding 8: `run` builds exactly what plain `cargo run` does.
+#[test]
+fn run_builds_only_the_binary_cargo_run_would() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(
+        &project,
+        "project",
+        "unused",
+        "\n[[bin]]\nname = \"app\"\npath = \"src/app.rs\"\n\n[[bin]]\nname = \"broken\"\npath = \"src/broken.rs\"\n",
+    );
+    fs::remove_file(project.join("src/main.rs")).expect("no default binary");
+    fs::write(
+        project.join("src/app.rs"),
+        "fn main() { println!(\"app\"); }\n",
+    )
+    .expect("app");
+    fs::write(
+        project.join("src/broken.rs"),
+        "compile_error!(\"never built by run\");\n",
+    )
+    .expect("broken");
+    fixture.lock(&project);
+
+    // Two binaries and no default: Cargo says which fails, and so do we.
+    let ambiguous = fixture.cargo_reapi(&project, &["run"]);
+    assert!(!ambiguous.status.success());
+    assert_declined(&ambiguous, "default-run");
+
+    // With a default the application runs, and the broken binary is not built.
+    let manifest = fs::read_to_string(project.join("Cargo.toml")).expect("manifest");
+    fs::write(
+        project.join("Cargo.toml"),
+        manifest.replace("[package]\n", "[package]\ndefault-run = \"app\"\n"),
+    )
+    .expect("manifest with default-run");
+    let default = fixture.cargo_reapi(&project, &["run", "--locked"]);
+    assert!(default.status.success(), "{}", stderr(&default));
+    assert_eq!(String::from_utf8_lossy(&default.stdout).trim(), "app");
+    assert_succeeded(&default);
+
+    let named = fixture.cargo_reapi(&project, &["run", "--bin", "app"]);
+    assert!(named.status.success(), "{}", stderr(&named));
+    assert_eq!(String::from_utf8_lossy(&named.stdout).trim(), "app");
+}
+
+/// Astra 0.2.13 finding 9: when preparing the build's gate fails, the program
+/// still runs exactly once.
+#[test]
+fn a_failed_gate_preparation_still_runs_the_program_once() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"ran\"); }\n",
+    )
+    .expect("main source");
+    fixture.lock(&project);
+    let first = fixture.cargo_reapi(&project, &["run"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let published = fs::read_dir(fixture.cache.join("gate-snapshots/objects"))
+        .expect("snapshots")
+        .next()
+        .expect("a snapshot")
+        .expect("entry")
+        .path();
+    fs::write(published.join("manifest.json"), "damaged").expect("damage the manifest");
+
+    let second = fixture.cargo_reapi(&project, &["run"]);
+
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert_eq!(String::from_utf8_lossy(&second.stdout).trim(), "ran");
+}
+
+/// Astra 0.2.13 finding 11: `doc --open` opens its viewer every time.
+#[cfg(unix)]
+#[test]
+fn doc_open_is_never_cached_and_opens_every_time() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(project.join("src/lib.rs"), "pub fn answer() {}\n").expect("library");
+    fs::remove_file(project.join("src/main.rs")).expect("no binary");
+    fixture.lock(&project);
+    let opened = fixture.path("opened");
+    let browser = fixture.path("browser");
+    fs::write(
+        &browser,
+        format!("#!/bin/sh\necho opened >> {}\n", opened.display()),
+    )
+    .expect("browser");
+    fs::set_permissions(&browser, fs::Permissions::from_mode(0o755)).expect("executable");
+    let environment = [("BROWSER", browser.as_os_str())];
+
+    for _ in 0..2 {
+        let output = fixture.cargo_reapi_with(&project, &["doc", "--open"], &environment);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_declined(&output, "--open");
+    }
+
+    assert_eq!(
+        fs::read_to_string(&opened)
+            .expect("browser log")
+            .lines()
+            .count(),
+        2
+    );
+}
+
+/// Astra 0.2.13 finding 12: an audit variable never reaches a compile.
+#[test]
+fn an_audit_variable_never_reaches_the_compiler() {
+    let fixture = Fixture::new();
+    let project = fixture.path("project");
+    write_package(&project, "project", "unused", "");
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"{:?}\", option_env!(\"CARGO_REAPI_RUSTC_TRACE\")); }\n",
+    )
+    .expect("main source");
+    fixture.lock(&project);
+    let trace = fixture.path("trace");
+    fs::create_dir_all(&trace).expect("trace directory");
+
+    let output = fixture.cargo_reapi_with(
+        &project,
+        &["build"],
+        &[("CARGO_REAPI_RUSTC_TRACE", trace.as_os_str())],
+    );
+
+    assert_succeeded(&output);
+    assert_eq!(run(&project.join("target/debug/project")), "None");
+}

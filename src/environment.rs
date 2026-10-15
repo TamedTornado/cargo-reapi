@@ -252,13 +252,15 @@ impl CompileEnvironment {
 
     /// Tracked variables the caller set that this environment withholds but
     /// could pass. Wrapper settings are never the caller's to give a
-    /// compile, so a compile that reads one sees it unset, as under Cargo.
+    /// compile, and neither are the audit observer's, so a compile that reads
+    /// one sees it unset, as under Cargo.
     pub fn withheld(&self, tracked: &BTreeSet<String>) -> BTreeSet<String> {
         tracked
             .iter()
             .filter(|name| {
                 env::var_os(name).is_some()
                     && !WRAPPER_PRIVATE.contains(&name.as_str())
+                    && !OBSERVER_ENVIRONMENT.contains(&name.as_str())
                     && !self.passes(OsStr::new(name))
             })
             .cloned()

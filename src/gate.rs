@@ -826,6 +826,7 @@ fn gate_key(scope: &GateScope<'_>, learned_environment: &str) -> Result<String> 
     hash_tree(&mut hasher, workspace, "workspace", target, action_log)?;
     hash_cargo_configuration(&mut hasher, workspace)?;
     hash_selected_project(&mut hasher, project, workspace, target, action_log)?;
+    hash_git_dependencies(&mut hasher, project)?;
     hash_declared_inputs(&mut hasher, declared_inputs, workspace, target, action_log)?;
     let state_key = format!("{:x}", hasher.finalize());
     let mut exact = Sha256::new();
@@ -1177,6 +1178,55 @@ fn hash_selected_project(
             target,
             action_log,
         )?;
+    }
+    Ok(())
+}
+
+/// Hashes the repository state of every Git dependency's checkout. Cargo
+/// itself opens a checkout's `.git`, so the sandbox cannot deny it as it does
+/// a local package's, and a build script there can query it. Every part of it
+/// is therefore keyed: all files by content, and `objects` by the names and
+/// sizes of its files, which name their content, so an unreachable object
+/// that would lengthen an abbreviated name is seen as well.
+fn hash_git_dependencies(hasher: &mut Sha256, project: &Project) -> Result<()> {
+    let mut repositories = BTreeSet::new();
+    for package in project.packages.iter().filter(|package| package.git) {
+        let repository = package
+            .root
+            .ancestors()
+            .map(|ancestor| ancestor.join(".git"))
+            .find(|candidate| candidate.is_dir());
+        if let Some(repository) = repository {
+            repositories.insert(repository);
+        }
+    }
+    for repository in repositories {
+        let objects = repository.join("objects");
+        let mut entries = WalkDir::new(&repository)
+            .follow_links(false)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.path().to_path_buf());
+        for entry in entries {
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(&repository)?;
+            hash_field(hasher, b"git-dependency");
+            // Named by its place beneath Cargo's `checkouts`, so every Cargo
+            // home with the same checkout agrees.
+            let name = repository
+                .iter()
+                .skip_while(|component| *component != "checkouts")
+                .collect::<PathBuf>();
+            hash_field(hasher, name.to_string_lossy().as_bytes());
+            hash_field(hasher, relative.to_string_lossy().as_bytes());
+            if entry.path().starts_with(&objects) {
+                hash_field(hasher, &entry.metadata()?.len().to_le_bytes());
+            } else {
+                hash_field(hasher, digest_file(entry.path())?.as_bytes());
+            }
+        }
     }
     Ok(())
 }
