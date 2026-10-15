@@ -1,6 +1,8 @@
-//! Native libraries a compile reads: a link step always runs, a compile that
-//! reaches outside the workspace and toolchain runs uncached, and a static
-//! library an rlib bundles from inside the workspace keys the compile.
+//! Native libraries a compile reads: a link step always runs, a metadata-only
+//! compile reads none, an rlib that bundles a static library from outside the
+//! workspace and toolchain runs uncached, an rlib that only searches outside
+//! is cached, and a static library an rlib bundles from inside the workspace
+//! keys the compile.
 
 #![cfg(unix)]
 
@@ -37,6 +39,11 @@ impl Build {
 
 /// Runs `cargo build` through the cache backend with a fresh action log.
 fn cached_build(root: &Path, cache: &Path) -> Build {
+    cached_cargo(root, cache, "build")
+}
+
+/// Runs `cargo <command>` through the cache backend with a fresh action log.
+fn cached_cargo(root: &Path, cache: &Path, command: &str) -> Build {
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
     let _ = fs::remove_file(&action_log);
 
@@ -47,7 +54,7 @@ fn cached_build(root: &Path, cache: &Path) -> Build {
         .arg(&action_log)
         .arg("--cache-dir")
         .arg(cache)
-        .args(["--", "build"])
+        .args(["--", command])
         .output()
         .expect("run cargo-reapi");
 
@@ -152,10 +159,27 @@ fn an_outside_static_library_replaced_makes_the_link_step_run_fresh() {
     );
 }
 
-/// A library that bundles `libanswer.a` from `search` (relative to the
-/// package) and a binary that prints what it returns.
-fn write_bundling_library(root: &Path, search: &str) {
+/// How the `native-library` package reaches `libanswer.a`.
+#[derive(Clone, Copy)]
+enum Bundling {
+    /// `#[link(name = "answer", kind = "static")]` in the library source.
+    LinkAttribute,
+    /// `cargo::rustc-link-lib=static=answer` from the build script.
+    LinkLibArgument,
+    /// Nothing: the library only searches the directory and returns 7.
+    Nothing,
+}
+
+/// A library that searches `search` (relative to the package) for native
+/// libraries and bundles `libanswer.a` from it as `bundling` says, and a
+/// binary that prints what it returns.
+fn write_native_library(root: &Path, search: &str, bundling: Bundling) {
     write_manifest(root, "native-library");
+
+    let link_lib = match bundling {
+        Bundling::LinkLibArgument => "println!(\"cargo::rustc-link-lib=static=answer\");\n",
+        Bundling::LinkAttribute | Bundling::Nothing => "",
+    };
     fs::write(
         root.join("build.rs"),
         format!(
@@ -164,17 +188,25 @@ fn write_bundling_library(root: &Path, search: &str) {
              let search = std::path::Path::new(&manifest).join({search:?});\n\
              println!(\"cargo::rustc-link-search=native={{}}\", search.display());\n\
              println!(\"cargo::rerun-if-changed={{}}\", search.join(\"libanswer.a\").display());\n\
+             {link_lib}\
              }}\n"
         ),
     )
     .expect("build script");
-    fs::write(
-        root.join("src/lib.rs"),
-        "#[link(name = \"answer\", kind = \"static\")]\n\
-         unsafe extern \"C\" { fn answer() -> i32; }\n\
-         pub fn value() -> i32 { unsafe { answer() } }\n",
-    )
-    .expect("library source");
+
+    let library = match bundling {
+        Bundling::LinkAttribute => {
+            "#[link(name = \"answer\", kind = \"static\")]\n\
+             unsafe extern \"C\" { fn answer() -> i32; }\n\
+             pub fn value() -> i32 { unsafe { answer() } }\n"
+        }
+        Bundling::LinkLibArgument => {
+            "unsafe extern \"C\" { fn answer() -> i32; }\n\
+             pub fn value() -> i32 { unsafe { answer() } }\n"
+        }
+        Bundling::Nothing => "pub fn value() -> i32 { 7 }\n",
+    };
+    fs::write(root.join("src/lib.rs"), library).expect("library source");
     fs::write(
         root.join("src/main.rs"),
         "fn main() { println!(\"{}\", native_library::value()); }\n",
@@ -182,17 +214,26 @@ fn write_bundling_library(root: &Path, search: &str) {
     .expect("binary source");
 }
 
+/// A library that bundles `libanswer.a` from `search` through `#[link]`.
+fn write_bundling_library(root: &Path, search: &str) {
+    write_native_library(root, search, Bundling::LinkAttribute);
+}
+
 /// The library compile's executions: the one action of `native_library`
 /// with `--crate-type lib`.
 fn library_executions(build: &Build) -> Vec<String> {
+    compile_executions(build, "native_library", "lib")
+}
+
+/// The executions of `crate_name`'s compiles with `--crate-type crate_type`.
+fn compile_executions(build: &Build, crate_name: &str, crate_type: &str) -> Vec<String> {
+    let crate_type = format!("\"--crate-type\",\"{crate_type}\"");
     build
         .actions
         .iter()
         .filter(|action| {
-            action["crate_name"] == "native_library"
-                && action["arguments"]
-                    .to_string()
-                    .contains("\"--crate-type\",\"lib\"")
+            action["crate_name"] == crate_name
+                && action["arguments"].to_string().contains(&crate_type)
         })
         .map(|action| action["execution"].as_str().unwrap_or_default().to_owned())
         .collect()
@@ -266,4 +307,139 @@ fn a_static_archive_bundled_from_inside_the_workspace_keys_the_compile() {
         run_program(&workspace.join("target/debug/native-library")),
         "43"
     );
+}
+
+/// A workspace of `native-library`, which searches `../../outside` and
+/// bundles nothing from it, and `native-user`, a library that calls it and
+/// so inherits its `-L` directory from Cargo.
+fn write_propagating_workspace(root: &Path) {
+    fs::create_dir_all(root).expect("workspace directory");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = ['native', 'user']\nresolver = '3'\n",
+    )
+    .expect("workspace manifest");
+    write_native_library(&root.join("native"), "../../outside", Bundling::Nothing);
+
+    let user = root.join("user");
+    write_manifest(&user, "native-user");
+    let mut manifest = fs::read_to_string(user.join("Cargo.toml")).expect("user manifest");
+    manifest.push_str("[dependencies]\nnative-library = { path = '../native' }\n");
+    fs::write(user.join("Cargo.toml"), manifest).expect("user manifest");
+    fs::write(
+        user.join("src/lib.rs"),
+        "pub fn twice() -> i32 { native_library::value() * 2 }\n",
+    )
+    .expect("user source");
+}
+
+#[test]
+fn a_check_with_a_propagated_outside_search_directory_is_a_hit_the_second_time() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("shared cache");
+    write_answer_archive(&roots.path().join("outside"), 42);
+    let first = roots.path().join("first");
+    let second = roots.path().join("second");
+    write_propagating_workspace(&first);
+    write_propagating_workspace(&second);
+
+    let checked = cached_cargo(&first, cache.path(), "check");
+    checked.assert_succeeded();
+    assert_eq!(
+        compile_executions(&checked, "native_user", "lib"),
+        ["local-cache-miss"]
+    );
+    let user_arguments = checked
+        .actions
+        .iter()
+        .find(|action| action["crate_name"] == "native_user")
+        .expect("native_user compile")["arguments"]
+        .to_string();
+    assert!(
+        user_arguments.contains("native="),
+        "the dependent compile inherits the -L directory: {user_arguments}"
+    );
+
+    let rechecked = cached_cargo(&second, cache.path(), "check");
+    rechecked.assert_succeeded();
+    assert_eq!(library_executions(&rechecked), ["cache-hit"]);
+    assert_eq!(
+        compile_executions(&rechecked, "native_user", "lib"),
+        ["cache-hit"]
+    );
+}
+
+#[test]
+fn a_library_searching_an_outside_directory_without_bundling_is_cached() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("shared cache");
+    write_answer_archive(&roots.path().join("outside"), 42);
+    let first = roots.path().join("first");
+    let second = roots.path().join("second");
+    write_native_library(&first, "../outside", Bundling::Nothing);
+    write_native_library(&second, "../outside", Bundling::Nothing);
+
+    let built = cached_build(&first, cache.path());
+    built.assert_succeeded();
+    assert_eq!(library_executions(&built), ["local-cache-miss"]);
+
+    let restored = cached_build(&second, cache.path());
+    restored.assert_succeeded();
+    assert_eq!(library_executions(&restored), ["cache-hit"]);
+    assert_eq!(
+        run_program(&second.join("target/debug/native-library")),
+        "7"
+    );
+}
+
+#[test]
+fn a_static_library_named_by_link_lib_inside_the_workspace_keys_the_compile() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("shared cache");
+    let workspace = roots.path().join("workspace");
+    let copy = roots.path().join("copy");
+    for root in [&workspace, &copy] {
+        write_answer_archive(&root.join("native"), 42);
+        write_native_library(
+            &root.join("package"),
+            "../native",
+            Bundling::LinkLibArgument,
+        );
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = ['package']\nresolver = '3'\n",
+        )
+        .expect("workspace manifest");
+    }
+
+    let built = cached_build(&workspace, cache.path());
+    built.assert_succeeded();
+    assert_eq!(library_executions(&built), ["local-cache-miss"]);
+
+    let restored = cached_build(&copy, cache.path());
+    restored.assert_succeeded();
+    assert_eq!(library_executions(&restored), ["cache-hit"]);
+
+    // Replacing the archive the `-l` argument names changes the key.
+    write_answer_archive(&copy.join("native"), 43);
+    let rebuilt = cached_build(&copy, cache.path());
+
+    rebuilt.assert_succeeded();
+    assert_eq!(library_executions(&rebuilt), ["local-cache-miss"]);
+    assert_eq!(run_program(&copy.join("target/debug/native-library")), "43");
+}
+
+#[test]
+fn a_library_naming_an_outside_static_archive_by_link_lib_runs_uncached() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("shared cache");
+    write_answer_archive(&roots.path().join("outside"), 42);
+    let root = roots.path().join("package");
+    write_native_library(&root, "../outside", Bundling::LinkLibArgument);
+
+    let built = cached_build(&root, cache.path());
+
+    built.assert_succeeded();
+    assert_eq!(library_executions(&built), ["local-ineligible"]);
+    assert_eq!(run_program(&root.join("target/debug/native-library")), "42");
 }

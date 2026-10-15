@@ -213,7 +213,7 @@ impl CompileEnvironment {
     }
 
     fn keys(&self, name: &str) -> bool {
-        if WRAPPER_PRIVATE.contains(&name) {
+        if WRAPPER_PRIVATE.contains(&name) || is_scheduling_environment(name) {
             return false;
         }
         match self {
@@ -319,6 +319,15 @@ pub fn is_toolchain_environment(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
         || TOOLCHAIN_NAMES.contains(&name)
         || name.ends_with("_DEPLOYMENT_TARGET")
+}
+
+/// Whether a variable only schedules or configures the build around a
+/// compile: Cargo's jobserver and job count, and cargo-reapi's own settings.
+/// The compiler still receives them (rustc joins the jobserver), but they
+/// cannot change what it writes, so they are not keyed. A compile whose
+/// source reads one through `env!` or `option_env!` is not stored.
+pub fn is_scheduling_environment(name: &str) -> bool {
+    matches!(name, "CARGO_MAKEFLAGS" | "CARGO_BUILD_JOBS") || name.starts_with("CARGO_REAPI_")
 }
 
 /// Encodes this process's environment for [`CALLER_ENVIRONMENT`].

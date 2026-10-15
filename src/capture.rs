@@ -86,6 +86,9 @@ pub struct PreparedInvocation {
     working_directory: String,
     crate_name: Option<String>,
     output_directory: Option<String>,
+    /// Whether an rlib this compile writes must hold nothing it bundled
+    /// before its outputs are stored; see [`bundles_nothing_unkeyed`].
+    check_bundled_members: bool,
 }
 
 #[derive(Debug)]
@@ -259,21 +262,31 @@ struct NativeInputs {
     files: Vec<PathBuf>,
     /// Why the compile reads native inputs cargo-reapi does not key.
     outside: Option<String>,
+    /// Whether an rlib compile searches a directory outside the workspace and
+    /// toolchain, so its result may be stored only if the rlib bundles nothing.
+    check_bundled_members: bool,
 }
 
 /// The native inputs of a compile.
 ///
 /// A link step (a binary, test, proc macro or other dynamic library) lets
 /// the linker pick libraries, start files and itself from places cargo-reapi
-/// does not key, so it always runs. So does a compile with a `-L` directory
-/// outside the workspace, the build output, the package and the compiler's
-/// own sysroot, or a `-l` library not found in an inside `-L` directory.
-/// Every file directly in an inside `-L` directory outside the sysroot is
-/// keyed by content, so a static library an rlib bundles is part of its key.
+/// does not key, so it always runs. A metadata-only compile reads no native
+/// library, so its `-L` and `-l` arguments read nothing.
+///
+/// An rlib compile reads only the static libraries it bundles: `-l static=`
+/// without `-bundle`, and `#[link(kind = "static")]` in its source. A bundled
+/// `-l` library not found in an inside or toolchain `-L` directory makes it
+/// uncached. Every file directly in an inside `-L` directory outside the
+/// sysroot is keyed by content, so a static library an rlib bundles from
+/// there is part of its key. A `-L` directory outside the workspace, the
+/// build output, the package and the compiler's own sysroot is allowed, but
+/// the result is stored only if the rlib holds nothing it bundled.
 fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<NativeInputs> {
     let mut native = NativeInputs {
         files: Vec::new(),
         outside: None,
+        check_bundled_members: false,
     };
     if invocation.requires_native_linker() {
         native.outside = Some(
@@ -282,11 +295,14 @@ fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<N
         );
         return Ok(native);
     }
+    if !invocation.is_link_action() {
+        return Ok(native);
+    }
 
     let (search_directories, libraries) = native_arguments(invocation);
     let mut inside_directories = Vec::new();
     let mut toolchain_directories = Vec::new();
-    for (argument, directory) in search_directories {
+    for directory in search_directories {
         // A directory that does not exist holds nothing the compile can read.
         let Ok(directory) = absolute(&directory, &invocation.cwd).canonicalize() else {
             continue;
@@ -305,20 +321,20 @@ fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<N
             // The compiler's identity covers its own sysroot.
             toolchain_directories.push(directory);
         } else {
-            native.outside = Some(format!(
-                "-L {argument} reaches outside the workspace and toolchain"
-            ));
-            return Ok(native);
+            // The command line alone cannot show that nothing is bundled from
+            // here: a `#[link(kind = "static")]` in source bundles an archive
+            // that never appears as `-l`. Only the rlib rustc writes can.
+            native.check_bundled_members = true;
         }
     }
 
-    for library in libraries {
-        if !library_is_found(&library, &inside_directories)
-            && !library_is_found(&library, &toolchain_directories)
+    for library in libraries.iter().filter(|library| bundles(library)) {
+        if !library_is_found(library, &inside_directories)
+            && !library_is_found(library, &toolchain_directories)
         {
             native.outside = Some(format!(
-                "-l {library} is not found beside a -L directory inside the workspace, so it \
-                 may be a system library"
+                "the bundled static library -l {library} is not found beside a -L directory \
+                 inside the workspace or toolchain"
             ));
             return Ok(native);
         }
@@ -341,9 +357,9 @@ fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<N
     Ok(native)
 }
 
-/// The `-L` search directories other than Cargo's own crate directories,
-/// each with the argument that named it, and the `-l` libraries.
-fn native_arguments(invocation: &RustcInvocation) -> (Vec<(String, PathBuf)>, Vec<String>) {
+/// The `-L` search directories other than Cargo's own crate directories, and
+/// the `-l` libraries.
+fn native_arguments(invocation: &RustcInvocation) -> (Vec<PathBuf>, Vec<String>) {
     let mut search_directories = Vec::new();
     let mut libraries = Vec::new();
     let mut arguments = invocation
@@ -365,13 +381,23 @@ fn native_arguments(invocation: &RustcInvocation) -> (Vec<(String, PathBuf)>, Ve
         if argument.starts_with("-L") {
             let (kind, path) = value.split_once('=').unwrap_or(("all", value.as_str()));
             if kind != "dependency" && kind != "crate" {
-                search_directories.push((value.clone(), PathBuf::from(path)));
+                search_directories.push(PathBuf::from(path));
             }
         } else {
             libraries.push(value);
         }
     }
     (search_directories, libraries)
+}
+
+/// Whether a `-l` library is copied into the rlib: a `static` kind without
+/// the `-bundle` modifier. Other kinds are read only by a later link step.
+fn bundles(library: &str) -> bool {
+    let Some((kind, _)) = library.split_once('=') else {
+        return false;
+    };
+    let (kind, modifiers) = kind.split_once(':').unwrap_or((kind, ""));
+    kind == "static" && !modifiers.split(',').any(|modifier| modifier == "-bundle")
 }
 
 /// Whether a `-l` library is a file in one of `directories`.
@@ -419,6 +445,7 @@ pub fn prepare_invocation(
         record_path_mappings(&roots.path_mappings())?;
     }
     let native = native_inputs(invocation, &roots)?;
+    let check_bundled_members = native.check_bundled_members;
     let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots, native.files)?;
     eligibility_reasons.extend(native.outside);
     let paths = prepare_paths(invocation, &roots, &mut eligibility_reasons)?;
@@ -462,12 +489,7 @@ pub fn prepare_invocation(
     };
     let key = action_key(&deterministic_action)?;
     let cache_eligibility = RemoteEligibility::from_reasons(eligibility_reasons.clone());
-    if invocation.requires_native_linker() {
-        eligibility_reasons.push(
-            "link action input discovery is incomplete; native libraries, linker binaries, response files, and platform SDK inputs must be declared"
-                .to_owned(),
-        );
-    }
+    eligibility_reasons.extend(remote_only_reasons(invocation, check_bundled_members));
 
     let relocation_mappings = roots.relocation_mappings();
     let output_files = prepare_outputs(
@@ -511,7 +533,51 @@ pub fn prepare_invocation(
         output_files,
         path_mappings: roots.path_mappings(),
         relocation_mappings,
+        check_bundled_members,
     })
+}
+
+/// Why a compile the cache may run still cannot run remotely: what it reads
+/// is not all among its action inputs.
+fn remote_only_reasons(invocation: &RustcInvocation, check_bundled_members: bool) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if check_bundled_members {
+        reasons.push(
+            "an -L directory outside the workspace and toolchain is not an action input".to_owned(),
+        );
+    }
+    if invocation.requires_native_linker() {
+        reasons.push(
+            "link action input discovery is incomplete; native libraries, linker binaries, response files, and platform SDK inputs must be declared"
+                .to_owned(),
+        );
+    }
+    reasons
+}
+
+/// Whether the outputs a successful compile wrote may be stored: they may
+/// unless the compile searched an outside `-L` directory and an rlib it wrote
+/// holds anything besides its metadata and the crate's own objects. Both
+/// the command line and the sources are keyed, so the same key bundles the
+/// same libraries and the check carries to every later hit.
+pub fn bundles_nothing_unkeyed(prepared: &PreparedInvocation) -> Result<bool> {
+    if !prepared.check_bundled_members {
+        return Ok(true);
+    }
+    let Some(crate_name) = &prepared.crate_name else {
+        return Ok(false);
+    };
+
+    for output in &prepared.output_files {
+        let is_rlib = output
+            .actual_path
+            .extension()
+            .is_some_and(|extension| extension == "rlib");
+        if is_rlib && !crate::rlib::holds_only_own_members(&output.actual_path, crate_name)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn prepare_paths(

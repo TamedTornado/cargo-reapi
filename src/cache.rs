@@ -9,9 +9,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::capture::{
-    CaptureOptions, DepInput, PreparedInvocation, prepare_invocation, record_invocation,
+    CaptureOptions, DepInput, PreparedInvocation, bundles_nothing_unkeyed, prepare_invocation,
+    record_invocation,
 };
-use crate::environment::{CompileEnvironment, EnvironmentHints, tracked_environment};
+use crate::environment::{
+    CompileEnvironment, EnvironmentHints, is_scheduling_environment, tracked_environment,
+};
 use crate::invocation::RustcInvocation;
 use crate::maintenance::{acquire_shared, record_access};
 use crate::relocation::{
@@ -270,7 +273,11 @@ fn finish_cached_execution(
         });
     }
 
-    let execution = if exit_code == 0 && publish(cache_options, invocation, prepared)? {
+    let execution = if exit_code == 0 && !bundles_nothing_unkeyed(prepared)? {
+        // The rlib bundled a static library from an outside directory the
+        // key does not cover.
+        "local-ineligible"
+    } else if exit_code == 0 && publish(cache_options, invocation, prepared)? {
         record_access(&cache_options.root, &prepared.action_key)?;
         "local-cache-miss"
     } else if exit_code == 0 {
@@ -403,6 +410,9 @@ fn publish(
     {
         return Ok(false);
     }
+    if reads_scheduling_environment(prepared) {
+        return Ok(false);
+    }
 
     let mut outputs = Vec::with_capacity(prepared.output_files.len());
     for output in &prepared.output_files {
@@ -453,6 +463,21 @@ fn publish(
         &serde_json::to_vec(&manifest).context("serializing action manifest")?,
     )?;
     Ok(true)
+}
+
+/// Whether the compile's dep-info shows its source read a variable the key
+/// leaves out, or cannot be read. Its output could then differ under the
+/// same key.
+fn reads_scheduling_environment(prepared: &PreparedInvocation) -> bool {
+    let Some(dep_info) = &prepared.dep_info else {
+        return false;
+    };
+    let Ok(bytes) = fs::read(&dep_info.actual_path) else {
+        return true;
+    };
+    tracked_environment(&bytes)
+        .iter()
+        .any(|name| is_scheduling_environment(name))
 }
 
 fn publish_blob(options: &CacheOptions, digest: &str, bytes: &[u8]) -> Result<()> {

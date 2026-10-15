@@ -12,6 +12,7 @@ mod project;
 mod reclient;
 mod relocation;
 mod resource;
+mod rlib;
 mod safe_io;
 
 use std::env;

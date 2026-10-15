@@ -304,6 +304,84 @@ fn shell_history_and_unrelated_variables_do_not_change_action_keys() {
     );
 }
 
+#[test]
+fn job_scheduling_and_wrapper_settings_do_not_change_action_keys() {
+    let roots = tempdir().expect("worktree roots");
+    let cache = tempdir().expect("shared cache");
+    let body = "\"scheduled\"";
+    let first_root = roots.path().join("first");
+    let second_root = roots.path().join("second");
+    write_package(&first_root, "envkey-jobs", body, None);
+    write_package(&second_root, "envkey-jobs", body, None);
+
+    let first = cached_build(
+        &first_root,
+        cache.path(),
+        &[
+            ("CARGO_BUILD_JOBS", "1"),
+            ("CARGO_REAPI_UNRELATED_SETTING", "first"),
+        ],
+    );
+    assert!(first.succeeded(), "{}", first.stderr());
+    assert_eq!(first.executions("envkey_jobs"), ["local-cache-miss"]);
+
+    let second = cached_build(
+        &second_root,
+        cache.path(),
+        &[
+            ("CARGO_BUILD_JOBS", "2"),
+            ("CARGO_REAPI_UNRELATED_SETTING", "second"),
+        ],
+    );
+    assert!(second.succeeded(), "{}", second.stderr());
+    assert_eq!(second.executions("envkey_jobs"), ["cache-hit"]);
+
+    let first_action = first.final_action("envkey_jobs");
+    let second_action = second.final_action("envkey_jobs");
+    assert_eq!(first_action["action_key"], second_action["action_key"]);
+    for name in [
+        "CARGO_BUILD_JOBS",
+        "CARGO_MAKEFLAGS",
+        "CARGO_REAPI_UNRELATED_SETTING",
+    ] {
+        assert!(
+            first_action["keyed_environment"][name].is_null(),
+            "{name} is keyed"
+        );
+    }
+}
+
+#[test]
+fn a_compile_that_reads_an_unkeyed_scheduling_variable_is_not_stored() {
+    let roots = tempdir().expect("worktree roots");
+    let cache = tempdir().expect("shared cache");
+    let body = "env!(\"CARGO_BUILD_JOBS\")";
+    let first_root = roots.path().join("first");
+    let second_root = roots.path().join("second");
+    write_package(&first_root, "envkey-reads-jobs", body, None);
+    write_package(&second_root, "envkey-reads-jobs", body, None);
+
+    let first = cached_build(&first_root, cache.path(), &[("CARGO_BUILD_JOBS", "1")]);
+    assert!(first.succeeded(), "{}", first.stderr());
+    assert_eq!(
+        first.executions("envkey_reads_jobs"),
+        ["local-output-incomplete"]
+    );
+    assert_eq!(
+        run_binary(&first_root.join("target/debug/envkey-reads-jobs")),
+        "1"
+    );
+
+    // The key leaves the variable out, so only not storing the compile keeps
+    // the second build from restoring the first one's value.
+    let second = cached_build(&second_root, cache.path(), &[("CARGO_BUILD_JOBS", "2")]);
+    assert!(second.succeeded(), "{}", second.stderr());
+    assert_eq!(
+        run_binary(&second_root.join("target/debug/envkey-reads-jobs")),
+        "2"
+    );
+}
+
 #[cfg(unix)]
 fn prepend_path(directory: &Path, path: &std::ffi::OsStr) -> String {
     format!("{}:{}", directory.display(), path.to_string_lossy())
