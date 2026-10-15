@@ -192,3 +192,23 @@ fn arguments_from_a_response_file_run_uncached() {
     assert_eq!(library_executions(&root), ["local-ineligible"]);
     assert_eq!(run_program(&root.join("target/debug/options")), "42");
 }
+
+#[test]
+fn a_codegen_option_outside_the_supported_list_runs_uncached() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    let root = roots.path().join("package");
+    write_package(&root, LIBRARY);
+
+    // `save-temps` keeps intermediate files beside the declared outputs.
+    let output = cargo_reapi(
+        &root,
+        cache.path(),
+        &["build"],
+        &[("RUSTFLAGS", "-C save-temps")],
+    );
+
+    assert_succeeded(&output);
+    assert_eq!(library_executions(&root), ["local-ineligible"]);
+    assert_eq!(run_program(&root.join("target/debug/options")), "42");
+}
