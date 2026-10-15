@@ -1,536 +1,174 @@
 # cargo-reapi
 
-`cargo-reapi` lets ordinary Cargo projects reuse compiled artifacts across
-independent worktrees and processes without replacing Cargo's build graph. It
-was built for massively parallel Rust agent pipelines, where many clean
-worktrees otherwise repeat the same expensive checks, tests, compiler actions,
-and links.
+`cargo-reapi` is a shared compile cache for ordinary Cargo projects, in the
+model of `sccache`. It was built for massively parallel Rust agent pipelines,
+where many clean worktrees of one project would otherwise repeat the same
+compiles.
 
 `cargo-reapi` is an independent project and is not affiliated with or endorsed
 by the Rust Project or Rust Foundation.
 
-We are currently dogfooding it in our private agentic coding harness against
-[Moria](https://github.com/TamedTornado/moria), a real Rust/Bevy voxel-world
-substrate. Five simultaneous clean Moria consumers completed their full warm
-quality gates in 24.695 seconds with zero OS-observed compiler/linker work. In
-the live harness, five worktrees reaching the same cold `bevy_pbr` action
-produced one physical compiler action and four coalesced waiters. The
-[agent-fleet case study](docs/case-studies/moria-agent-fleet.md) includes the
-measurements, integration failures, repairs, and limits.
+Cargo remains the build planner. `cargo-reapi` runs Cargo with itself as the
+compiler wrapper (`RUSTC_WRAPPER`), so Cargo runs every time, decides what to
+build and runs build scripts as usual. Each compile Cargo asks the wrapper for
+is either restored from a shared local cache, after its inputs are verified,
+or run and published. Identical compiles in different worktrees share one
+entry; identical compiles running at the same moment run once.
 
-Cargo remains the build planner and source of truth. `cargo-reapi` observes the
-exact commands Cargo schedules through `RUSTC_WRAPPER`, captures and verifies
-their inputs and outputs, coalesces identical concurrent work, and restores
-artifacts from a shared local cache. It also includes a reclient adapter for
-eligible Remote Execution API (REAPI) actions; validation against a live
-production REAPI service remains a separate milestone.
+## What is cached, and what runs fresh
 
-`cargo-reapi` uses two nested reuse paths. An exact whole-gate hit restores the
-complete Cargo target state and skips Cargo entirely. When the gate differs,
-Cargo remains the planner and runs inside the strict sandbox, while individual
-compiler and linker actions reuse verified cached outputs or coalesce identical
-concurrent misses. A gate miss discards Cargo's timestamp fingerprints before
-replanning, so preserved or older source timestamps cannot hide changed content.
-Existing artifacts remain available to the content-addressed action cache.
-Only invalidated actions execute physically, and a successful
-result becomes a new whole-gate snapshot. The adversarial mutation qualification
-proves this by rebuilding exactly the changed leaf and its dependants while
-restoring unrelated work. The
-[Moria agent-fleet case study](docs/case-studies/moria-agent-fleet.md#two-reuse-layers)
-documents both paths and a live partial-match sample.
+**Cached: library compiles.** A compile that produces an `rlib`, or only its
+metadata, is looked up in the cache and restored on a hit.
 
-On an exact hit, the user sees no Cargo compilation stream and the JSONL action
-log records `gate-snapshot-hit` or `coalesced-gate-hit`. On a replan, Cargo emits
-its normal output and the action log records each `cache-hit`, `coalesced-hit`,
-or physical miss. The CLI does not yet print a human-readable end-of-gate
-“N actions reused” summary; that presentation improvement is listed under
-[known limitations and roadmap](#known-limitations-and-roadmap).
+**Always run: link steps.** Binaries, tests, examples, benches, proc macros,
+and `cdylib`, `dylib` and `staticlib` crates are linked every time. A linker
+reads libraries, start files and itself from places the key does not cover,
+so a cached link could be stale. The action log records these as
+`local-ineligible`, with the reason.
 
-The current-schema macOS/arm64 APFS and Linux/x86_64 XFS platform batches each
-passed all 11 required qualification receipts. Independent recursive
-verification rehashed 152 macOS artifacts and 192 Linux artifacts and reported
-zero platform violations. A combined cross-platform aggregate is not claimed:
-the macOS raw evidence tree had already been intentionally discarded before the
-Linux verification run, so the enclosing two-platform command correctly
-reported macOS `UNMET`.
+**Run uncached: compiles with native inputs outside the project.** A compile
+that passes rustc a `-L` directory outside the workspace, the target
+directory, the package and the compiler's own sysroot, or a `-l` library that
+is not found in an inside `-L` directory, runs uncached. Such a compile may
+bundle a static library cargo-reapi cannot key.
 
-The binding project acceptance requirements are recorded in
-[`acceptance/ACCEPTANCE_CRITERIA.md`](acceptance/ACCEPTANCE_CRITERIA.md). Raw
-proof trees are disposable generated artifacts, not repository content. The
-committed acceptance machinery and the
-[end-to-end reproduction procedure](acceptance/REPRODUCING.md) are the durable,
-reproducible validation surface. Only concise benchmark statistics and pass
-matrices are committed—never raw OS events, receipt trees, caches, restored
-binaries, or aggregate evidence directories.
-The [2026-07-23 launch preflight](docs/launch-preflight-2026-07-23.md) records
-the file-by-file cold-reader audit, clean-checkout reproduction, and the
-explicitly unreconciled six-record production evidence gap.
-The [compiler-environment relocation audit](docs/compiler-environment-relocation.md)
-enumerates Cargo's built-in and customer-defined path-bearing variables and the
-cross-worktree regression that now covers them.
+**Plain Cargo: a wrapper you already chose.** When `RUSTC_WRAPPER`,
+`RUSTC_WORKSPACE_WRAPPER`, their `CARGO_BUILD_*` forms, or
+`build.rustc-wrapper` or `build.rustc-workspace-wrapper` in a Cargo
+configuration file or a `--config` argument already names a compiler wrapper,
+cargo-reapi would replace it, so it runs your Cargo command unchanged and
+prints `cargo-reapi: not caching (<reason>); running Cargo uncached`.
 
-The project exists because Bazel `rules_rust` and Buck2/Reindeer both require a
-second maintained build graph. That is a poor fit for arbitrary Cargo projects
-and is particularly costly around workspace feature selection, build scripts,
-proc macros, and Cargo-provided environment variables.
+## What a cached compile is keyed on
 
-## Real-world benchmarks
+A compile's key covers:
 
-The [benchmark index](benchmarks/README.md) contains the pinned Bevy linked-
-binary proof, real Moria one/five/ten rotational qualification, Bro's five-job
-qualification, reproduction commands, explicit SSD status, and the latest
-[macOS APFS current-schema qualification](benchmarks/results/2026-07-21-macos-apfs.md)
-and [Linux XFS current-schema qualification](benchmarks/results/2026-07-21-linux-xfs-schema-v3.md).
-The production Bro/Moria dogfood result is recorded in
-[the 2026-07-22 Linux/XFS run](benchmarks/results/2026-07-22-bro-moria-production.md).
-Bro is our private agentic coding harness, so its production record is a
-documented field result rather than a public reproduction of the orchestration
-layer. The public Moria runner and acceptance suite reproduce and independently
-observe the underlying cache, invalidation, coalescing, sandbox, and
-linked-binary behavior.
-Rotational results are not presented as SSD acceptance, platform qualification
-is not presented as a combined cross-platform aggregate, and the README does
-not treat a warm clock as a substitute for adversarial correctness or OS-level
-process evidence.
-The complete macOS, Linux/XFS, aggregation, benchmark-recording, and evidence-
-disposal procedure is documented in
-[`acceptance/REPRODUCING.md`](acceptance/REPRODUCING.md).
+- the compiler binary's digest and version, the host platform, and the
+  compiler's arguments with the worktree's paths normalized, so the same
+  project in two worktrees shares entries;
+- its keyed environment (below);
+- every file in the package directory and in `OUT_DIR`, by content, except
+  the target directory and any entry named `.git`; a directory named `target`
+  inside the sources is ordinary source;
+- every file directly in each `-L` native search directory inside the
+  workspace, target or package, so a static library an rlib bundles from
+  another package's output, or from a directory of the workspace, is keyed by
+  content;
+- every `--extern` artifact by content.
 
-### Qualification coverage at a glance
+An entry is a hit only while every file rustc's own dep-info listed when the
+entry was made still resolves to the same file with the same content. Paths
+are resolved as the kernel does (a link followed by `..` included), and
+rustc's escaping (spaces only) is read exactly. So a file that `include!`,
+`include_str!`, `include_bytes!` or `#[path]` reads from outside the package
+invalidates the entry when it changes. A dep-info that cannot be read, or that
+lists a file outside the package, workspace, target and toolchain, is not
+published.
 
-The suite is exhaustive against the committed acceptance threat model, not
-against every possible Rust toolchain or project. The complete
-[requirement-to-runner-to-evidence map](acceptance/COVERAGE.md) identifies the
-test, receipt, and independent evidence behind every row.
+An entry written by another version of cargo-reapi is a miss, never an error.
+Restored artifacts have the worktree's paths written back into them, so a
+binary linked from restored libraries names its own worktree.
 
-| Area | What must be demonstrated | macOS APFS record | Linux XFS record |
-| --- | --- | --- | --- |
-| Invalidation | Exact dependent rebuild set; poison, flags/configuration, external inputs, and undeclared effects cannot produce stale hits | schema-v3 pass | schema-v3 pass |
-| Linked artifacts | Relocated Bevy application and test binary match a fresh control | schema-v3 pass | schema-v3 pass |
-| Coalescing | One producer/one waiter, correct waiter behavior, and failure propagation | schema-v3 pass | schema-v3 pass |
-| Warm populations | Complete Moria gates in 1/5/10 simultaneous clean consumers with zero physical and OS-observed compiler/linker work | schema-v3 pass | schema-v3 pass |
-| Bro integration | Five simultaneous public-boundary Moria jobs with complete gates and zero warm compilation | schema-v3 pass | schema-v3 pass |
-| Resources | Distinct cold work overlaps within RSS/swap bounds; a 300-second stall is infrastructure | schema-v3 pass | schema-v3 pass |
-| Portability | APFS clone or Linux reflink selection is proved; portable fallback remains isolated | schema-v3 pass | schema-v3 pass |
-| Evidence integrity | Runner identity, criteria, raw OS events, derived audits, and all recursive evidence hashes verify fail-closed | 152 artifacts rehashed; zero violations | 192 artifacts rehashed; zero violations |
+## Assumptions
 
-Current deliberate limits are Windows, arbitrary Rust/native build systems and
-targets, untested filesystems and architectures, and validation against a live
-production REAPI service. Unsupported effects fail closed in strict mode. The
-[coverage document](acceptance/COVERAGE.md#deliberate-limits) gives the exact
-boundary so “exhaustive” is not used as an unbounded compatibility claim.
+The cache gives the artifacts plain Cargo would, given two assumptions:
 
-## Known limitations and roadmap
+- **Build scripts and proc macros are not written to defeat the cache.** A
+  build script that rewrites another package's sources while the build runs,
+  or a proc macro that deliberately reads inputs hidden from rustc, is out of
+  scope.
+- **Proc macros declare the files they read.** rustc's dep-info lists the
+  files a compile reads through `include!`, `include_str!` and
+  `include_bytes!`, but not files a proc macro opens itself. A macro that reads
+  a file should also expand to an `include_bytes!` of it, or otherwise make
+  rustc track it; an edit to an untracked file alone is not noticed.
 
-Cache growth currently requires operator-configured size/free-space thresholds,
-and large-cache GC progress reporting is minimal: it does not yet expose
-lock-wait, scan, eviction, and blob-sweep phase telemetry. The CLI also lacks a
-human-readable end-of-gate reuse summary; the JSONL action log is currently the
-authoritative distinction between whole-gate hits, per-action reuse, coalesced
-waiters, and physical misses.
-
-## Current status
-
-In capture mode, Cargo runs normally, every compiler action executes locally,
-and a JSON Lines action log records the compiler command, Cargo environment,
-package inputs, explicit `--extern` artifacts, output directory, and content
-digests. Cache mode additionally restores verified actions and whole gates as
-described above. Actions carry a cross-worktree-stable key derived from
-normalized paths, input content, compiler identity, platform, arguments,
-environment, and outputs.
-
-Remote REAPI eligibility is fail-closed and auditable. Metadata-only compiler
-actions with fully mapped inputs and outputs can be marked eligible. Link
-actions remain remotely ineligible until native libraries, linker binaries,
-response files, generated linker arguments, and platform SDK inputs are
-completely represented. The local shared cache does support verified linked
-outputs. Identical real Cargo fixtures in different worktrees must produce the
-same action key in the integration suite.
-
-The local shared-cache backend implements content-addressed output blobs, per-action cross-process locks, atomic publication, digest verification, fixed-width cross-worktree relocation, macOS re-signing, and output materialization into independent worktrees. Native link discovery keys linker binaries, response files, native libraries, and platform SDK inputs. Concurrent identical actions execute once; distinct cold actions lease CPU and memory from one shared physical-action ledger. Cache hits never acquire a heavy-action lease and logical Cargo gates are never admission-capped.
-
-The reclient transport adapter stages eligible actions into explicit input roots, invokes the production `rewrapper` client with declared inputs and outputs, and materializes successful outputs back into Cargo's target directory. Its platform template must bind `{os}`, `{arch}`, and `{toolchain_sha256}` so an action cannot silently execute against a mismatched worker toolchain. Real remote execution still requires an operator-provided reclient installation, a running `reproxy`, and a platform-matched REAPI service. The repository test suite exercises the complete adapter against a behaviorally faithful fake `rewrapper`; validation against a live service is the next infrastructure milestone.
-
-The first bounded [five-worktree Moria experiment](docs/moria-acceptance-2026-07-18.md) is retained as failed evidence: it used serialized two-process waves and executed cacheable work. The later [self-reported Moria experiment](docs/moria-acceptance-2026-07-19.md) met its timing thresholds, but predates external compiler observation and is therefore also historical, unaudited evidence rather than an acceptance result. Fixed timing references and anti-escape clauses are embedded from `acceptance/contract.toml`; receipts always report whether each host met or exceeded its selected reference, while correctness still requires a complete externally observed `cargo reapi prove` report with zero warm compiler/linker work.
-
-The current platform records report complete clean-consumer Moria gates in
-8.302s / 14.264s / 25.016s on [macOS APFS](benchmarks/results/2026-07-21-macos-apfs.md)
-and 6.455s / 10.818s / 18.852s on
-[Linux XFS](benchmarks/results/2026-07-21-linux-xfs-schema-v3.md) for one, five,
-and ten simultaneous worktrees respectively. Every warm population recorded
-zero physical actions and zero OS-observed compiler/linker executions. Both
-schema-v3 platform batches also passed Bevy behavioral parity, adversarial
-invalidation, coalescing, resource, portability, and Bro five-job receipts.
-Peak aggregate build-process RSS was 3.50 GB on macOS and 9.32 GB on Linux with
-no swap growth; deliberate no-progress runs were terminated and classified as
-infrastructure rather than agent feedback.
-
-The public name is currently collision-free: a crates.io exact-name search
-returned no `cargo-reapi` package, and the only GitHub repository returned for
-the name was this project (checked 2026-07-23). That is not a crates.io
-reservation; publication must repeat the check immediately before publishing.
+Build scripts always run under Cargo, so whatever they read is keyed through
+what they produce: `OUT_DIR` contents, compiler arguments and `rustc-env`
+values.
 
 ## Usage
 
-Whole-gate snapshots are strict by default and currently support macOS and
-Linux. They require the exact audited sandbox provider release; cargo-reapi
-rejects missing, older, newer, or modified installations:
-
-```sh
-npm install --global @anthropic-ai/sandbox-runtime@0.0.66
-```
-
-On macOS this uses Seatbelt through `/usr/bin/sandbox-exec`. On Linux the same
-provider uses bubblewrap and requires `bwrap`, `socat`, and `rg` on `PATH`.
-Sandbox-runtime is still beta infrastructure, so cargo-reapi hashes its full
-recursive Node dependency closure and the platform helper executables into
-every snapshot key. `CARGO_REAPI_SRT` may point to an exact pinned installation
-for development and CI; it is not a version bypass.
-
-The sandbox provider stores its control sockets beneath the caller's `TMPDIR`
-(the operating system's temporary directory by default). This directory must be
-writable and short enough for Unix socket paths. Cargo ReAPI reports an overlong
-path before starting the provider. Compiler temporary files remain isolated in
-the worktree's target directory.
-
-Shared-cache temporary files and clone probes are reserved atomically; process
-IDs are not unique across containers. Each invocation cleans up only its own
-temporary paths. Cache statistics tolerate files disappearing during concurrent
-publication and cleanup, so their counts describe a changing cache rather than
-an atomic snapshot.
-
 ```sh
 cargo install cargo-reapi --locked
-cargo reapi --backend capture -- test
 cargo reapi --backend cache --cache-dir /shared/cargo-reapi-cache -- check
+cargo reapi --backend cache --cache-dir /shared/cargo-reapi-cache -- test
 cargo reapi doctor --cache-dir /shared/cargo-reapi-cache --json
 cargo reapi cache stats --cache-dir /shared/cargo-reapi-cache --json
 cargo reapi cache gc --cache-dir /shared/cargo-reapi-cache \
   --max-bytes 96636764160 --min-free-bytes 32212254720 \
   --target-free-bytes 48318382080 --json
-cargo reapi contract verify --path acceptance/contract.toml
-cargo reapi prove action-log \
-  --action-log /path/to/actions.jsonl \
-  --rustc-trace /path/to/external-rustc-trace \
-  --worktree /path/to/audited-worktree \
-  --report /path/to/proof.json
-cargo reapi --backend reapi \
-  --rewrapper /opt/reclient/rewrapper \
-  --rewrapper-cfg /etc/cargo-reapi/rewrapper.cfg \
-  --reclient-staging-dir /shared/cargo-reapi-stage \
-  --reclient-platform 'OSFamily={os},Arch={arch},toolchain_sha256={toolchain_sha256}' \
-  -- check
 ```
 
-The installation provides the `cargo-reapi` Cargo subcommand and the
-`cargo-reapi-auditor` and `cargo-reapi-exec-auditor` verification tools.
+Everything after `--` is passed to Cargo unchanged. Long-lived runtimes may
+set `CARGO_REAPI_BACKEND`, `CARGO_REAPI_CACHE_DIR` and the other options in
+the environment once, then run `cargo-reapi check`, `cargo-reapi clippy ...`
+or `cargo-reapi test`; explicit flags still take precedence. Cache mode
+requires an explicit cache directory, so separate worktrees share only the
+store the operator chose.
 
-To install an unreleased checkout instead, run `cargo install --path .` from
-the repository root.
+Backends:
 
-Long-lived runtimes may configure the backend and cache once, then use the ordinary
-driver form `cargo-reapi check`, `cargo-reapi clippy ...`, or `cargo-reapi test`.
-`CARGO_REAPI_BACKEND`, `CARGO_REAPI_CACHE_DIR`, and the other documented driver
-options are environment-backed defaults; explicit CLI flags still take precedence.
-`CARGO_REAPI_RESOURCE_CPU_CAPACITY` and
-`CARGO_REAPI_RESOURCE_MEMORY_GIB_CAPACITY` define one host-wide physical-action
-ledger; they do not cap logical Cargo gates. `doctor` proves the pinned sandbox,
-copy-on-write selection, configured resource capacity, and cache readability
-before a worker is admitted. `cache gc` takes an exclusive maintenance lease,
-waits for all active restores and producers, evicts least-recently-used action
-and whole-gate entries, and removes blobs that no surviving action references.
-A dry run reports the same selection without mutation.
+- `cache` restores and publishes compiles as described above.
+- `capture` runs every compile and records, in the action log, the key a
+  cached compile would have.
+- `local` runs every compile.
+- `reapi` sends eligible compiles to a Remote Execution API service through
+  reclient (below).
+
+The action log is JSON Lines, by default `cargo-reapi/actions.jsonl` in the
+target directory; a relative `--action-log` is relative to the directory
+cargo-reapi starts in. Each compile's `execution` is one of `cache-hit`,
+`coalesced-hit` (it waited for an identical compile and restored its
+result), `local-cache-miss` (run and published), `local-ineligible` (run
+uncached; `cache_eligibility.reasons` says why), `local-environment-withheld`
+(see below), `local-output-incomplete` or `local-failed`. Cargo's control
+probes, such as `rustc -vV`, are logged too.
+
+To check that cargo-reapi changes nothing, compare the exit status and
+artifacts with the same Cargo command run without it.
+
+### Cache maintenance
+
+`cache gc` takes an exclusive maintenance lease, waits for active restores and
+producers, evicts least-recently-used compile entries, and removes blobs that
+no surviving entry references. A dry run reports the same selection without
+changing anything. It also removes, whole, the directories earlier versions
+kept (`gate-snapshots`, `access/gates`, `rustc-query-cache-v1`, `discoveries`,
+`link-captures`, `file-digests`), and reports how many as
+`removed_obsolete_directories`.
 
 `--max-bytes` bounds the cache's physical footprint, reported as
 `total_bytes`. On Linux it comes from each file's extent map, so blocks shared
-by reflinked gate snapshots count once, and evicting an entry is credited only
-with the blocks no surviving entry still references. An action is credited
-with the blobs only it referenced. Files without an exact extent map, and every
-file on other platforms, count their allocated size as unshared, which can
+by reflinked copies count once, and evicting an entry is credited only with
+the blocks no surviving entry still references. Files without an exact extent
+map, and every file on other platforms, count their allocated size, which can
 over-count clones but never under-counts. `apparent_bytes` reports the sum of
 file lengths for comparison.
 
 A waiting collector closes cache admission before draining existing readers.
-Active readers remain concurrent; new readers wait until collection finishes.
-Snapshot waiters release their maintenance lease before waiting for a producer,
-so that producer can still finish and publish without a collector lock cycle.
-The admission fence is an OS file lock: process exit releases it without stale
-marker repair. Upgrade every reader and collector sharing a cache together;
-older binaries do not participate in this admission protocol.
+Active readers continue; new readers wait until collection finishes. The
+admission fence is an OS file lock, so process exit releases it. Upgrade every
+reader and collector sharing a cache together.
 
-Without explicit capacities the ledger uses detected host logical CPUs and
-physical memory, rather than the acceptance benchmark's reference machine.
-The driver passes its selected capacities into the strict sandbox so compiler
-wrappers share the same accounting even when host discovery is hidden there.
-Set explicit capacities to reserve resources for other workloads. Undetectable
-capacity requires explicit configuration; values exceeding detected host
-capacity are rejected.
+### Resource ledger
 
-`CARGO_REAPI_RESOURCE_LEDGER` selects a separate shared physical-action ledger.
-Use the same path and capacity settings for all workers on one physical host,
-including workers with separate project artifact caches. The driver, snapshot
-restoration and strict sandbox all honor this setting. Only that directory is
-added to the sandbox's allowed paths. Without an explicit setting, the ledger
-lives in `resource-ledger-v1` below the selected cache directory. Keep writable
-target directories private to each worker; sharing a ledger does not share
-artifacts or target state.
-
-The complete local proof runner has no concurrency or threshold flags. It cold-seeds one
-producer, retires that producer path, then runs the full canonical gate in one, five, and
-ten clean worktrees. The five and ten populations are launched simultaneously and their
-timestamps and action logs are revalidated by the embedded contract:
-
-```sh
-sudo -v
-target/release/cargo-reapi-auditor run \
-  --report /path/to/proof-report/resource-proof.json -- \
-  acceptance/run-moria-local.sh \
-  /path/to/Moria \
-  /shared/cargo-reapi-cache \
-  /path/to/proof-report \
-  ssd
-```
-
-The final local runner requires macOS Full Disk Access for `/usr/bin/eslogger`
-and a current operator-authorized `sudo` session. Its tool-selected OS event
-stream is independent of cargo-reapi's wrapper and action log. Rotational mode
-uses the fixed compatibility clocks but cannot substitute for the SSD result.
-
-The default log is `cargo-reapi/actions.jsonl` in the target directory Cargo uses for the invocation; a relative `--action-log` is relative to the directory cargo-reapi starts in. Cache mode deliberately requires an explicit cache directory so separate worktrees share only the operator-selected store. REAPI mode expects `reproxy` to be started and stopped through reclient's `bootstrap` lifecycle outside each individual Cargo action. To prove there is no semantic change, compare the exit status and artifacts with the same Cargo command without the wrapper.
-
-Strict snapshot execution denies network access, denies reads outside the
-workspace/package/toolchain/configuration/declared-input set, and denies writes
-outside target, cache, action log, Cargo locks, and provider-private temporary
-state. Build scripts and proc macros that need another deterministic input must
-receive it through `--declared-input`; undeclared filesystem or network effects
-fail the gate and publish no snapshot. `--snapshot-policy off` is an explicit
-uncached compatibility mode, not a fallback: strict mode never silently
-degrades when the provider or an OS primitive is unavailable.
-
-#### What is cached, and what runs as plain Cargo
-
-cargo-reapi caches only what it can prove safe. Everything else runs the
-exact Cargo command you typed, uncached: nothing is restored, recorded or
-wrapped, and cargo-reapi prints one stderr line, `cargo-reapi: not caching
-(<reason>); running Cargo uncached`. A decline is never an error. The checks
-apply only when caching would happen, so `--backend local`, `--backend
-capture` and `--snapshot-policy off` never inherit them. When the invocation
-was resolved far enough for the strict sandbox, the uncached run stays inside
-it; a decline reached before or without a resolved project, or because the
-target overlaps the project, runs Cargo plainly, since nothing is cached there
-and the sandbox exists only to keep cache keys sound. A sandbox that cannot be
-started is not a decline: cargo-reapi fails with its own message ("the strict
-sandbox is unavailable, so Cargo was not run") and does not run Cargo.
-
-Only `build`, `check`, `clippy`, `test`, `run`, `bench` and `doc` (and Cargo's
-`b`, `c`, `d`, `r`, `t`) are cached. Any other command, and `--help`,
-`-h`, `--version`, `-V` and `--list`, run as plain Cargo before any metadata
-run, so they never fetch, resolve or write a lockfile. `run` caches only its
-build: the gate is the `build --bin <name>` for the one binary `run` builds
-(arguments after `--` dropped; the name from `--bin` or `--example`, else
-the one binary of the packages Cargo selects: `-p`'s package, else at the
-workspace root manifest the workspace's `default-members`, else inside a member
-that member; then its only binary, or the single `default-run`), and the
-program then runs through Cargo as usual, outside the cache and the sandbox,
-with its own stdin and stdout, exactly once. A `run` whose binary cannot be
-told exactly (several binaries and no single `default-run`, `--workspace`,
-a package id that is none of the project's) declines, as does a `run` given an
-option only `build` takes (`--all-targets`) or arguments without `--`,
-and so does a selection Cargo rejects before compiling: a glob or unknown
-name, several `--bin` or `--example`, a non-executable example. Nothing is
-built for these.
-`--open` (`doc --open`) declines too, since a cache hit would never open the
-viewer.
-
-Because the sandboxed Cargo runs offline, cargo-reapi acquires dependency
-sources first, outside the sandbox, with `cargo metadata --locked` for the
-project the invocation selects. Preparation never changes the project: with
-`--locked` Cargo cannot write `Cargo.lock`, so a missing lockfile, one that
-would change, or any metadata failure (an offline build whose unrelated
-dev-dependency sources are not cached, say) declines. Create the lockfile
-first (`cargo generate-lockfile`, or any ordinary build), and a cached build
-finds it.
-
-cargo-reapi does not emulate Cargo's command line or configuration. It reads
-the plain option forms Cargo documents, separated or attached: the manifest
-(`--manifest-path`, `-m`), the lockfile and network policy (`--locked`,
-`--frozen`, `--offline`, each passed to `cargo metadata` once), the features
-(`--features`, `-F`, including an empty `-F=`, `--all-features`,
-`--no-default-features`), the package selection (`-p`, `--workspace`,
-`--exclude`), the target directory (`--target-dir`), and a fixed list of
-other options the cached subcommands take (`--release`, `--profile`,
-`--all-targets`, `--bin`, `--test`, `-j`, `--message-format` and so on). Features
-without a package selection reach `cargo metadata` as given, so an offline
-build acquires only what its features need. With a package selection `cargo
-metadata` cannot apply them as Cargo does, so it resolves every feature, and
-such an invocation with `--offline` or `--frozen` declines.
-
-Whatever it cannot read exactly declines, with the reason in the line above:
-
-- any option after the subcommand that is not in that list, such as the older
-  `--lockfile-path`, and `--ignore-rust-version`, which changes how Cargo
-  selects dependencies;
-- a user-defined alias, from `[alias]` in any Cargo configuration file or a
-  `CARGO_ALIAS_<NAME>` variable, including one that redefines a built-in alias
-  such as `b`. Cargo's own commands and its unredefined built-in aliases
-  (`b`, `c`, `d`, `r`, `rm`, `t`) are read as usual;
-- any invocation when a configuration file cannot be read completely, as when
-  it `include`s another file, which cargo-reapi does not follow;
-- configuration that changes what Cargo builds in a way cargo-reapi neither
-  reads nor keys, in a configuration file or its environment equivalent:
-  `resolver.lockfile-path` (`CARGO_RESOLVER_LOCKFILE_PATH`), the compiler and
-  wrappers `build.rustc`, `build.rustdoc`, `build.rustc-wrapper` and
-  `build.rustc-workspace-wrapper` (`CARGO_BUILD_RUSTC*`, `RUSTC_WRAPPER`,
-  `RUSTC_WORKSPACE_WRAPPER`; an empty wrapper is no wrapper), the separate
-  intermediate directory `build.build-dir` (`CARGO_BUILD_BUILD_DIR`), and any
-  `[unstable]` table or `CARGO_UNSTABLE_*` variable. A custom `RUSTDOC` is
-  honored, and its contents are part of the gate key;
-- `--config`, except `KEY=VALUE` overrides of `profile.*`, `term.*` and
-  `build.jobs`, which cannot change the project, sources, lockfile or target
-  directory;
-- `-Z` flags and `-C`;
-- options before the subcommand other than `-v`, `-q`, `--verbose`,
-  `--quiet`, `--locked`, `--frozen`, `--offline`, `--color`, `--config` as
-  above, `--version`, `--help` and `--list`, and `--` before the subcommand;
-- a cluster of short options that holds one taking a value, such as `-qm`;
-- a target whose `cargo-reapi` administrative directory is not a real
-  directory, or holds a symlink: the driver writes its marker and default
-  action log there outside the sandbox, so a link would send those writes
-  elsewhere.
-
-The target directory is `--target-dir`, else `CARGO_TARGET_DIR`, else the one
-Cargo reports for the selected project. A whole-gate snapshot is restored into
-the target, which the gate does not hash, so its canonical path (symlinks
-resolved, the deepest existing ancestor for a directory not created yet) must
-be disjoint, in both directions, from the working directory, the selected
-workspace, every package in the resolve (path dependencies outside the
-workspace included), every directory holding a package's target sources
-(`src`, `src/bin`, `examples`, `tests`, `benches`) and every declared input.
-Anything else declines. The one exception is Cargo's own default,
-`<workspace root>/target`, which Cargo owns: `moria_cargo`'s
-`CARGO_TARGET_DIR=<checkout>/target` is exactly that. A directory named
-`target` anywhere else is ordinary source. This means a root package that
-wants an overlapping layout (`target-dir = "."` or `"data"`) must use an
-external target directory to be cached.
-
-#### When a gate hit may touch the target
-
-The whole-gate snapshot exists for clean consumers: a new checkout, worktree
-or container that has never built. A gate may write into a target only when
-the target is absent, or holds nothing but the two files Cargo keeps at the top
-of every target (`.rustc_info.json` and `CACHEDIR.TAG`, regenerated on demand
-and not build output). cargo-reapi's own `cargo-reapi/` directory is content:
-what is in it cannot be told from a project's own input by its name. A snapshot is
-restored only into such a target, and a restore never overwrites a file that is
-already there. A producer likewise publishes only when it started from a clean
-target, so a snapshot holds exactly what one clean build wrote and never
-another run's artifacts.
-
-A file under `cargo-reapi/` that rustc's dependency files list as read, such
-as a generator's file in the build's temporary directory (`TMPDIR` is
-`target/cargo-reapi/hermetic-tmp`), is recorded with its digest when a gate is
-published and checked by content on every marker hit; a snapshot that has any
-is never restored into another target, which cannot have them.
-
-One other state is a hit without a restore: the target holds exactly the files
-a marker recorded when the gate last left it, each with the size, modification
-time, change time and inode recorded then, and `cargo-reapi/` holds only
-entries cargo-reapi writes, none a link. The marker alone proves nothing: an
-extra file, or an output another Cargo run replaced, changed or deleted,
-fails the check.
-
-Every other target state skips the gate and runs Cargo with the per-action
-cache, as before any gate existed: nothing is restored, nothing is published,
-and Cargo's old fingerprints (`<target>/<profile>/.fingerprint` and
-`<target>/<triple>/<profile>/.fingerprint` of directories holding Cargo's
-`.cargo-lock`, and no other directory of that name) are cleared so it plans
-again. A source edit in a
-checkout that has built therefore costs a Cargo run over cached compiler
-actions, not a restore.
-
-Each snapshot records a content digest of every file when it is published,
-and every digest is checked against the bytes before anything is restored. The
-check covers every entry of the snapshot, whatever its name, and a restore copies
-the snapshot and nothing else. A snapshot that fails it is evicted and never
-restored; the gate runs as a producer instead.
-
-Everything the driver writes in the target outside the sandbox (the marker, the
-hit record in the action log, the removal of a stale marker) goes through a
-directory handle opened on the canonical target and one `openat` per path
-component with `O_NOFOLLOW`, so a symlink a build script planted, anywhere on
-the path, cannot redirect it into the source.
-
-#### What the keys hash
-
-The gate key hashes the selected workspace root, the working directory and
-every local package by its real directory, directories by name as well as files
-(an empty subdirectory is part of what a build script that lists them reads;
-declared directory inputs are keyed the same way), with no exclusion by name except
-`.git` (below): only the canonical target directory and the action log are
-left out. A directory named `target` inside a source tree is hashed, and so is
-a package reached through a symlink or a virtual workspace beside the working
-directory.
-
-Each cached compile is also a hit only while every file in rustc's own
-dep-info still resolves to the file it did, with the content recorded when the
-entry was made (paths are resolved as the kernel does, a link followed by `..`
-included, and rustc's escaping, spaces only, is read exactly), the way
-`sccache` keys a compile. The action key covers the command line, the package
-directory and `OUT_DIR`, but `include!`, `include_str!` and `#[path]` can read a
-file anywhere under the workspace, so the entry lists each such input with its
-digest and a changed one is a miss. A dep-info that cannot be read, or that
-lists a file outside the package, workspace, target and toolchain, is not
-published.
-
-**Build scripts get no Git state under caching.** The strict sandbox denies
-reads of every entry named `.git` (a directory or a file) beneath the trees the
-gate hashes, and of the Git directory a `.git` file names, so a build script
-that runs `git rev-parse` or `git describe` finds no repository, in a main
-clone and in a linked worktree alike. The gate key then does not hash `.git`.
-Every part of a repository can change a build script's answer (a reflog, an
-abbreviated object name that gets longer when an unreachable object is added),
-so no partial hash of it is sound; no hash at all, with the state denied, is.
-A build that needs the commit must receive it through a declared input or the
-environment.
-
-A Git dependency is different because Cargo itself opens its checkout's `.git`
-under the sandbox, so it cannot be denied there. The gate key hashes the whole
-repository state of every Git dependency's checkout instead: every file of
-`.git` by content, and the loose objects and pack data under `objects` by name
-and size, which name their content; `objects/info` and a pack's `.idx`, `.keep`
-and `.rev` files carry state their names do not and are hashed by content, so a
-new tag, a reflog entry or an object that lengthens an abbreviated name changes
-the key. A checkout whose repository has `objects/info/alternates` borrows
-objects from elsewhere and declines.
-
-An entry of the action cache written by another version of cargo-reapi is a
-miss, never an error, and action keys carry the cache layout's version. The
-audit observer's variables (`CARGO_REAPI_RUSTC_TRACE`, `CARGO_REAPI_REAL_RUSTC`)
-never reach a compile. They are given only to a compiler that carries the
-observer shim's marker line, which removes them before the real compiler
-runs; every other compiler has them stripped, whatever else is set.
-
-Everything an action observed outside the hashed trees is recorded when a gate
-is published and checked by content on every hit: build scripts' declared paths
-and variables (relative paths resolved against their package), files the
-compiles' dependency files list, and the native inputs and linker of every link,
-which the compiler wrapper records. An input that cannot be verified is a miss.
-
-Every write cargo-reapi makes to storage a build can write follows one policy:
-no link is followed; a file is changed in place only by a locked append to a
-regular file with a single link; anything else is replaced by a new file
-renamed over it; lock files are opened without following links and only locked.
-`docs/handoff.md` lists them. Nothing a build can write is something the driver
-writes after it, outside the sandbox: the sandbox's policy makes the cache's `gate-snapshots` and
-`access/gates` read-only to the build, and the action log is appended to only
-as a regular file with a single hard link, opened without following links; any
-other kind of file at its name is replaced by a new one.
+Compiles that miss the cache lease CPU and memory from one host-wide ledger,
+so many concurrent Cargo runs do not oversubscribe the machine; cache hits
+never take a lease. `CARGO_REAPI_RESOURCE_CPU_CAPACITY` and
+`CARGO_REAPI_RESOURCE_MEMORY_GIB_CAPACITY` set its capacity; without them it
+uses the host's logical CPUs and physical memory, and values above those are
+rejected. `CARGO_REAPI_RESOURCE_LEDGER` selects the ledger directory (by
+default `resource-ledger-v1` in the cache directory); use the same path and
+capacities for every worker on one host, even with separate caches. A compile
+that waits 300 seconds for a lease while no other lease is released fails as
+an infrastructure stall.
 
 ### Compile environment
 
-In cache mode, each compile runs with only the environment variables its
-action key covers. Every other variable is removed before rustc starts, so an
-unkeyed variable cannot change an artifact, and unrelated shell state (`OLDPWD`,
+In cache mode, each compile runs with only the environment variables its key
+covers. Every other variable is removed before rustc starts, so an unkeyed
+variable cannot change an artifact, and unrelated shell state (`OLDPWD`,
 `PWD`, terminal and agent session variables) does not split the cache between
 shells. A compile receives:
 
@@ -553,27 +191,21 @@ shells. A compile receives:
 - variables rustc recorded as `# env-dep:` dependencies (`env!`, `option_env!`
   and tracked proc-macro reads). The first compile that tracks a set variable
   it was not given is repeated with it, and the cache remembers the name for
-  that crate. If such a compile had already succeeded, it fails once with an
-  explanation instead, because Cargo may already have used its artifacts; the
-  next build passes the variable. Whole-gate snapshots are keyed on every
-  name remembered, so a snapshot built before a crate learned a variable is
-  never restored after. A compile that reads one of cargo-reapi's own
-  settings sees it unset, as under plain Cargo;
+  that crate, so later compiles of the crate are keyed on it and an entry made
+  before is never restored. If such a compile had already succeeded, it fails
+  once with an explanation instead, because Cargo may already have used its
+  artifacts; the next build passes the variable. A compile that reads one of
+  cargo-reapi's own settings sees it unset, as under plain Cargo;
 - every name in `CARGO_REAPI_DECLARED_ENV`, a comma-separated list.
 
 cargo-reapi's own settings (action log, cache directory, backend, worktree
 roots and resource capacity) are read by the wrapper only; they never reach a
-compile and are not keyed. The audit observer's `CARGO_REAPI_REAL_RUSTC` and
-`CARGO_REAPI_RUSTC_TRACE` reach only a compiler that is the observer shim.
+compile and are not keyed.
 
 Search lists (`PATH`, `LD_LIBRARY_PATH`, `LIBRARY_PATH`, `COMPILER_PATH` and
 the `DYLD_*` library paths) reach the compile as the canonical directories
 they resolve through, and are keyed by that value, so a per-shell symlink to
-the same directory does not change the key. Lookups find the same files, and
-a compile that reads the list sees exactly what its key covers. The
-compiler's binary digest,
-version, host and arguments, including `--target`, stay in the key, so
-different toolchains never share an entry.
+the same directory does not change the key.
 
 A proc macro that reads a variable through `std::env` is invisible to rustc's
 dependency tracking, so it sees that variable as unset unless the variable is
@@ -591,35 +223,75 @@ variables removed from it on stderr. The action log records the same list as
 If cargo-reapi cannot determine a compile's environment (the driver did not
 start Cargo, the compile emits no dep-info, or the build script's output is
 unreadable), that compile runs with the whole environment and keys all of it.
-Capture mode runs compiles with the caller's whole environment and records
-the key a cached compile would start with. REAPI mode keys actions the same way,
-sends remote actions only Cargo's compiler variables, a subset of that key,
-and runs local fallbacks with the whole environment.
-Build scripts always run under Cargo with its whole environment. Whatever they
-produce reaches a compile only as `OUT_DIR` contents, compiler arguments or
-`rustc-env` values, and all of those are action inputs. So a build script that
-reads an undeclared variable cannot cause a wrong action hit; whole-gate
-snapshots key the entire environment.
+Link steps and other uncached compiles run with the whole environment. Capture
+mode runs compiles with the caller's whole environment and records the key a
+cached compile would start with.
 
-For Linux container consumers, build the repository's image rather than bind-mounting a host binary across an OS boundary:
+### Writes where a build can write
+
+Build scripts and proc macros can write in the target and wherever else the
+user can, so any path there may become a link while a build runs. Every write
+cargo-reapi makes to such storage (the action log, path-mapping records,
+restored outputs, locks) follows one policy: no link is followed; a file is
+changed in place only by a locked append to a regular file with a single
+link; anything else is replaced by a new file renamed over its name; lock
+files are opened without following links and only locked.
+
+### Remote execution
+
+The reclient adapter stages eligible compiles into explicit input roots,
+invokes the production `rewrapper` client with declared inputs and outputs,
+and materializes successful outputs into Cargo's target directory:
+
+```sh
+cargo reapi --backend reapi \
+  --rewrapper /opt/reclient/rewrapper \
+  --rewrapper-cfg /etc/cargo-reapi/rewrapper.cfg \
+  --reclient-staging-dir /shared/cargo-reapi-stage \
+  --reclient-platform 'OSFamily={os},Arch={arch},toolchain_sha256={toolchain_sha256}' \
+  -- check
+```
+
+Eligibility fails closed: link steps never go remote, and the platform
+template must bind `{os}`, `{arch}` and `{toolchain_sha256}` so a compile
+cannot run against a mismatched worker toolchain. It requires an
+operator-provided reclient installation, a running `reproxy` and a
+platform-matched REAPI service. The test suite exercises the adapter against a
+behaviorally faithful fake `rewrapper`; it has not been validated against a
+live service.
+
+### Containers
+
+For Linux container consumers, build the repository's image rather than
+bind-mounting a host binary across an OS boundary:
 
 ```sh
 docker build -t cargo-reapi:local .
 ```
 
-The image is also suitable as an init artifact source: its executable is at `/usr/local/bin/cargo-reapi`. Bro's optional local overlay uses that boundary, so cargo-reapi remains independently built and is not copied into Bro's source tree.
+Its executable is at `/usr/local/bin/cargo-reapi`.
+
+## History
+
+Versions up to 0.2.10 also restored a whole quality gate's target state in one
+step and ran Cargo in a sandbox to make that sound. That design, its
+acceptance harness and the measurements in [`benchmarks/`](benchmarks/README.md)
+and [`docs/`](docs/architecture.md) are historical: they describe the earlier
+design, not this one.
 
 ## Design constraints
 
-- Cargo owns dependency resolution, features, build scripts, proc macros, profiles, and command ordering.
-- The wrapper may distribute compiler actions; it must not regenerate Cargo's graph.
-- Action keys include all declared inputs, the toolchain identity, compiler arguments, and relevant environment.
-- Remote execution must match the host/target platform contract. Native test and proc-macro artifacts cannot cross OS or architecture boundaries.
-- Missing inputs or unsupported actions fail closed or execute locally according to explicit policy.
-- Logical quality gates remain concurrent. The shared ledger bounds only physical compiler/linker misses; identical work coalesces and cache hits proceed without heavy-action admission.
-
-See [docs/architecture.md](docs/architecture.md) for the implementation boundary and milestones.
+- Cargo owns dependency resolution, features, build scripts, proc macros,
+  profiles and command ordering.
+- The wrapper may distribute compiles; it must not regenerate Cargo's graph.
+- Keys include every input a compile reads, the toolchain identity, the
+  compiler arguments and the relevant environment. What cannot be keyed runs
+  uncached.
+- Remote execution must match the host and target platform contract.
 
 ## Project policy
 
-This is infrastructure built first for the Moria/Bro workload and shared in public as-is. Issues with reproducible action captures are welcome, but publication does not promise compatibility with every Cargo project, hosted workers, or support response times. Correctness and fail-closed behavior take priority over backend coverage.
+This is infrastructure built first for the Moria/Bro workload and shared in
+public as-is. Issues with reproducible action captures are welcome, but
+publication does not promise compatibility with every Cargo project, hosted
+workers, or support response times. Correctness takes priority over coverage.

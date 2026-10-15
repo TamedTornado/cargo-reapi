@@ -4,151 +4,78 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
-### Narrowing (work in progress on branch `narrow-0216`)
+cargo-reapi is now a per-compile cache, in the model of `sccache`. Cargo runs
+every time and plans every build; cargo-reapi caches the individual rustc
+compiles it is asked to run.
 
-cargo-reapi is narrowed to per-action compile caching. Removed outright:
-the whole-gate snapshot, restore, marker, gate key and `gate-inputs.jsonl`; the
-strict `srt` sandbox, `--snapshot-policy`, `--declared-input` and the
-`CARGO_REAPI_SRT` variable; the `cargo metadata --locked` preflight and the
-selection, run-resolution and target-disjointness rules; link-input discovery
-and the linker capture (`CARGO_REAPI_LINKER_CAPTURE`,
-`CARGO_REAPI_REAL_LINKER`, `CARGO_REAPI_DEFAULT_LINKER`, `link-captures`); the
-rustc query shim and its cache; `CARGO_REAPI_ACTION_CACHE_TEST_MODE`,
-`CARGO_REAPI_GATE_INPUTS` and `CARGO_REAPI_CLONE_TRACE`; the doctor's sandbox
-and clone fields. `CARGO_REAPI_TARGET_ROOT` is set by the driver and a value
-the caller sets is overwritten, as before. Passing a removed option is a clap
-error; the removed variables above are no longer read. Link steps (binaries,
-tests, proc macros and other dynamic libraries) and compiles whose `-L`/`-l`
-reach outside the workspace, build output and sysroot always run uncached.
-`cache gc` removes the directories earlier versions kept (`gate-snapshots`,
-`access/gates`, `rustc-query-cache-v1`, `discoveries`, `link-captures`,
-`file-digests`) and reports them as `removed_obsolete_directories`; its report
-keeps `schema_version` 2 for the trim script.
+### What is cached, and what runs fresh
 
+- A library compile (an `rlib`, or only its metadata) is cached. Its key
+  covers the compiler's identity, its arguments, its keyed environment, every
+  file in the package directory and in `OUT_DIR`, and every file directly in
+  each `-L` native search directory inside the workspace, target or package,
+  so a static library an rlib bundles is keyed by content. An entry is a hit
+  only while every file in rustc's own dep-info still has the content it had,
+  so `include!` and `include_str!` inputs outside the package invalidate it.
+- A link step runs every time: binaries, tests, examples, benches, proc
+  macros, `cdylib`, `dylib` and `staticlib` crates. The linker reads libraries,
+  start files and itself from places the key does not cover.
+- A compile with a `-L` directory outside the workspace, target, package and
+  the compiler's sysroot, or a `-l` library not found in an inside `-L`
+  directory, runs uncached. The action log records it as `local-ineligible`
+  with the reason.
+- A build whose configuration already names a compiler wrapper
+  (`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, their `CARGO_BUILD_*` forms,
+  `build.rustc-wrapper` or `build.rustc-workspace-wrapper` in a configuration
+  file or a `--config` argument) runs as plain Cargo, with one line on stderr.
+  A `--config` wrapper used to be replaced silently.
 
-cargo-reapi now caches only what it can prove safe; everything else runs as
-plain Cargo. Several faults below could serve a stale gate hit or overwrite
-source.
+### Assumptions
 
-- A decline is never an error. When an invocation cannot be proven safe to
-  cache, or preparing it fails for any reason, cargo-reapi runs the exact Cargo
-  command uncached, restores and records nothing, and prints one line,
-  `cargo-reapi: not caching (<reason>); running Cargo uncached`. A resolved
-  project keeps the strict sandbox for the uncached run. Refusals used to be
-  errors, and applied to `--backend local` and `capture` as well, so a valid
-  alias failed there; the checks now apply only where caching would happen.
-- Only `build`, `check`, `clippy`, `test`, `run`, `bench` and `doc` are cached.
-  Other commands, `--help` and `--version` run as plain Cargo before any
-  metadata run; they used to resolve and fetch first, could create the
-  lockfile, and failed outside a project.
-- Preparation never changes the project: `cargo metadata` runs with
-  `--locked`. A missing or outdated lockfile, or a metadata failure such as an
-  offline library build whose dev-dependency sources are not cached, declines
-  instead of writing the lockfile or failing. An alternate lockfile
-  (`CARGO_RESOLVER_LOCKFILE_PATH`, `resolver.lockfile-path`) and
-  `--ignore-rust-version` decline; the gate did not track the former, and
-  preparation silently dropped the latter, choosing dependencies Cargo would
-  not have.
-- The target directory must be disjoint from every project directory in both
-  directions: the working directory, selected workspace, every package root,
-  source directory and declared input. Only Cargo's own default,
-  `<workspace root>/target`, is exempt. `build.target-dir = "data"` over an
-  `include_str!` data directory used to pass and let a hit restore over edits.
-- Hashing has no exclusions by name, except `.git`. A source directory named
-  `target` (`include_str!("target/message.txt")`) was skipped by the gate key
-  and by rustc input discovery, so an edit returned the old binary. Only the
-  canonical target directory is left out. The strict sandbox now denies reads
-  of every `.git` (directory or file) and the gitdir it names, in a main clone
-  as in a linked worktree, and `.git` is not hashed: no partial hash of a
-  repository is sound (reflogs and abbreviated object names can change a build
-  script's answer), so a build script gets no Git state under caching.
-- A gate writes into a target only when it is absent or clean (nothing but
-  cargo-reapi's directory and Cargo's `.rustc_info.json` and `CACHEDIR.TAG`),
-  and a producer publishes only from one. A restore had overwritten files
-  already there: an `include_str!` input inside Cargo's own default target, and
-  other builds' artifacts that a snapshot of the whole target carried. Any
-  other target state skips the gate and runs Cargo with the per-action cache.
-- A marker alone never proves a hit. It records the size, times and inode of
-  every file the gate left, and a hit needs exactly that set of files to be
-  there with those identities; a plain `cargo build --features extra` into the
-  same target used to leave its executable in place of the cached one.
-- Snapshots record a content digest of every file when published and verify
-  them before restoring; a mismatch evicts the snapshot.
-- Every cached compile is a hit only while every file in rustc's own dep-info
-  still matches its recorded digest. A file included from outside the package
-  directory (`include!("../../shared/body.rs")`) did not key the compile, so
-  editing it returned the old successful result.
-- Options after the subcommand that cargo-reapi does not know decline,
-  including the older `--lockfile-path`, as do `[unstable]` configuration and
-  `CARGO_UNSTABLE_*`; configured compilers and wrappers (`build.rustc`,
-  `build.rustdoc`, `build.rustc-wrapper`, `build.rustc-workspace-wrapper` and
-  their environment forms) and `build.build-dir`/`CARGO_BUILD_BUILD_DIR`
-  decline instead of being overridden or left out of snapshots. A custom
-  `RUSTDOC` is hashed by content.
-- `run` caches only its build, as the `build` it contains; the program then
-  runs normally with its own stdin and stdout every time. A whole-gate hit
-  used to skip the program.
-- The `cargo-reapi` directory in the target must be real, with no symlink
-  inside; a link there sent the driver's marker and log writes into source.
-- A strict sandbox that cannot start is an error that says Cargo was not run,
-  not a "running Cargo uncached" decline that then failed.
-- An action entry written by another cargo-reapi, such as a schema-1 entry
-  after upgrading, is a cache miss; reading its missing `dep_inputs` field
-  aborted the build. Action keys are namespaced by the cache layout's version.
-- `run` gates the `build --bin <name>` for the binary `run` would build
-  (`--bin`, `--example`, `-p`, `default-run`, the only binary), not every
-  binary of the package, and declines when that cannot be told; a gate
-  preparation failure never runs the program inside the sandbox as well as
-  outside it. `--open` declines.
-- Every driver write in the target after a build (the marker, the hit record)
-  opens beneath a handle with `O_NOFOLLOW`, so a link a build script planted
-  cannot redirect it into source. Snapshot verification covers every entry a
-  restore copies. Fingerprint invalidation removes only Cargo's own
-  `.fingerprint` directories. cargo-reapi's own directory in the target counts
-  as content for cleanliness, and a marker hit needs it to hold only what
-  cargo-reapi writes.
-- Dep-info inputs are resolved as the kernel does (a link then `..`) and
-  parsed with rustc's escaping, spaces only; a changed file behind either was
-  not noticed.
-- A Git dependency's checkout repository state is part of the gate key, since
-  Cargo needs its `.git` readable. The audit observer's variables no longer
-  reach the compiler.
-- Directories are keyed by name as well as files, empty ones included, in tree
-  hashing and in declared and observed directory inputs: a build script that
-  lists a directory saw a new empty subdirectory only after a rebuild nothing
-  forced.
-- A file under `cargo-reapi/` that rustc's dependency files list as read (a
-  generator's file in the build's temporary directory) is checked by content on
-  every marker hit; a snapshot with such files is never restored elsewhere.
-- Git dependency repositories hash `objects/info` and pack index, `.keep` and
-  `.rev` files by content, and a checkout with alternates declines.
-- `run` resolves its package as Cargo does (`-p`, the workspace's
-  `default-members` at its root, else the member) and declines glob, unknown,
-  repeated and non-executable `--bin`/`--example` selections before building.
-- The audit variables are removed from every compiler that does not carry the
-  observer shim's marker; setting `CARGO_REAPI_REAL_RUSTC` no longer opens
-  them to an ordinary compiler.
-- The sandbox makes the cache's `gate-snapshots` and `access/gates` read-only
-  to builds, and the action log is only appended to as a single-link regular
-  file; a build could plant a link there that the driver wrote through.
-- Test hooks are compiled only with the `test-hooks` feature, documented as
-  for the crate's own tests: the coalescing signal and
-  `CARGO_REAPI_ACTION_CACHE_TEST_MODE`. The integration tests that need them
-  require it; run the suite with `cargo test --features test-hooks`.
-- Selected packages are hashed by their real directories: a package selected
-  through a symlink counted as hashed by the working directory's scan, so an
-  edit got a stale hit. The root of a selected virtual workspace is hashed too
-  and is readable in the sandbox.
-- User-defined aliases, `--config` beyond `profile.*`, `term.*` and
-  `build.jobs`, `-Z`, `-C`, unknown global options and short-option clusters
-  holding a value option decline instead of being emulated.
-- `-F=` is an explicitly empty feature list; a lockfile or network flag given
-  twice reaches `cargo metadata` once; features without a package selection
-  reach `cargo metadata` as given, and with `-p`, `--workspace` or `--exclude`
-  offline they decline; a target directory whose parent does not exist yet
-  works; an empty `CARGO_HOME` falls back to `$HOME/.cargo`.
-- Tests: the collection test detects a lock cycle in the kernel's lock table
-  instead of a 60 second deadline, and every regression drives real Cargo.
+Build scripts and proc macros are trusted not to be written to defeat the
+cache, and proc macros declare the files they read: rustc's dep-info lists
+the files a compile read through `include!`, `include_str!` and
+`include_bytes!`, not files a proc macro opens itself. Variables a proc
+macro reads through `std::env` reach it only when they are keyed (see the
+README).
+
+### Removed
+
+- The whole-gate snapshot, its restore, marker and key, and
+  `gate-inputs.jsonl`; the strict `srt` sandbox, `--snapshot-policy`,
+  `--declared-input` and `CARGO_REAPI_SRT`; the `cargo metadata --locked`
+  preflight and the selection, `run` and target-disjointness rules.
+- Link caching and native link-input discovery, the linker capture
+  (`CARGO_REAPI_LINKER_CAPTURE`, `CARGO_REAPI_REAL_LINKER`,
+  `CARGO_REAPI_DEFAULT_LINKER`) and Mach-O re-signing of restored outputs.
+- The rustc query shim and its cache; `CARGO_REAPI_ACTION_CACHE_TEST_MODE`,
+  `CARGO_REAPI_GATE_INPUTS` and `CARGO_REAPI_CLONE_TRACE`; the doctor's
+  sandbox and clone fields.
+- The acceptance harness: `acceptance/`, the `contract` and `prove`
+  commands, the `cargo-reapi-auditor` and `cargo-reapi-exec-auditor`
+  binaries and the rustc observer (`CARGO_REAPI_REAL_RUSTC`,
+  `CARGO_REAPI_RUSTC_TRACE`). Its warm-run criterion, zero physical compiler
+  actions, no longer holds now that link steps always run.
+
+Passing a removed option is a clap error, and the removed variables are no
+longer read. `CARGO_REAPI_TARGET_ROOT` is set by the driver; a value the
+caller sets is overwritten, as before. `cache gc` removes the directories
+earlier versions kept (`gate-snapshots`, `access/gates`,
+`rustc-query-cache-v1`, `discoveries`, `link-captures`, `file-digests`) and
+reports them as `removed_obsolete_directories`; its report keeps
+`schema_version` 2.
+
+### Kept
+
+An action entry written by another cargo-reapi version is a miss, never an
+error. Every write cargo-reapi makes where a build can write follows one
+policy (no link followed, in-place change only as a locked append to a
+single-link regular file, otherwise replace by rename). Concurrent identical
+compiles run once; misses lease CPU and memory from the shared ledger.
+
+The unreleased whole-gate work that followed 0.2.10 (declines, target rules,
+snapshot verification, sandbox hardening and their regressions) is superseded
+by this narrowing and was never released.
 
 ## [0.2.10] - 2026-10-14
 
