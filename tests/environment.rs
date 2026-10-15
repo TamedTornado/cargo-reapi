@@ -767,3 +767,71 @@ fn a_variable_that_can_never_be_passed_ends_learning() {
     );
     assert_eq!(build.executions("envkey_private"), ["local-failed"]);
 }
+
+#[test]
+fn a_sibling_of_the_package_named_in_a_variable_keeps_its_path() {
+    let roots = tempdir().expect("worktree roots");
+    let cache = tempdir().expect("shared cache");
+    // `foo-assets` begins with the package root `foo`, but is not beneath it.
+    let build_script = "fn main() {\n\
+         let manifest = std::env::var(\"CARGO_MANIFEST_DIR\").unwrap();\n\
+         println!(\"cargo::rustc-env=ASSET_DIR={manifest}-assets/data\");\n\
+         }\n";
+    for name in ["foo", "bar"] {
+        write_package(
+            &roots.path().join(name),
+            "envkey-sibling",
+            "env!(\"ASSET_DIR\")",
+            Some(build_script),
+        );
+    }
+
+    for name in ["foo", "bar"] {
+        let root = roots.path().join(name);
+        let built = cached_build(&root, cache.path(), &[]);
+        assert!(built.succeeded(), "{}", built.stderr());
+
+        let expected = format!(
+            "{}-assets/data",
+            root.canonicalize().expect("package root").display()
+        );
+        assert_eq!(
+            run_binary(&root.join("target/debug/envkey-sibling")),
+            expected
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn variables_that_are_not_utf8_neither_stop_the_wrapper_nor_share_a_key() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let roots = tempdir().expect("worktree roots");
+    let cache = tempdir().expect("shared cache");
+    let body = "env!(\"CARGO_PKG_NAME\")";
+    for name in ["first", "second"] {
+        write_package(&roots.path().join(name), "envkey-bytes", body, None);
+    }
+    // Each value is one byte that is not UTF-8; read lossily, both would be
+    // the same replacement character.
+    let build = |name: &str, keyed: &[u8]| {
+        let root = roots.path().join(name);
+        let mut command = cargo_reapi(&root, cache.path(), &["build"], &[]);
+        command
+            .env(
+                "ENVKEY_UNRELATED_BYTES",
+                std::ffi::OsStr::from_bytes(b"\xff"),
+            )
+            .env("RUST_ENVKEY_BYTES", std::ffi::OsStr::from_bytes(keyed));
+        finished_build(&root, command.output().expect("run cargo-reapi"))
+    };
+
+    let first = build("first", b"\xfe");
+    assert!(first.succeeded(), "{}", first.stderr());
+    assert_eq!(first.executions("envkey_bytes"), ["local-cache-miss"]);
+
+    let second = build("second", b"\xfd");
+    assert!(second.succeeded(), "{}", second.stderr());
+    assert_eq!(second.executions("envkey_bytes"), ["local-cache-miss"]);
+}

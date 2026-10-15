@@ -284,12 +284,16 @@ impl CompileEnvironment {
         env::vars_os()
             .filter_map(|(name, value)| {
                 let value = Self::compiler_value(&name, &value);
-                let name = name.to_string_lossy().into_owned();
-                if !self.keys(&name) {
+                if !self.keys(&name.to_string_lossy()) {
                     return None;
                 }
-                let normalized = normalize(&value.to_string_lossy());
-                Some((name, format!("sha256:{:x}", Sha256::digest(normalized))))
+                Some((
+                    lossless_name(&name),
+                    format!(
+                        "sha256:{:x}",
+                        Sha256::digest(keyed_bytes(&value, &normalize))
+                    ),
+                ))
             })
             .collect()
     }
@@ -309,6 +313,34 @@ impl CompileEnvironment {
             ),
         }
     }
+}
+
+/// A variable's name as keyed. A name that is not UTF-8 is written as its
+/// bytes in hexadecimal after `=`, which no variable name contains, so two
+/// names never share a key entry.
+fn lossless_name(name: &OsStr) -> String {
+    match name.to_str() {
+        Some(name) => name.to_owned(),
+        None => format!("=non-utf-8:{}", hex(name.as_encoded_bytes())),
+    }
+}
+
+/// The bytes a value is keyed by. Text has its roots mapped by `normalize`.
+/// A value that is not UTF-8 names no root and is keyed byte for byte, after
+/// a NUL byte, which no text value contains.
+fn keyed_bytes(value: &OsStr, normalize: impl Fn(&str) -> String) -> Vec<u8> {
+    match value.to_str() {
+        Some(text) => normalize(text).into_bytes(),
+        None => [b"\0".as_slice(), value.as_encoded_bytes()].concat(),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        use std::fmt::Write;
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }
 
 /// Whether rustc, Cargo, Clippy, the dynamic loader, the C toolchain or a

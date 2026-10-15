@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::environment::CompileEnvironment;
-use crate::relocation::execution_slot;
+use crate::relocation::{execution_slot, find_whole_root};
 
 #[derive(Debug)]
 pub struct RustcInvocation {
@@ -53,6 +53,13 @@ impl RustcInvocation {
 
     pub fn crate_name(&self) -> Option<&OsStr> {
         value_after(&self.args, "--crate-name")
+    }
+
+    /// The `--target` the compile names, if any.
+    pub fn target(&self) -> Option<String> {
+        option_values(&self.args, "--target")
+            .into_iter()
+            .next_back()
     }
 
     pub fn is_link_action(&self) -> bool {
@@ -106,6 +113,36 @@ impl RustcInvocation {
             )));
         }
         Ok(())
+    }
+
+    /// Why the command line asks for something a cached compile cannot
+    /// reproduce, if it does: arguments read from a response file, which are
+    /// not analysed; an emit kind other than the dep-info, metadata and link
+    /// outputs the cache declares; or a codegen option outside
+    /// [`CACHEABLE_CODEGEN_OPTIONS`], or with a value that writes undeclared
+    /// outputs or depends on the machine.
+    pub fn unsupported_reason(&self) -> Option<String> {
+        if let Some(argument) = self
+            .args
+            .iter()
+            .find(|argument| argument.as_encoded_bytes().starts_with(b"@"))
+        {
+            return Some(format!(
+                "arguments from the response file {} are not analysed",
+                argument.to_string_lossy()
+            ));
+        }
+        if let Some((kind, _)) = emit_values(&self.args)
+            .into_iter()
+            .find(|(kind, _)| !CACHEABLE_EMIT_KINDS.contains(&kind.as_str()))
+        {
+            return Some(format!(
+                "--emit {kind} writes an output the cache does not declare"
+            ));
+        }
+        codegen_options(&self.args)
+            .into_iter()
+            .find_map(|(name, value)| unsupported_codegen_option(&name, value.as_deref()))
     }
 
     pub fn out_dir(&self) -> Option<PathBuf> {
@@ -172,7 +209,6 @@ impl RustcInvocation {
                     outputs.push(out_dir.join(format!("lib{crate_name}{extra_filename}.rmeta")));
                 }
                 "dep-info" => outputs.push(out_dir.join(format!("{crate_name}{extra_filename}.d"))),
-                "obj" => outputs.push(out_dir.join(format!("{crate_name}{extra_filename}.o"))),
                 _ => {}
             }
         }
@@ -274,33 +310,29 @@ fn relocated_environment_value(value: &OsStr, roots: &[PathBuf]) -> Result<Optio
             matches.push((root, execution_slot(root)?));
         }
     }
+    // Only a whole root is a path to relocate: `/work/foo-assets` is not
+    // beneath `/work/foo`.
+    let patterns = matches
+        .iter()
+        .map(|(root, _)| root.as_bytes())
+        .collect::<Vec<_>>();
     let mut output = String::with_capacity(value.len());
-    let mut remaining = value;
-    let mut changed = false;
-    while !remaining.is_empty() {
-        let Some((offset, root, slot)) = matches
-            .iter()
-            .filter_map(|(root, slot)| remaining.find(root).map(|offset| (offset, *root, slot)))
-            .min_by(
-                |(left_offset, left_root, _), (right_offset, right_root, _)| {
-                    left_offset
-                        .cmp(right_offset)
-                        .then_with(|| right_root.len().cmp(&left_root.len()))
-                },
-            )
-        else {
-            output.push_str(remaining);
-            break;
-        };
-        output.push_str(&remaining[..offset]);
+    let mut copied = 0;
+    while let Some((offset, index)) = find_whole_root(value.as_bytes(), copied, &patterns) {
+        let (root, slot) = &matches[index];
+        output.push_str(&value[copied..offset]);
         output.push_str(slot);
-        remaining = &remaining[offset + root.len()..];
-        if let Some(without_separator) = remaining.strip_prefix('/') {
-            remaining = without_separator;
+        copied = offset + root.len();
+        // The slot is padded with `/`, so it already ends in a separator.
+        if value[copied..].starts_with('/') {
+            copied += 1;
         }
-        changed = true;
     }
-    Ok(changed.then(|| OsString::from(output)))
+    if copied == 0 {
+        return Ok(None);
+    }
+    output.push_str(&value[copied..]);
+    Ok(Some(OsString::from(output)))
 }
 
 fn relocated_environment_path(value: &OsStr, roots: &[PathBuf]) -> Result<Option<OsString>> {
@@ -348,6 +380,110 @@ fn codegen_value(args: &[OsString], key: &str) -> Option<String> {
         .filter_map(|pair| pair[1].to_str())
         .filter_map(|value| value.split_once('='))
         .find_map(|(name, value)| (name == key).then(|| value.to_owned()))
+}
+
+/// The emit kinds whose outputs [`RustcInvocation::output_files`] declares.
+const CACHEABLE_EMIT_KINDS: &[&str] = &["dep-info", "metadata", "link"];
+
+/// The codegen options a cached compile may carry: each only changes the
+/// declared outputs' contents, which the key covers through the command line,
+/// or affects only a link step, which always runs. An option not listed here
+/// makes the compile run uncached. `save-temps` and unpacked split debuginfo
+/// write undeclared files; `profile-use` and `profile-sample-use` read files
+/// the key does not cover; `profile-generate` embeds a path.
+const CACHEABLE_CODEGEN_OPTIONS: &[&str] = &[
+    "ar",
+    "code-model",
+    "codegen-units",
+    "collapse-macro-debuginfo",
+    "control-flow-guard",
+    "debug-assertions",
+    "debuginfo",
+    "default-linker-libraries",
+    "dlltool",
+    "dwarf-version",
+    "embed-bitcode",
+    "extra-filename",
+    "force-frame-pointers",
+    "force-unwind-tables",
+    "incremental",
+    "inline-threshold",
+    "instrument-coverage",
+    "jump-tables",
+    "link-arg",
+    "link-args",
+    "link-dead-code",
+    "link-self-contained",
+    "linker",
+    "linker-flavor",
+    "linker-plugin-lto",
+    "llvm-args",
+    "lto",
+    "metadata",
+    "no-prepopulate-passes",
+    "no-redzone",
+    "no-vectorize-loops",
+    "no-vectorize-slp",
+    "opt-level",
+    "overflow-checks",
+    "panic",
+    "passes",
+    "prefer-dynamic",
+    "relocation-model",
+    "relro-level",
+    "rpath",
+    "soft-float",
+    "split-debuginfo",
+    "strip",
+    "symbol-mangling-version",
+    "target-cpu",
+    "target-feature",
+];
+
+/// Why a codegen option keeps a compile from being cached, if it does.
+fn unsupported_codegen_option(name: &str, value: Option<&str>) -> Option<String> {
+    if !CACHEABLE_CODEGEN_OPTIONS.contains(&name) {
+        return Some(format!(
+            "the codegen option -C {name} is not supported by the cache"
+        ));
+    }
+    match (name, value) {
+        // The CPU rustc resolves `native` to is not part of the key.
+        ("target-cpu", Some("native")) => {
+            Some("-C target-cpu=native depends on the machine that compiles".to_owned())
+        }
+        // `off` writes no debuginfo files and `packed` keeps them in the
+        // declared outputs; `unpacked` leaves `.dwo` files beside them.
+        ("split-debuginfo", value) if !matches!(value, Some("off" | "packed")) => Some(format!(
+            "-C split-debuginfo={} writes debuginfo files the cache does not declare",
+            value.unwrap_or_default()
+        )),
+        _ => None,
+    }
+}
+
+/// Every codegen option, as its name and value, from `-C name=value`,
+/// `-Cname=value`, `--codegen name=value` and `--codegen=name=value`.
+fn codegen_options(args: &[OsString]) -> Vec<(String, Option<String>)> {
+    let mut options = Vec::new();
+    let mut arguments = args.iter().map(|argument| argument.to_string_lossy());
+    while let Some(argument) = arguments.next() {
+        let option = if argument == "-C" || argument == "--codegen" {
+            arguments.next().map(std::borrow::Cow::into_owned)
+        } else {
+            argument
+                .strip_prefix("-C")
+                .or_else(|| argument.strip_prefix("--codegen="))
+                .map(str::to_owned)
+        };
+        if let Some(option) = option {
+            let (name, value) = option
+                .split_once('=')
+                .map_or((option.as_str(), None), |(name, value)| (name, Some(value)));
+            options.push((name.to_owned(), value.map(str::to_owned)));
+        }
+    }
+    options
 }
 
 fn emit_values(args: &[OsString]) -> Vec<(String, Option<String>)> {
@@ -459,6 +595,35 @@ mod tests {
             execution_slot(workspace.to_str().unwrap()).unwrap(),
         );
         assert_eq!(relocated, OsString::from(expected));
+    }
+
+    #[test]
+    fn only_whole_roots_in_environment_values_are_relocated() {
+        let package = PathBuf::from("/work/foo");
+        let roots = std::slice::from_ref(&package);
+        for unrelated in [
+            "/work/foo-assets/data",
+            "/work/food",
+            "/elsewhere/work/foo/data",
+        ] {
+            assert_eq!(
+                relocated_environment_value(OsStr::new(unrelated), roots).expect("relocate"),
+                None,
+                "{unrelated}"
+            );
+        }
+
+        let slot = execution_slot("/work/foo").unwrap();
+        let relocated = relocated_environment_value(
+            OsStr::new("/work/foo:/work/foo-assets:/work/foo/data"),
+            roots,
+        )
+        .expect("relocate")
+        .expect("whole roots relocate");
+        assert_eq!(
+            relocated,
+            OsString::from(format!("{slot}:/work/foo-assets:{slot}data"))
+        );
     }
 
     #[test]

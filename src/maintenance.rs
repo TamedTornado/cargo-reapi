@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,6 +138,8 @@ pub struct GcReport {
     /// Directories earlier versions kept and this one does not use, removed
     /// whole (see [`OBSOLETE_DIRECTORIES`]).
     pub removed_obsolete_directories: usize,
+    /// Temporary action files interrupted publishers left behind.
+    pub removed_temporary_files: usize,
     pub removed_blob_entries: usize,
     pub estimated_freed_bytes: u64,
     pub capacity_satisfied: bool,
@@ -162,6 +165,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
 
     let Units {
         obsolete,
+        temporaries,
         candidates,
         blobs: blob_owners,
         owners,
@@ -188,6 +192,14 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
     let removed_obsolete_directories = obsolete.len();
     for (staging, owner) in &obsolete {
         projected_free = projected_free.saturating_add(removal.remove(staging, *owner)?);
+    }
+
+    // Publishers hold the shared lease while they write, so under this
+    // exclusive one a temporary action file belongs to a publisher that was
+    // interrupted. It is not an entry and nothing will finish it.
+    let removed_temporary_files = temporaries.len();
+    for (temporary, owner) in &temporaries {
+        projected_free = projected_free.saturating_add(removal.remove(temporary, *owner)?);
     }
 
     // An action's real size is its output blobs. A blob is freed only once no
@@ -254,6 +266,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         after,
         removed_action_entries,
         removed_obsolete_directories,
+        removed_temporary_files,
         removed_blob_entries,
         capacity_satisfied,
     })
@@ -263,6 +276,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
 /// footprint knows exactly which physical bytes removing it frees.
 struct Units {
     obsolete: Vec<(PathBuf, OwnerId)>,
+    temporaries: Vec<(PathBuf, OwnerId)>,
     /// Least recently used first.
     candidates: Vec<(Candidate, OwnerId)>,
     blobs: BTreeMap<String, (OwnerId, PathBuf)>,
@@ -285,6 +299,14 @@ fn removable_units(cache_root: &Path) -> Result<Units> {
             (path, owner)
         })
         .collect();
+    let temporaries = action_files(cache_root)?
+        .temporaries
+        .into_iter()
+        .map(|path| {
+            let owner = register(&path);
+            (path, owner)
+        })
+        .collect();
     let mut candidates = candidates(cache_root)?;
     candidates.sort_by_key(|candidate| candidate.last_used);
     let candidates = candidates
@@ -301,6 +323,7 @@ fn removable_units(cache_root: &Path) -> Result<Units> {
 
     Ok(Units {
         obsolete,
+        temporaries,
         candidates,
         blobs,
         owners,
@@ -450,35 +473,68 @@ fn obsolete_directories(cache_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The action entries a collection may evict, with when each was last used.
-fn candidates(cache_root: &Path) -> Result<Vec<Candidate>> {
+/// The action key a committed action manifest's file name carries: the
+/// manifest is published by renaming a complete temporary file to
+/// `<key>.json`, where the key is a SHA-256 in lowercase hexadecimal. Any
+/// other file in `actions` is a temporary file a publisher left behind.
+fn committed_action_key(file_name: &OsStr) -> Option<&str> {
+    const ACTION_KEY_LENGTH: usize = 64;
+
+    let key = file_name.to_str()?.strip_suffix(".json")?;
+    let is_key = key.len() == ACTION_KEY_LENGTH
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    is_key.then_some(key)
+}
+
+/// Every regular file in `actions`.
+#[derive(Default)]
+struct ActionFiles {
+    /// Committed manifests, with their keys.
+    committed: Vec<(String, PathBuf)>,
+    /// Temporary files publishers left behind.
+    temporaries: Vec<PathBuf>,
+}
+
+fn action_files(cache_root: &Path) -> Result<ActionFiles> {
     let Ok(entries) = fs::read_dir(cache_root.join("actions")) else {
-        return Ok(Vec::new());
+        return Ok(ActionFiles::default());
     };
-    let mut result = Vec::new();
+    let mut committed = Vec::new();
+    let mut temporaries = Vec::new();
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let key = entry
-            .path()
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_owned();
+        match committed_action_key(&entry.file_name()) {
+            Some(key) => committed.push((key.to_owned(), entry.path())),
+            None => temporaries.push(entry.path()),
+        }
+    }
+    Ok(ActionFiles {
+        committed,
+        temporaries,
+    })
+}
+
+/// The action entries a collection may evict, with when each was last used.
+fn candidates(cache_root: &Path) -> Result<Vec<Candidate>> {
+    let mut result = Vec::new();
+    for (key, path) in action_files(cache_root)?.committed {
         let marker = cache_root.join("access/actions").join(&key);
         let last_used = match fs::metadata(marker) {
             Ok(metadata) => metadata
                 .modified()
                 .context("reading cache access timestamp")?,
-            Err(_) => fs::metadata(entry.path())?
+            Err(_) => fs::metadata(&path)?
                 .modified()
                 .context("reading cache entry timestamp")?,
         };
         result.push(Candidate {
             key,
-            path: entry.path(),
+            path,
             last_used,
         });
     }
@@ -491,14 +547,8 @@ fn remove_access_marker(cache_root: &Path, candidate: &Candidate) {
 
 fn sweep_unreferenced_blobs(cache_root: &Path) -> Result<usize> {
     let mut referenced = BTreeSet::new();
-    if let Ok(actions) = fs::read_dir(cache_root.join("actions")) {
-        for action in actions {
-            let action = action?;
-            if !action.file_type()?.is_file() {
-                continue;
-            }
-            referenced.extend(action_outputs(&action.path())?);
-        }
+    for (_, path) in action_files(cache_root)?.committed {
+        referenced.extend(action_outputs(&path)?);
     }
     let mut removed = 0;
     if let Ok(blobs) = fs::read_dir(cache_root.join("blobs")) {
@@ -605,7 +655,7 @@ mod tests {
         fs::write(root.path().join("blobs/keep"), b"kept").unwrap();
         fs::write(root.path().join("blobs/drop"), b"dropped").unwrap();
         fs::write(
-            root.path().join("actions/action.json"),
+            action_path(root.path(), "action"),
             br#"{"schema_version":1,"action_key":"action","outputs":[{"sha256":"keep"}]}"#,
         )
         .unwrap();
@@ -625,6 +675,23 @@ mod tests {
     }
 
     #[test]
+    fn gc_removes_the_temporary_file_an_interrupted_publisher_left() {
+        let root = tempdir().unwrap();
+        write_action(root.path(), "kept", &["kept-blob"], 1024);
+        // The publisher was killed halfway through writing the manifest it
+        // would have renamed into place.
+        let temporary = root.path().join("actions/.tmpAbC123");
+        fs::write(&temporary, br#"{"schema_version":3,"action_key":"#).unwrap();
+
+        let report = collect_within(root.path(), u64::MAX);
+
+        assert_eq!(report.removed_temporary_files, 1);
+        assert!(!temporary.exists());
+        assert!(action_path(root.path(), "kept").exists());
+        assert!(root.path().join("blobs/kept-blob").exists());
+    }
+
+    #[test]
     fn dry_run_reports_eviction_without_mutating_entries() {
         let root = tempdir().unwrap();
         write_action(root.path(), "action", &["action-blob"], 1024);
@@ -639,7 +706,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.removed_action_entries, 1);
-        assert!(root.path().join("actions/action.json").exists());
+        assert!(action_path(root.path(), "action").exists());
         assert!(root.path().join("blobs/action-blob").exists());
     }
 
@@ -664,7 +731,7 @@ mod tests {
         for obsolete in [&snapshots, &gates, &discoveries] {
             assert!(!obsolete.exists(), "{obsolete:?} was kept");
         }
-        assert!(root.path().join("actions/reusable.json").exists());
+        assert!(action_path(root.path(), "reusable").exists());
         assert_eq!(report.removed_obsolete_directories, 3);
         assert_eq!(report.removed_action_entries, 0);
         assert!(report.capacity_satisfied);
@@ -785,18 +852,18 @@ mod tests {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join("actions")).unwrap();
         fs::write(
-            root.path().join("actions/older.json"),
+            action_path(root.path(), "older"),
             format!(r#"{{"outputs":[]}}{}"#, " ".repeat(1024)),
         )
         .unwrap();
         fs::write(
-            root.path().join("actions/newer.json"),
+            action_path(root.path(), "newer"),
             format!(r#"{{"outputs":[]}}{}"#, " ".repeat(1024)),
         )
         .unwrap();
-        record_access(root.path(), "older").unwrap();
+        record_access(root.path(), &key("older")).unwrap();
         thread::sleep(Duration::from_millis(10));
-        record_access(root.path(), "newer").unwrap();
+        record_access(root.path(), &key("newer")).unwrap();
         let before = cache_stats(root.path()).unwrap();
         let report = collect_garbage(
             root.path(),
@@ -810,8 +877,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.removed_action_entries, 1);
-        assert!(!root.path().join("actions/older.json").exists());
-        assert!(root.path().join("actions/newer.json").exists());
+        assert!(!action_path(root.path(), "older").exists());
+        assert!(action_path(root.path(), "newer").exists());
     }
 
     const MIB: usize = 1024 * 1024;
@@ -842,15 +909,29 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         fs::write(
-            root.join("actions").join(format!("{key}.json")),
-            format!(r#"{{"schema_version":1,"action_key":"{key}","outputs":[{outputs}]}}"#),
+            action_path(root, key),
+            format!(
+                r#"{{"schema_version":1,"action_key":"{}","outputs":[{outputs}]}}"#,
+                self::key(key)
+            ),
         )
         .unwrap();
     }
 
+    /// The action key a test names `name`: a SHA-256, as real keys are.
+    fn key(name: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(name.as_bytes()))
+    }
+
+    /// Where the manifest of the action named `name` is committed.
+    fn action_path(root: &Path, name: &str) -> PathBuf {
+        root.join("actions").join(format!("{}.json", key(name)))
+    }
+
     /// Access markers have millisecond timestamps; keep the LRU order explicit.
     fn touch(root: &Path, key: &str) {
-        record_access(root, key).unwrap();
+        record_access(root, &self::key(key)).unwrap();
         thread::sleep(Duration::from_millis(20));
     }
 
@@ -884,10 +965,10 @@ mod tests {
         let report = collect_within(root.path(), before.total_bytes - mib(2 * MIB));
 
         assert_eq!(report.removed_action_entries, 1);
-        assert!(!root.path().join("actions/a0.json").exists());
+        assert!(!action_path(root.path(), "a0").exists());
         assert!(!root.path().join("blobs/a0-blob").exists());
         for key in ["a1", "a2", "a3"] {
-            assert!(root.path().join(format!("actions/{key}.json")).exists());
+            assert!(action_path(root.path(), key).exists());
             assert!(root.path().join(format!("blobs/{key}-blob")).exists());
         }
         assert!(report.capacity_satisfied);
@@ -909,7 +990,7 @@ mod tests {
 
         assert_eq!(report.removed_action_entries, 2);
         assert!(!root.path().join("blobs/shared").exists());
-        assert!(root.path().join("actions/a2.json").exists());
+        assert!(action_path(root.path(), "a2").exists());
         assert!(root.path().join("blobs/a2-blob").exists());
         assert!(report.capacity_satisfied);
     }

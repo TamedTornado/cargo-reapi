@@ -117,11 +117,67 @@ pub fn materialize_artifact_slots(
 pub fn logical_text(value: &str, mappings: &[(String, String)]) -> String {
     let slots = normalize_artifact_slots(value.as_bytes().to_vec(), mappings)
         .unwrap_or_else(|_| value.as_bytes().to_vec());
-    let mut text = String::from_utf8(slots).unwrap_or_else(|_| value.to_owned());
-    for (label, actual) in by_specificity(mappings) {
-        text = text.replace(actual, label);
+    let roots = mappings
+        .iter()
+        .map(|(label, actual)| (actual.as_bytes(), label.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    let text = replace_whole_roots(&slots, &roots);
+    String::from_utf8(text).unwrap_or_else(|_| value.to_owned())
+}
+
+/// Bytes that end one path and start the next inside a composite value: a
+/// list or assignment separator, a quote, whitespace, or the separator of
+/// `CARGO_ENCODED_RUSTFLAGS`.
+const PATH_DELIMITERS: &[u8] = b" \t\n\r=:;,\"'\x1f";
+
+/// Whether `root` occurs in `text` at `offset` as a whole path, or as the
+/// leading components of one: it starts `text` or follows a delimiter, and
+/// it ends `text` or is followed by `/` or a delimiter. `/work/foo` is a
+/// root of `/work/foo/src`, but not of `/work/foo-assets` or `/x/work/foo`.
+fn is_whole_root_at(text: &[u8], offset: usize, root: &[u8]) -> bool {
+    let starts_path = offset == 0 || PATH_DELIMITERS.contains(&text[offset - 1]);
+    let ends_component = text
+        .get(offset + root.len())
+        .is_none_or(|next| *next == b'/' || PATH_DELIMITERS.contains(next));
+    starts_path && ends_component
+}
+
+/// The earliest whole-path occurrence in `text` at or after `from` of any of
+/// `roots` (see [`is_whole_root_at`]), as its offset and the root's index.
+/// Of roots at the same offset the longest wins, so a target inside the
+/// workspace keeps its own name.
+pub fn find_whole_root(text: &[u8], from: usize, roots: &[&[u8]]) -> Option<(usize, usize)> {
+    roots
+        .iter()
+        .enumerate()
+        .filter(|(_, root)| !root.is_empty())
+        .filter_map(|(index, root)| {
+            memchr::memmem::find_iter(&text[from..], root)
+                .map(|found| from + found)
+                .find(|offset| is_whole_root_at(text, *offset, root))
+                .map(|offset| (offset, index))
+        })
+        .min_by(|(left_offset, left), (right_offset, right)| {
+            left_offset
+                .cmp(right_offset)
+                .then_with(|| roots[*right].len().cmp(&roots[*left].len()))
+        })
+}
+
+/// `text` with every whole-path occurrence of a root (see
+/// [`is_whole_root_at`]) replaced by its replacement, in one pass, so a
+/// replacement is never itself rewritten.
+fn replace_whole_roots(text: &[u8], roots: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+    let patterns = roots.iter().map(|(root, _)| *root).collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(text.len());
+    let mut copied = 0;
+    while let Some((offset, index)) = find_whole_root(text, copied, &patterns) {
+        output.extend_from_slice(&text[copied..offset]);
+        output.extend_from_slice(&roots[index].1);
+        copied = offset + patterns[index].len();
     }
-    text
+    output.extend_from_slice(&text[copied..]);
+    output
 }
 
 fn by_specificity(mappings: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -223,20 +279,22 @@ pub fn logical_bytes(
         .extension()
         .is_some_and(|extension| extension == "d")
     {
-        return Ok(rewrite_paths_for_cache(bytes, mappings));
+        return Ok(rewrite_paths_for_cache(&bytes, mappings));
     }
     Ok(bytes)
 }
 
-fn rewrite_paths_for_cache(mut bytes: Vec<u8>, mappings: &[(String, String)]) -> Vec<u8> {
-    for (label, actual) in by_specificity(mappings) {
-        bytes = replace_bytes(
-            &bytes,
-            actual.as_bytes(),
-            format!("/__cargo_reapi__/{label}").as_bytes(),
-        );
-    }
-    bytes
+fn rewrite_paths_for_cache(bytes: &[u8], mappings: &[(String, String)]) -> Vec<u8> {
+    let roots = mappings
+        .iter()
+        .map(|(label, actual)| {
+            (
+                actual.as_bytes(),
+                format!("/__cargo_reapi__/{label}").into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    replace_whole_roots(bytes, &roots)
 }
 
 /// Reverses the root labels of [`logical_bytes`] for the consumer's roots.
@@ -486,6 +544,30 @@ mod tests {
         let restored = materialize_artifact_slots(cached, &consumer).unwrap();
         let restored = String::from_utf8(restored).unwrap();
         assert!(restored.contains(&execution_slot(&consumer[0].1).unwrap()));
+    }
+
+    #[test]
+    fn keys_and_dep_info_name_only_whole_roots() {
+        let mappings = vec![
+            ("workspace".to_owned(), "/work/foo".to_owned()),
+            ("target".to_owned(), "/work/foo/target".to_owned()),
+        ];
+
+        assert_eq!(
+            logical_text(
+                "/work/foo/src:/work/foo-assets/data:/x/work/foo:/work/foo/target/debug=/work/foo",
+                &mappings
+            ),
+            "workspace/src:/work/foo-assets/data:/x/work/foo:target/debug=workspace"
+        );
+
+        let dep_info = b"/work/foo/target/a.d: /work/foo/src/lib.rs /work/foo-assets/x.txt\n";
+        let cached = logical_bytes(Path::new("a.d"), dep_info.to_vec(), &mappings).unwrap();
+        assert_eq!(
+            String::from_utf8(cached).unwrap(),
+            "/__cargo_reapi__/target/a.d: /__cargo_reapi__/workspace/src/lib.rs \
+             /work/foo-assets/x.txt\n"
+        );
     }
 
     fn digest_in(target: &Path, artifact: &Path, mappings: &[(String, String)]) -> (String, u64) {

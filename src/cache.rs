@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -258,6 +259,7 @@ fn finish_cached_execution(
 
     let _lease = ResourceLease::acquire()?;
     remove_stale_dep_info(prepared)?;
+    let started = SystemTime::now();
     let exit_code = invocation.execute_in(Some(environment))?;
     let withheld = withheld_by_execution(prepared, environment)?;
     if !withheld.is_empty() {
@@ -273,17 +275,21 @@ fn finish_cached_execution(
         });
     }
 
-    let execution = if exit_code == 0 && !bundles_nothing_unkeyed(prepared)? {
+    let execution = if exit_code != 0 {
+        "local-failed"
+    } else if !bundles_nothing_unkeyed(prepared)? {
         // The rlib bundled a static library from an outside directory the
         // key does not cover.
         "local-ineligible"
-    } else if exit_code == 0 && publish(cache_options, invocation, prepared)? {
-        record_access(&cache_options.root, &prepared.action_key)?;
-        "local-cache-miss"
-    } else if exit_code == 0 {
-        "local-output-incomplete"
     } else {
-        "local-failed"
+        match publish(cache_options, invocation, prepared, started)? {
+            Publication::Stored => {
+                record_access(&cache_options.root, &prepared.action_key)?;
+                "local-cache-miss"
+            }
+            Publication::InputChanged => "local-input-changed",
+            Publication::Incomplete => "local-output-incomplete",
+        }
     };
     record_invocation(capture_options, prepared, execution, exit_code)?;
     Ok(Resolution::Finished(exit_code))
@@ -397,22 +403,43 @@ fn restore(
     Ok(true)
 }
 
+/// What [`publish`] did with a successful compile's outputs.
+enum Publication {
+    Stored,
+    /// An input changed while the compile ran, so its outputs may not match
+    /// the content the entry would record.
+    InputChanged,
+    /// An output is missing, or the entry could not be checked on a hit.
+    Incomplete,
+}
+
 fn publish(
     options: &CacheOptions,
     invocation: &RustcInvocation,
     prepared: &PreparedInvocation,
-) -> Result<bool> {
+    started: SystemTime,
+) -> Result<Publication> {
     if prepared.output_files.is_empty()
         || prepared
             .output_files
             .iter()
             .any(|output| !output.actual_path.is_file())
     {
-        return Ok(false);
+        return Ok(Publication::Incomplete);
     }
     if reads_scheduling_environment(prepared) {
-        return Ok(false);
+        return Ok(Publication::Incomplete);
     }
+    if !crate::capture::keyed_inputs_unchanged(invocation, prepared, started)? {
+        return Ok(Publication::InputChanged);
+    }
+    // Without every input rustc read there is nothing to check a hit
+    // against, so the entry is not published.
+    let dep_inputs = match crate::capture::read_dep_inputs(invocation, prepared, started) {
+        Ok(Some(dep_inputs)) => dep_inputs,
+        Ok(None) => return Ok(Publication::InputChanged),
+        Err(_) => return Ok(Publication::Incomplete),
+    };
 
     let mut outputs = Vec::with_capacity(prepared.output_files.len());
     for output in &prepared.output_files {
@@ -446,11 +473,6 @@ fn publish(
         });
     }
 
-    // Without every input rustc read there is nothing to check a hit
-    // against, so the entry is not published.
-    let Ok(dep_inputs) = crate::capture::read_dep_inputs(invocation, prepared) else {
-        return Ok(false);
-    };
     let manifest = ActionManifest {
         schema_version: ACTION_MANIFEST_VERSION,
         action_key: prepared.action_key.clone(),
@@ -462,7 +484,7 @@ fn publish(
         &path,
         &serde_json::to_vec(&manifest).context("serializing action manifest")?,
     )?;
-    Ok(true)
+    Ok(Publication::Stored)
 }
 
 /// Whether the compile's dep-info shows its source read a variable the key

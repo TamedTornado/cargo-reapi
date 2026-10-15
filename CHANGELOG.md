@@ -24,8 +24,10 @@ compiles it is asked to run.
   so `cargo check` and `cargo clippy` cache crates that link system libraries.
 - An rlib compile ignores `-l` kinds it does not bundle (`dylib`, the default
   kind, `static:-bundle`). A bundled `-l static=` library not found in a `-L`
-  directory inside the workspace, target, package or the compiler's sysroot
-  makes it run uncached. A `-L` directory outside those (such as the system
+  directory inside the workspace, target, package or the sysroot's own
+  library directory (`<sysroot>/lib/rustlib/<target>/lib`; the rest of an
+  installation prefix such as `/usr` is not exempt) makes it run uncached, as
+  does a thin archive in an inside directory. A `-L` directory outside those (such as the system
   directory pkg-config `-sys` crates pass to every dependent) is allowed, but
   the result is stored only if the rlib holds nothing but `lib.rmeta` and the
   crate's own objects, since `#[link(kind = "static")]` bundles without any
@@ -33,6 +35,22 @@ compiles it is asked to run.
 - `CARGO_MAKEFLAGS`, `CARGO_BUILD_JOBS` and `CARGO_REAPI_*` are passed to the
   compile but not keyed, so a different job count no longer splits the cache.
   A compile that reads one through `env!` is not stored.
+- Only dep-info, metadata and link outputs and a fixed list of codegen
+  options are cached. Other `--emit` kinds, unpacked split debuginfo,
+  `-C save-temps`, profile-guided options, `-C target-cpu=native`, unlisted
+  codegen options and response-file arguments run uncached.
+- A compile whose keyed package files changed while it ran, or whose keyed or
+  dep-info files were modified at or after it started, is not stored
+  (`local-input-changed`).
+- Worktree roots are relocated and keyed only as whole path components, so
+  a sibling such as `<package>-assets` keeps its path.
+- Target discovery honours `--config` arguments, and the package walk skips
+  directories Cargo marks with `CACHEDIR.TAG`, such as a `build.build-dir`
+  inside the package.
+- An environment variable that is not UTF-8 no longer stops the wrapper, and
+  keyed values that are not UTF-8 are keyed byte for byte.
+- `cache gc` reads only committed `actions/<key>.json` manifests and removes
+  temporary manifests interrupted publishers left behind.
 - A build whose configuration already names a compiler wrapper
   (`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, their `CARGO_BUILD_*` forms,
   `build.rustc-wrapper` or `build.rustc-workspace-wrapper` in a configuration

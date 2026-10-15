@@ -351,7 +351,8 @@ fn user_wrapper(workspace_root: &Path, cargo_args: &[OsString]) -> Option<String
 }
 
 /// Cargo's target directory: `--target-dir`, else `CARGO_TARGET_DIR`, else
-/// what Cargo reports for the working directory's project.
+/// what Cargo reports for the working directory's project given the same
+/// `--manifest-path` and `--config` arguments.
 fn resolve_target_root(cli: &Cli, workspace_root: &Path) -> Result<PathBuf> {
     let mut target_dir = None;
     let mut manifest_path = None;
@@ -374,9 +375,15 @@ fn resolve_target_root(cli: &Cli, workspace_root: &Path) -> Result<PathBuf> {
             }
         }
     }
+    // `--config build.target-dir=...` moves the target directory as well.
     let metadata_arguments = manifest_path
         .into_iter()
         .flat_map(|path| [OsString::from("--manifest-path"), path])
+        .chain(
+            crate::cargo_config::config_arguments(&cli.cargo_args)
+                .into_iter()
+                .flat_map(|value| [OsString::from("--config"), value]),
+        )
         .collect::<Vec<_>>();
     let configured = target_dir
         .map(PathBuf::from)

@@ -33,14 +33,27 @@ rlib compile reads only the static libraries it bundles: `-l static=` (without
 `-bundle`) and `#[link(kind = "static")]` in its source. Other `-l` kinds are
 read only by a later link step. An rlib compile runs uncached when a bundled
 `-l static=` library is not found in a `-L` directory inside the workspace,
-the target directory, the package or the compiler's own sysroot. A `-L`
-directory outside those, such as the system library directory a pkg-config
+the target directory, the package or the sysroot's own library directory for
+the target (`<sysroot>/lib/rustlib/<target>/lib`). The rest of the
+compiler's installation prefix, such as `/usr` for a distribution's
+`/usr/bin/rustc`, is an ordinary outside directory. A thin archive in an
+inside directory names member files elsewhere, so it also makes the compile
+run uncached. A `-L` directory outside those, such as the system library directory a pkg-config
 `-sys` crate passes to all its dependents, is allowed, but the result is
 stored only if the rlib rustc wrote holds nothing besides `lib.rmeta` and the
 crate's own object files; otherwise it ran uncached. This check is needed
 because a `#[link(kind = "static")]` bundles an archive that never appears as
 `-l`. The key covers the arguments and the sources, so every hit bundles the
 same nothing.
+
+**Run uncached: outputs and options the cache does not reproduce.** A
+compile is cached only when it emits dep-info, metadata and link outputs and
+uses codegen options from a fixed list whose effect the key covers. Another
+`--emit` kind, `-C save-temps`, `-C split-debuginfo=unpacked` (anything but
+`off` or `packed`), the profile-guided options, `-C target-cpu=native` (the
+CPU it resolves to is not keyed) and any codegen option not on the list run
+uncached. So do arguments read from a response file (`@file`), which are not
+analysed.
 
 **Plain Cargo: a wrapper you already chose.** When `RUSTC_WRAPPER`,
 `RUSTC_WORKSPACE_WRAPPER`, their `CARGO_BUILD_*` forms, or
@@ -58,8 +71,10 @@ A compile's key covers:
   project in two worktrees shares entries;
 - its keyed environment (below);
 - every file in the package directory and in `OUT_DIR`, by content, except
-  the target directory and any entry named `.git`; a directory named `target`
-  inside the sources is ordinary source;
+  the target directory, any directory Cargo marked as its output with
+  `CACHEDIR.TAG` (such as a `build.build-dir` inside the package) and any
+  entry named `.git`; a directory named `target` inside the sources is
+  ordinary source;
 - for an rlib compile, every file directly in each `-L` native search
   directory inside the workspace, target or package, so a static library an
   rlib bundles from another package's output, or from a directory of the
@@ -74,6 +89,13 @@ rustc's escaping (spaces only) is read exactly. So a file that `include!`,
 invalidates the entry when it changes. A dep-info that cannot be read, or that
 lists a file outside the package, workspace, target and toolchain, is not
 published.
+
+A compile's files are hashed around it, not at the instant rustc reads them,
+so an edit while it runs could pair its outputs with content it never read.
+The entry is therefore not published (`local-input-changed`) when a package
+or `OUT_DIR` file the key covers has different content after the compile
+than before it, or when any keyed or dep-info file was modified at or after
+the moment the compile started.
 
 An entry written by another version of cargo-reapi is a miss, never an error.
 Restored artifacts have the worktree's paths written back into them, so a
@@ -132,7 +154,8 @@ cargo-reapi starts in. Each compile's `execution` is one of `cache-hit`,
 `coalesced-hit` (it waited for an identical compile and restored its
 result), `local-cache-miss` (run and published), `local-ineligible` (run
 uncached; `cache_eligibility.reasons` says why), `local-environment-withheld`
-(see below), `local-output-incomplete` or `local-failed`. Cargo's control
+(see below), `local-input-changed` (run, but an input changed while it ran,
+so nothing was stored), `local-output-incomplete` or `local-failed`. Cargo's control
 probes, such as `rustc -vV`, are logged too.
 
 To check that cargo-reapi changes nothing, compare the exit status and
@@ -146,7 +169,9 @@ no surviving entry references. A dry run reports the same selection without
 changing anything. It also removes, whole, the directories earlier versions
 kept (`gate-snapshots`, `access/gates`, `rustc-query-cache-v1`, `discoveries`,
 `link-captures`, `file-digests`), and reports how many as
-`removed_obsolete_directories`.
+`removed_obsolete_directories`. Only `actions/<key>.json` files are entries;
+any other file there is a temporary manifest a publisher was interrupted
+writing, removed under the lease and counted as `removed_temporary_files`.
 
 `--max-bytes` bounds the cache's physical footprint, reported as
 `total_bytes`. On Linux it comes from each file's extent map, so blocks shared

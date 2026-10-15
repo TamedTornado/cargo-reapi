@@ -451,3 +451,107 @@ fn a_library_naming_an_outside_static_archive_by_link_lib_runs_uncached() {
     assert_eq!(library_executions(&built), ["local-ineligible"]);
     assert_eq!(run_program(&root.join("target/debug/native-library")), "42");
 }
+
+/// A compiler installed in `<prefix>/bin`, as a distribution installs
+/// `/usr/bin/rustc`: a script that runs the real rustc.
+fn write_prefixed_compiler(prefix: &Path) -> PathBuf {
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("ask rustc for its sysroot");
+    let real = PathBuf::from(
+        String::from_utf8(sysroot.stdout)
+            .expect("UTF-8 sysroot")
+            .trim(),
+    )
+    .join("bin/rustc");
+
+    let compiler = prefix.join("bin/rustc");
+    fs::create_dir_all(compiler.parent().expect("bin directory")).expect("bin directory");
+    fs::write(
+        &compiler,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", real.display()),
+    )
+    .expect("compiler script");
+    let mut permissions = fs::metadata(&compiler).expect("script").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&compiler, permissions).expect("make the script executable");
+    compiler
+}
+
+#[test]
+fn a_library_bundling_an_archive_from_the_compilers_installation_prefix_runs_uncached() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("shared cache");
+    let prefix = roots.path().join("usr");
+    let compiler = write_prefixed_compiler(&prefix);
+    // A system library directory beside the compiler, like
+    // /usr/lib/x86_64-linux-gnu beside /usr/bin/rustc.
+    let system_libraries = prefix.join("lib/system");
+    write_answer_archive(&system_libraries, 42);
+    let root = roots.path().join("package");
+    write_native_library(
+        &root,
+        system_libraries.to_str().expect("UTF-8 path"),
+        Bundling::LinkLibArgument,
+    );
+
+    let action_log = root.join("target/cargo-reapi/actions.jsonl");
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+        .current_dir(&root)
+        .env_remove("CARGO_TARGET_DIR")
+        .env("RUSTC", &compiler)
+        .args(["--backend", "cache", "--action-log"])
+        .arg(&action_log)
+        .arg("--cache-dir")
+        .arg(cache.path())
+        .args(["--", "build"])
+        .output()
+        .expect("run cargo-reapi");
+    let actions = fs::read_to_string(&action_log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON action"))
+        .collect();
+    let built = Build { output, actions };
+
+    built.assert_succeeded();
+    assert_eq!(library_executions(&built), ["local-ineligible"]);
+    assert_eq!(run_program(&root.join("target/debug/native-library")), "42");
+}
+
+#[test]
+fn a_thin_archive_inside_the_workspace_runs_uncached() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("shared cache");
+    let workspace = roots.path().join("workspace");
+    write_bundling_library(&workspace.join("package"), "../native");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = ['package']\nresolver = '3'\n",
+    )
+    .expect("workspace manifest");
+
+    // The thin archive inside the workspace names an object outside it.
+    let objects = roots.path().join("objects");
+    write_answer_archive(&objects, 42);
+    let native = workspace.join("native");
+    fs::create_dir_all(&native).expect("native directory");
+    let archived = Command::new("ar")
+        .current_dir(&native)
+        .arg("rcsT")
+        .arg("libanswer.a")
+        .arg(objects.join("answer.o"))
+        .status()
+        .expect("run ar");
+    assert!(archived.success(), "ar failed");
+
+    let built = cached_build(&workspace, cache.path());
+
+    built.assert_succeeded();
+    assert_eq!(library_executions(&built), ["local-ineligible"]);
+    assert_eq!(
+        run_program(&workspace.join("target/debug/native-library")),
+        "42"
+    );
+}

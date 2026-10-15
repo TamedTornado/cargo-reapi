@@ -357,3 +357,201 @@ fn a_compiler_wrapper_the_user_configured_runs_cargo_uncached() {
     let output = cargo_reapi(&project, cache.path(), &["build"], &[]);
     assert_declined(&project, &output, "build.rustc-workspace-wrapper");
 }
+
+/// Sets the modification time of the file at `path`.
+fn set_modified(path: &Path, modified: std::time::SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for its modification time")
+        .set_modified(modified)
+        .expect("set the modification time");
+}
+
+/// An hour from now: a file modified then was modified after any compile
+/// this test starts.
+fn after_the_compile() -> std::time::SystemTime {
+    std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
+}
+
+#[test]
+fn a_file_included_from_outside_the_package_and_modified_during_the_compile_is_not_stored() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    let workspace = roots.path().join("workspace");
+    write_workspace_manifest(&workspace, "'member'");
+    write_package(
+        &workspace.join("member"),
+        "member",
+        "include!(\"../../shared/body.rs\");\n",
+    );
+    fs::create_dir_all(workspace.join("shared")).expect("shared directory");
+    let body = workspace.join("shared/body.rs");
+    fs::write(&body, "pub fn value() -> u8 { 1 }\n").expect("body");
+
+    // rustc reads the body before cargo-reapi hashes it after the compile:
+    // a body modified since the compile started may not be what rustc read.
+    set_modified(&body, after_the_compile());
+    let output = cargo_reapi(&workspace, cache.path(), &["check"], &[]);
+
+    assert_succeeded(&output);
+    assert_eq!(
+        library_executions(&workspace, "member"),
+        ["local-input-changed"]
+    );
+}
+
+#[test]
+fn a_package_file_modified_during_the_compile_is_not_stored() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    let project = roots.path().join("project");
+    write_package(&project, "project", "pub fn value() -> u8 { 1 }\n");
+    // The action key hashes every package file before the compile, rustc
+    // reads or not.
+    let notes = project.join("notes.txt");
+    fs::write(&notes, "notes").expect("package file");
+
+    set_modified(&notes, after_the_compile());
+    let output = cargo_reapi(&project, cache.path(), &["check"], &[]);
+
+    assert_succeeded(&output);
+    assert_eq!(
+        library_executions(&project, "project"),
+        ["local-input-changed"]
+    );
+}
+
+/// A workspace whose `member` library calls `editor::rewrite!()`, a
+/// procedural macro that rewrites `member/data.txt` while the compile runs
+/// and gives it a modification time long past, so only its content shows
+/// the change.
+fn write_editing_workspace(root: &Path) {
+    write_workspace_manifest(root, "'editor', 'member'");
+
+    let editor = root.join("editor");
+    fs::create_dir_all(editor.join("src")).expect("editor source directory");
+    fs::write(
+        editor.join("Cargo.toml"),
+        "[package]\nname='editor'\nversion='0.0.0'\nedition='2024'\n[lib]\nproc-macro = true\n",
+    )
+    .expect("editor manifest");
+    fs::write(
+        editor.join("src/lib.rs"),
+        "use proc_macro::TokenStream;\n\
+         #[proc_macro]\n\
+         pub fn rewrite(_: TokenStream) -> TokenStream {\n\
+             let manifest = std::env::var(\"CARGO_MANIFEST_DIR\").unwrap();\n\
+             let path = std::path::Path::new(&manifest).join(\"data.txt\");\n\
+             std::fs::write(&path, \"rewritten during the compile\").unwrap();\n\
+             let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);\n\
+             std::fs::File::options().write(true).open(&path).unwrap()\n\
+                 .set_modified(past).unwrap();\n\
+             TokenStream::new()\n\
+         }\n",
+    )
+    .expect("editor source");
+
+    let member = root.join("member");
+    write_package(
+        &member,
+        "member",
+        "editor::rewrite!();\npub fn value() -> u8 { 1 }\n",
+    );
+    let mut manifest = fs::read_to_string(member.join("Cargo.toml")).expect("member manifest");
+    manifest.push_str("[dependencies]\neditor = { path = '../editor' }\n");
+    fs::write(member.join("Cargo.toml"), manifest).expect("member manifest");
+    fs::write(member.join("data.txt"), "as keyed").expect("package data");
+}
+
+#[test]
+fn a_package_file_whose_content_changed_during_the_compile_is_not_stored() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    let workspace = roots.path().join("workspace");
+    write_editing_workspace(&workspace);
+
+    let output = cargo_reapi(&workspace, cache.path(), &["check"], &[]);
+
+    assert_succeeded(&output);
+    assert_eq!(
+        fs::read_to_string(workspace.join("member/data.txt")).expect("package data"),
+        "rewritten during the compile"
+    );
+    assert_eq!(
+        library_executions(&workspace, "member"),
+        ["local-input-changed"]
+    );
+}
+
+/// The logical paths of the outputs logged for `crate_name`'s library
+/// compile.
+fn library_outputs(root: &Path, crate_name: &str) -> Vec<String> {
+    actions(root)
+        .iter()
+        .filter(|action| {
+            action["crate_name"] == crate_name
+                && action["arguments"]
+                    .to_string()
+                    .contains("\"--crate-type\",\"lib\"")
+        })
+        .flat_map(|action| {
+            action["output_files"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|output| output.as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_target_directory_set_by_a_config_argument_is_the_target_root() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    let project = roots.path().join("project");
+    write_package(&project, "project", "pub fn value() -> u8 { 1 }\n");
+
+    let output = cargo_reapi(
+        &project,
+        cache.path(),
+        &["check", "--config", "build.target-dir=\"out\""],
+        &[],
+    );
+
+    assert_succeeded(&output);
+    let outputs = library_outputs(&project, "project");
+    assert!(!outputs.is_empty(), "no library outputs logged");
+    assert!(
+        outputs.iter().all(|output| output.starts_with("target/")),
+        "outputs outside the target root: {outputs:?}"
+    );
+}
+
+#[test]
+fn a_build_directory_inside_the_package_is_not_among_its_inputs() {
+    let roots = tempdir().expect("roots");
+    let cache = tempdir().expect("cache");
+    let build_dir = ["--config", "build.build-dir=\"build\""];
+    let check = [&["check"][..], &build_dir].concat();
+    let build = [&["build"][..], &build_dir].concat();
+
+    let first = roots.path().join("first");
+    write_package(&first, "project", "pub fn value() -> u8 { 1 }\n");
+    assert_succeeded(&cargo_reapi(&first, cache.path(), &check, &[]));
+    assert_succeeded(&cargo_reapi(&first, cache.path(), &build, &[]));
+    assert_eq!(library_executions(&first, "project"), ["local-cache-miss"]);
+
+    // Cargo writes the build directory while other compiles run; what is in
+    // it is not the package's source.
+    let second = roots.path().join("second");
+    write_package(&second, "project", "pub fn value() -> u8 { 1 }\n");
+    assert_succeeded(&cargo_reapi(&second, cache.path(), &check, &[]));
+    assert!(second.join("build/CACHEDIR.TAG").is_file());
+    fs::write(second.join("build/in-progress.tmp"), "transient").expect("transient file");
+    let output = cargo_reapi(&second, cache.path(), &build, &[]);
+
+    assert_succeeded(&output);
+    assert_eq!(library_executions(&second, "project"), ["cache-hit"]);
+    assert_eq!(run_program(&second.join("target/debug/project")), "1");
+}

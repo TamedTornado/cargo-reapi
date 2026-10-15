@@ -138,10 +138,17 @@ pub struct DepInput {
 /// same files with the same content. Fails when the dep-info is missing, or
 /// lists a file outside the declared roots or one that cannot be read, so the
 /// entry is not published.
+///
+/// A file is hashed after the compile, so the content hashed is the content
+/// rustc read only if the file did not change after the compile `started`.
+/// As ccache does, a file modified at or after that time ("too new") gives
+/// `None`: the entry is not published. Its modification time is read after
+/// its content, so an edit during hashing is seen too.
 pub fn read_dep_inputs(
     invocation: &RustcInvocation,
     prepared: &PreparedInvocation,
-) -> Result<Vec<DepInput>> {
+    started: SystemTime,
+) -> Result<Option<Vec<DepInput>>> {
     let dep_info = prepared
         .dep_info
         .as_ref()
@@ -161,16 +168,65 @@ pub fn read_dep_inputs(
         let logical_path = roots.normalize(&resolved, &invocation.cwd)?;
         let (sha256, _) = logical_digest(&resolved, &prepared.relocation_mappings)
             .with_context(|| format!("digesting dep-info input {}", resolved.display()))?;
+        if modified_since(&resolved, started)? {
+            return Ok(None);
+        }
         inputs.insert(raw_logical_path.clone(), (logical_path, sha256));
     }
-    Ok(inputs
-        .into_iter()
-        .map(|(raw_logical_path, (logical_path, sha256))| DepInput {
-            raw_logical_path,
-            logical_path,
-            sha256,
-        })
-        .collect())
+    Ok(Some(
+        inputs
+            .into_iter()
+            .map(|(raw_logical_path, (logical_path, sha256))| DepInput {
+                raw_logical_path,
+                logical_path,
+                sha256,
+            })
+            .collect(),
+    ))
+}
+
+/// Whether the inputs the action key hashed before the compile `started`
+/// (the package's files, `OUT_DIR`, native libraries and files on the
+/// command line) are still those files, with that content, and none was
+/// modified at or after the start. Otherwise rustc may have read other
+/// content than the key names, and the entry is not published.
+pub fn keyed_inputs_unchanged(
+    invocation: &RustcInvocation,
+    prepared: &PreparedInvocation,
+    started: SystemTime,
+) -> Result<bool> {
+    let roots = CaptureRoots::from_env(invocation)?;
+    // An input that can no longer be listed or read has changed too.
+    let Ok(native) = native_inputs(invocation, &roots, &prepared.toolchain) else {
+        return Ok(false);
+    };
+    let Ok((inputs, _)) = discover_inputs(invocation, &roots, native.files) else {
+        return Ok(false);
+    };
+
+    let unchanged = inputs.len() == prepared.inputs.len()
+        && inputs.iter().zip(&prepared.inputs).all(|(now, keyed)| {
+            now.logical_path == keyed.logical_path
+                && now.sha256 == keyed.sha256
+                && now.size_bytes == keyed.size_bytes
+        });
+    if !unchanged {
+        return Ok(false);
+    }
+    for input in &inputs {
+        if modified_since(&input.actual_path, started).unwrap_or(true) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the file at `path` was modified at or after `instant`.
+fn modified_since(path: &Path, instant: SystemTime) -> Result<bool> {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .with_context(|| format!("reading the modification time of {}", path.display()))?;
+    Ok(modified >= instant)
 }
 
 /// Whether every recorded dep-info input still resolves to the file it did,
@@ -282,7 +338,21 @@ struct NativeInputs {
 /// there is part of its key. A `-L` directory outside the workspace, the
 /// build output, the package and the compiler's own sysroot is allowed, but
 /// the result is stored only if the rlib holds nothing it bundled.
-fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<NativeInputs> {
+///
+/// The toolchain's own directory is only the sysroot's library directory
+/// for the target, `<sysroot>/lib/rustlib/<target>/lib`, which the
+/// compiler's identity stands for. The rest of the compiler's installation
+/// prefix, such as `/usr` for `/usr/bin/rustc`, holds system libraries that
+/// change without the compiler, so it follows the same rule as any other
+/// directory.
+///
+/// A thin archive in an inside directory names member files elsewhere, which
+/// are not keyed, so it makes the compile uncached.
+fn native_inputs(
+    invocation: &RustcInvocation,
+    roots: &CaptureRoots,
+    toolchain: &ToolchainIdentity,
+) -> Result<NativeInputs> {
     let mut native = NativeInputs {
         files: Vec::new(),
         outside: None,
@@ -300,6 +370,7 @@ fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<N
     }
 
     let (search_directories, libraries) = native_arguments(invocation);
+    let toolchain_library = toolchain_library_directory(invocation, roots, toolchain);
     let mut inside_directories = Vec::new();
     let mut toolchain_directories = Vec::new();
     for directory in search_directories {
@@ -317,8 +388,10 @@ fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<N
         .any(|root| directory.starts_with(root));
         if keyed_root {
             inside_directories.push(directory);
-        } else if directory.starts_with(&roots.toolchain) {
-            // The compiler's identity covers its own sysroot.
+        } else if toolchain_library
+            .as_ref()
+            .is_some_and(|library| directory.starts_with(library))
+        {
             toolchain_directories.push(directory);
         } else {
             // The command line alone cannot show that nothing is bundled from
@@ -349,12 +422,67 @@ fn native_inputs(invocation: &RustcInvocation, roots: &CaptureRoots) -> Result<N
                     format!("listing native search directory {}", directory.display())
                 })?
                 .path();
-            if path.is_file() {
-                native.files.push(path);
+            if !path.is_file() {
+                continue;
             }
+            if is_thin_archive(&path)? {
+                native.outside = Some(format!(
+                    "the thin archive {} names member files that are not keyed",
+                    path.display()
+                ));
+                return Ok(native);
+            }
+            native.files.push(path);
         }
     }
     Ok(native)
+}
+
+/// The sysroot's library directory for the compile's target, when it
+/// exists and the sysroot is the compiler's own: `--sysroot` names another.
+fn toolchain_library_directory(
+    invocation: &RustcInvocation,
+    roots: &CaptureRoots,
+    toolchain: &ToolchainIdentity,
+) -> Option<PathBuf> {
+    if invocation
+        .args
+        .iter()
+        .any(|argument| argument.to_string_lossy().starts_with("--sysroot"))
+    {
+        return None;
+    }
+    let target = invocation.target().or_else(|| {
+        toolchain
+            .version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .map(str::to_owned)
+    })?;
+    roots
+        .toolchain
+        .join("lib/rustlib")
+        .join(target)
+        .join("lib")
+        .canonicalize()
+        .ok()
+}
+
+/// Whether the file at `path` is a thin archive, which records the paths of
+/// its members instead of their contents.
+fn is_thin_archive(path: &Path) -> Result<bool> {
+    const THIN_ARCHIVE_MAGIC: &[u8] = b"!<thin>\n";
+
+    let mut file =
+        fs::File::open(path).with_context(|| format!("reading native input {}", path.display()))?;
+    let mut magic = [0; THIN_ARCHIVE_MAGIC.len()];
+    match std::io::Read::read_exact(&mut file, &mut magic) {
+        Ok(()) => Ok(magic == THIN_ARCHIVE_MAGIC),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading native input {}", path.display()))
+        }
+    }
 }
 
 /// The `-L` search directories other than Cargo's own crate directories, and
@@ -444,12 +572,13 @@ pub fn prepare_invocation(
     if should_record_path_mappings(invocation) {
         record_path_mappings(&roots.path_mappings())?;
     }
-    let native = native_inputs(invocation, &roots)?;
+    let toolchain = toolchain_identity(&invocation.compiler)?;
+    let native = native_inputs(invocation, &roots, &toolchain)?;
     let check_bundled_members = native.check_bundled_members;
     let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots, native.files)?;
     eligibility_reasons.extend(native.outside);
+    eligibility_reasons.extend(invocation.unsupported_reason());
     let paths = prepare_paths(invocation, &roots, &mut eligibility_reasons)?;
-    let toolchain = toolchain_identity(&invocation.compiler)?;
     let platform = PlatformIdentity {
         os: env::consts::OS,
         arch: env::consts::ARCH,
@@ -839,12 +968,6 @@ fn discover_inputs(
         if path.is_file() {
             candidates.insert(path);
         }
-        if let Some(response_path) = arg.to_string_lossy().strip_prefix('@') {
-            let response_path = PathBuf::from(response_path);
-            if response_path.is_file() {
-                candidates.insert(response_path);
-            }
-        }
         if arg == "--extern"
             && let Some(value) = invocation.args.get(index + 1).and_then(extern_path)
         {
@@ -863,7 +986,7 @@ fn discover_inputs(
         for entry in WalkDir::new(input_root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|entry| name == "OUT_DIR" || !is_ignored(entry.path(), &roots.target))
+            .filter_entry(|entry| name == "OUT_DIR" || !is_ignored(entry, &roots.target))
         {
             let entry = entry.context("walking Cargo package inputs")?;
             if entry.file_type().is_file() {
@@ -894,12 +1017,20 @@ fn extern_path(value: &OsString) -> Option<PathBuf> {
     text.split_once('=').map(|(_, path)| PathBuf::from(path))
 }
 
-/// Whether the walk over a package's files skips `path`: Cargo's target
-/// directory itself, which is output, and any entry named `.git`: build
-/// scripts run every time, and proc macros declare what they read (see the
-/// README). No other name is skipped.
-fn is_ignored(path: &Path, target: &Path) -> bool {
-    path.starts_with(target) || path.file_name().is_some_and(|name| name == ".git")
+/// Whether the walk over a package's files skips `entry`: Cargo's target
+/// directory itself, which is output; any directory beneath the package that
+/// Cargo marked as one of its output directories with `CACHEDIR.TAG` (a
+/// `build.build-dir`, or a target directory configured where cargo-reapi
+/// did not see it), whose files other compiles write while this one runs;
+/// and any entry named `.git`: build scripts run every time, and proc macros
+/// declare what they read (see the README). No other name is skipped.
+fn is_ignored(entry: &walkdir::DirEntry, target: &Path) -> bool {
+    let path = entry.path();
+    let is_output_directory =
+        entry.depth() > 0 && entry.file_type().is_dir() && path.join("CACHEDIR.TAG").is_file();
+    path.starts_with(target)
+        || is_output_directory
+        || path.file_name().is_some_and(|name| name == ".git")
 }
 
 fn digest_file(
@@ -1012,9 +1143,16 @@ fn logical_path(root: &str, relative: &Path) -> String {
     }
 }
 
+/// The compiler variables, as the action log shows them. Iterating the
+/// environment as bytes keeps an unrelated variable that is not UTF-8 from
+/// stopping the wrapper; the log is for reading, so a value that is not UTF-8
+/// is shown lossily.
 fn captured_environment() -> BTreeMap<String, String> {
-    env::vars()
-        .filter(|(name, _)| is_compiler_environment(name))
+    env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            is_compiler_environment(&name).then(|| (name, value.to_string_lossy().into_owned()))
+        })
         .collect()
 }
 
