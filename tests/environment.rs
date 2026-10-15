@@ -22,7 +22,8 @@ impl Build {
         String::from_utf8_lossy(&self.output.stderr).into_owned()
     }
 
-    /// Every recorded execution of `crate_name`'s compiles, in order.
+    /// Every recorded execution of `crate_name`'s library compiles, in
+    /// order. A binary's compile is a link step, which always runs.
     fn executions(&self, crate_name: &str) -> Vec<String> {
         self.actions_for(crate_name)
             .map(|action| action["execution"].as_str().unwrap_or_default().to_owned())
@@ -38,31 +39,24 @@ impl Build {
     fn actions_for(&self, crate_name: &str) -> impl Iterator<Item = &Value> {
         self.actions
             .iter()
-            .filter(move |action| action["crate_name"] == crate_name)
+            .filter(move |action| action["crate_name"] == crate_name && is_library_compile(action))
     }
 }
 
-/// Runs `cargo build` through the cache backend with only the action cache:
-/// whole-gate snapshots are disabled so every compile is visible.
+fn is_library_compile(action: &Value) -> bool {
+    action["arguments"].as_array().is_some_and(|arguments| {
+        arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--crate-type" && pair[1] == "lib")
+    })
+}
+
+/// Runs `cargo build` through the cache backend.
 fn cached_build(root: &Path, cache: &Path, environment: &[(&str, &str)]) -> Build {
-    let output = cached_build_command(root, cache, &["build"], environment)
-        .output()
-        .expect("run cargo-reapi");
-    finished_build(root, output)
+    cargo_build(root, cache, &["build"], environment)
 }
 
-fn cached_build_command(
-    root: &Path,
-    cache: &Path,
-    cargo_args: &[&str],
-    environment: &[(&str, &str)],
-) -> Command {
-    cargo_reapi(root, cache, cargo_args, environment)
-}
-
-/// Runs Cargo through the cache backend with whole-gate snapshots, as
-/// ordinary builds do. Snapshots need the strict sandbox.
-fn gated_build(
+fn cargo_build(
     root: &Path,
     cache: &Path,
     cargo_args: &[&str],
@@ -122,14 +116,26 @@ fn run_binary(path: &Path) -> String {
         .to_owned()
 }
 
-fn write_package(root: &Path, name: &str, main: &str, build_script: Option<&str>) {
+/// A package whose library defines `value() -> &'static str` with `body`,
+/// and whose binary prints it.
+fn write_package(root: &Path, name: &str, body: &str, build_script: Option<&str>) {
     fs::create_dir_all(root.join("src")).expect("source directory");
     fs::write(
         root.join("Cargo.toml"),
         format!("[package]\nname='{name}'\nversion='0.0.0'\nedition='2024'\n"),
     )
     .expect("manifest");
-    fs::write(root.join("src/main.rs"), main).expect("main source");
+    fs::write(
+        root.join("src/lib.rs"),
+        format!("pub fn value() -> &'static str {{ {body} }}\n"),
+    )
+    .expect("library source");
+    let crate_name = name.replace('-', "_");
+    fs::write(
+        root.join("src/main.rs"),
+        format!("fn main() {{ println!(\"{{}}\", {crate_name}::value()); }}\n"),
+    )
+    .expect("main source");
     if let Some(build_script) = build_script {
         fs::write(root.join("build.rs"), build_script).expect("build script");
     }
@@ -139,9 +145,9 @@ fn write_package(root: &Path, name: &str, main: &str, build_script: Option<&str>
 fn env_macro_variable_is_keyed_and_reaches_the_compile() {
     let roots = tempdir().expect("worktree roots");
     let cache = tempdir().expect("shared cache");
-    let main = "fn main() { println!(\"{}\", env!(\"ENVKEY_FIXTURE_VALUE\")); }\n";
+    let body = "env!(\"ENVKEY_FIXTURE_VALUE\")";
     for worktree in ["producer", "changed", "original"] {
-        write_package(&roots.path().join(worktree), "envkey-app", main, None);
+        write_package(&roots.path().join(worktree), "envkey-app", body, None);
     }
 
     // The variable is outside the toolchain families and Cargo did not set
@@ -199,7 +205,7 @@ fn rerun_if_env_changed_variable_is_keyed() {
         write_package(
             &roots.path().join(worktree),
             "envkey-build",
-            "fn main() {}\n",
+            "\"\"",
             Some(build_script),
         );
     }
@@ -238,12 +244,12 @@ fn rerun_if_env_changed_variable_is_keyed() {
 fn shell_history_and_unrelated_variables_do_not_change_action_keys() {
     let roots = tempdir().expect("worktree roots");
     let cache = tempdir().expect("shared cache");
-    let main = "fn main() { println!(\"{}\", env!(\"CARGO_PKG_NAME\")); }\n";
-    write_package(&roots.path().join("first"), "envkey-shell", main, None);
+    let body = "env!(\"CARGO_PKG_NAME\")";
+    write_package(&roots.path().join("first"), "envkey-shell", body, None);
     write_package(
         &roots.path().join("second-worktree"),
         "envkey-shell",
-        main,
+        body,
         None,
     );
 
@@ -336,8 +342,13 @@ pub fn untracked_value(_: TokenStream) -> TokenStream {
     )
     .expect("app manifest");
     fs::write(
+        root.join("app/src/lib.rs"),
+        "pub fn value() -> u64 { envkey_macro::untracked_value!() }\n",
+    )
+    .expect("app library");
+    fs::write(
         root.join("app/src/main.rs"),
-        "fn main() { println!(\"{}\", envkey_macro::untracked_value!()); }\n",
+        "fn main() { println!(\"{}\", envkey_macro_app::value()); }\n",
     )
     .expect("app source");
 }
@@ -389,9 +400,9 @@ fn a_search_path_reaches_the_compile_exactly_as_it_is_keyed() {
     let roots = tempdir().expect("worktree roots");
     let cache = tempdir().expect("shared cache");
     let fresh_cache = tempdir().expect("separate cache");
-    let main = "fn main() { println!(\"{}\", env!(\"PATH\")); }\n";
+    let body = "env!(\"PATH\")";
     for worktree in ["first", "second-worktree", "fresh"] {
-        write_package(&roots.path().join(worktree), "envkey-path", main, None);
+        write_package(&roots.path().join(worktree), "envkey-path", body, None);
     }
 
     let tools = roots.path().join("tools");
@@ -485,36 +496,42 @@ pub fn read_values(_: TokenStream) -> TokenStream {{
     )
     .expect("app manifest");
     fs::write(
+        root.join("app/src/lib.rs"),
+        format!("{app_prelude}\npub const VALUE: &str = envkey_reader::read_values!();\n"),
+    )
+    .expect("app library");
+    fs::write(
         root.join("app/src/main.rs"),
-        format!(
-            "{app_prelude}\nfn main() {{ println!(\"{{}}\", envkey_reader::read_values!()); }}\n"
-        ),
+        "fn main() { println!(\"{}\", envkey_reader_app::VALUE); }\n",
     )
     .expect("app source");
 }
 
 #[test]
-fn learned_environment_retires_gate_snapshots_built_without_it() {
+fn a_learned_variable_retires_entries_cached_without_it() {
     let roots = tempdir().expect("worktree roots");
     let cache = tempdir().expect("shared cache");
     let workspace = roots.path().join("workspace");
-    write_reading_macro_workspace(
-        &workspace,
-        &["ENVKEY_GATE_VALUE"],
-        "#[cfg(feature = \"tracked\")]\nconst _TRACKED: &str = env!(\"ENVKEY_GATE_VALUE\");\n",
-    );
+    let later = roots.path().join("later-worktree");
+    for root in [&workspace, &later] {
+        write_reading_macro_workspace(
+            root,
+            &["ENVKEY_LEARNED_VALUE"],
+            "#[cfg(feature = \"tracked\")]\nconst _TRACKED: &str = env!(\"ENVKEY_LEARNED_VALUE\");\n",
+        );
+    }
     let binary = workspace.join("target/debug/envkey-reader-app");
-    let environment = [("ENVKEY_GATE_VALUE", "configured")];
+    let environment = [("ENVKEY_LEARNED_VALUE", "configured")];
     let default_build = ["build", "-p", "envkey-reader-app"];
 
     // Nothing marks the proc macro's read, so the variable is withheld.
-    let untracked = gated_build(&workspace, cache.path(), &default_build, &environment);
+    let untracked = cargo_build(&workspace, cache.path(), &default_build, &environment);
     assert!(untracked.succeeded(), "{}", untracked.stderr());
     assert_eq!(run_binary(&binary), "MISSING");
 
     // The feature's env! reveals the variable, and later compiles of the
     // crate receive it.
-    let tracked = gated_build(
+    let tracked = cargo_build(
         &workspace,
         cache.path(),
         &["build", "-p", "envkey-reader-app", "--features", "tracked"],
@@ -523,11 +540,18 @@ fn learned_environment_retires_gate_snapshots_built_without_it() {
     assert!(tracked.succeeded(), "{}", tracked.stderr());
     assert_eq!(run_binary(&binary), "configured");
 
-    // The first gate's snapshot recorded compiles that no longer match how
-    // the crate compiles, so it must not be restored.
-    let repeated = gated_build(&workspace, cache.path(), &default_build, &environment);
+    // The first build cached a compile without the variable. Later compiles
+    // of the crate pass it, so a later worktree never restores that entry.
+    let repeated = cargo_build(&later, cache.path(), &default_build, &environment);
     assert!(repeated.succeeded(), "{}", repeated.stderr());
-    assert_eq!(run_binary(&binary), "configured");
+    assert_eq!(
+        repeated.executions("envkey_reader_app"),
+        ["local-cache-miss"]
+    );
+    assert_eq!(
+        run_binary(&later.join("target/debug/envkey-reader-app")),
+        "configured"
+    );
 }
 
 #[test]
@@ -575,13 +599,13 @@ fn concurrently_learned_variables_all_survive() {
 
     // One crate whose variants each read a different variable, so every
     // build learns a different name for the same crate.
-    let main = |name: &str| format!("fn main() {{ println!(\"{{}}\", env!(\"{name}\")); }}\n");
+    let body = |name: &str| format!("env!(\"{name}\")");
     for (index, name) in names.iter().enumerate() {
         for kind in ["learn", "check"] {
             write_package(
                 &roots.path().join(format!("{kind}-{index}")),
                 "envkey-learned",
-                &main(name),
+                &body(name),
                 None,
             );
         }
@@ -591,8 +615,7 @@ fn concurrently_learned_variables_all_survive() {
         let builds = (0..BUILDS)
             .map(|index| {
                 let root = roots.path().join(format!("learn-{index}"));
-                let mut command =
-                    cached_build_command(&root, cache.path(), &["build"], &environment);
+                let mut command = cargo_reapi(&root, cache.path(), &["build"], &environment);
                 scope.spawn(move || command.output().expect("run cargo-reapi"))
             })
             .collect::<Vec<_>>();
@@ -633,11 +656,11 @@ fn a_variable_that_can_never_be_passed_ends_learning() {
     write_package(
         &root,
         "envkey-private",
-        "fn main() { println!(\"{}\", env!(\"CARGO_REAPI_BACKEND\")); }\n",
+        "env!(\"CARGO_REAPI_BACKEND\")",
         None,
     );
 
-    let mut child = cached_build_command(&root, cache.path(), &["build"], &[])
+    let mut child = cargo_reapi(&root, cache.path(), &["build"], &[])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

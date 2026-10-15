@@ -11,7 +11,6 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fs2::FileExt;
 use tempfile::tempdir;
 
 /// How long the build script holds the build open. The executable is
@@ -105,7 +104,7 @@ impl Fixture {
         self.workspace.join("target")
     }
 
-    /// Starts an ordinary gated build, in the strict sandbox.
+    /// Starts an ordinary cached build.
     fn start_build(&self) -> Child {
         Command::new(&self.executable)
             .current_dir(&self.workspace)
@@ -133,28 +132,6 @@ impl Fixture {
     }
 }
 
-/// Waits until `process` has opened `file`.
-fn wait_for_open_file(process: &Child, file: &Path) {
-    let descriptors = PathBuf::from(format!("/proc/{}/fd", process.id()));
-    let started = Instant::now();
-    loop {
-        let open = fs::read_dir(&descriptors)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == file));
-        if open {
-            return;
-        }
-        assert!(
-            started.elapsed() < BUILD_SCRIPT_START_LIMIT,
-            "cargo-reapi never opened {}",
-            file.display()
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
 #[test]
 fn a_build_survives_reinstalling_cargo_reapi_while_it_runs() {
     let fixture = Fixture::new();
@@ -162,26 +139,6 @@ fn a_build_survives_reinstalling_cargo_reapi_while_it_runs() {
     let build = fixture.start_build();
     wait_for_build_script(&fixture.target());
     install(&fixture.executable);
-
-    fixture.assert_built(build);
-}
-
-/// A gate waits for cache admission, or for another producer, before Cargo
-/// starts. A reinstall during that wait must not leave Cargo running the
-/// new version as the compiler wrapper of the old driver.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_build_waiting_to_start_survives_reinstalling_cargo_reapi() {
-    let fixture = Fixture::new();
-    fs::create_dir_all(fixture.cache()).expect("cache directory");
-    let admission_path = fixture.cache().join(".maintenance-admission.lock");
-    let admission = fs::File::create(&admission_path).expect("admission lock");
-    FileExt::lock_exclusive(&admission).expect("hold cache admission");
-
-    let build = fixture.start_build();
-    wait_for_open_file(&build, &admission_path);
-    install(&fixture.executable);
-    FileExt::unlock(&admission).expect("release cache admission");
 
     fixture.assert_built(build);
 }

@@ -43,6 +43,8 @@ fn collector(cache: &Path) -> OwnedChild {
     )
 }
 
+/// A package whose library compile is cached and whose binary prints what
+/// the library returns.
 fn fixture_workspace(root: &Path, name: &str) -> PathBuf {
     let workspace = root.join(name);
     fs::create_dir_all(workspace.join("src")).unwrap();
@@ -52,22 +54,33 @@ fn fixture_workspace(root: &Path, name: &str) -> PathBuf {
     )
     .unwrap();
     fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn status() -> &'static str { \"complete\" }\n",
+    )
+    .unwrap();
+    fs::write(
         workspace.join("src/main.rs"),
-        "fn main() { println!(\"complete\"); }\n",
+        "fn main() { println!(\"{}\", maintenance_fixture::status()); }\n",
     )
     .unwrap();
     workspace
 }
 
-fn cached_build(workspace: &Path, cache: &Path, action_log: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
+fn cached_build_command(workspace: &Path, cache: &Path, action_log: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
+    command
         .current_dir(workspace)
         .env_remove("CARGO_TARGET_DIR")
         .args(["--backend", "cache", "--cache-dir"])
         .arg(cache)
         .arg("--action-log")
         .arg(action_log)
-        .args(["--", "build", "--offline"])
+        .args(["--", "build", "--offline"]);
+    command
+}
+
+fn cached_build(workspace: &Path, cache: &Path, action_log: &Path) -> Output {
+    cached_build_command(workspace, cache, action_log)
         .output()
         .unwrap()
 }
@@ -81,36 +94,26 @@ fn tree_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-fn published_gates(cache: &Path) -> Vec<String> {
-    fs::read_dir(cache.join("gate-snapshots/objects"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| !name.starts_with('.'))
-        .collect()
-}
-
 #[test]
-fn collection_reclaims_abandoned_gate_staging_and_keeps_reusable_snapshots() {
+fn collection_removes_directories_of_earlier_versions_and_keeps_action_entries() {
     let root = tempdir().unwrap();
     let cache = root.path().join("cache");
     let producer = fixture_workspace(root.path(), "producer");
 
     let built = cached_build(&producer, &cache, &root.path().join("producer.jsonl"));
     assert!(built.status.success(), "{built:?}");
-    let published = published_gates(&cache);
-    assert_eq!(
-        published.len(),
-        1,
-        "the successful build publishes its gate"
-    );
     let reusable_bytes = tree_bytes(&cache);
 
-    // A producer killed during publication never runs its staging cleanup.
-    let abandoned = cache.join("gate-snapshots/objects/.gate-killed");
-    fs::create_dir_all(abandoned.join("target")).unwrap();
-    fs::write(abandoned.join("target/data"), vec![0_u8; 4 * 1024 * 1024]).unwrap();
+    // Gate snapshots of an earlier version, which this one never reads.
+    let obsolete = cache.join("gate-snapshots");
+    fs::create_dir_all(obsolete.join("objects/earlier/target")).unwrap();
+    fs::write(
+        obsolete.join("objects/earlier/target/data"),
+        vec![0_u8; 4 * 1024 * 1024],
+    )
+    .unwrap();
 
-    // The budget fits every reusable entry, but not the abandoned staging.
+    // The budget fits every reusable entry, but not the obsolete directory.
     let collected = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .args(["cache", "gc", "--cache-dir"])
         .arg(&cache)
@@ -122,20 +125,18 @@ fn collection_reclaims_abandoned_gate_staging_and_keeps_reusable_snapshots() {
     assert!(collected.status.success(), "{collected:?}");
     let report: Value = serde_json::from_slice(&collected.stdout).unwrap();
 
-    assert_eq!(report["removed_gate_entries"], 0, "{report}");
     assert_eq!(report["removed_action_entries"], 0, "{report}");
+    assert_eq!(report["removed_obsolete_directories"], 1, "{report}");
     assert_eq!(report["capacity_satisfied"], true, "{report}");
-    assert_eq!(report["removed_abandoned_staging_entries"], 1, "{report}");
-    assert!(!abandoned.exists());
-    assert_eq!(published_gates(&cache), published);
+    assert!(!obsolete.exists());
 
-    // A fresh workspace still reuses the surviving gate snapshot.
+    // A fresh workspace still restores the library from the surviving entry.
     let consumer = fixture_workspace(root.path(), "consumer");
     let consumer_log = root.path().join("consumer.jsonl");
     let reused = cached_build(&consumer, &cache, &consumer_log);
     assert!(reused.status.success(), "{reused:?}");
     let actions = fs::read_to_string(&consumer_log).unwrap();
-    assert!(actions.contains("\"gate-snapshot-hit\""), "{actions}");
+    assert!(actions.contains("\"cache-hit\""), "{actions}");
     let output = Command::new(consumer.join("target/debug/maintenance-fixture"))
         .output()
         .unwrap();
@@ -180,27 +181,10 @@ fn real_parallel_cargo_producers_and_coalescers_finish_with_repeated_collection(
     let mut builds = Vec::new();
 
     for index in 0..3 {
-        let workspace = root.path().join(format!("consumer-{index}"));
-        fs::create_dir_all(workspace.join("src")).unwrap();
-        fs::write(
-            workspace.join("Cargo.toml"),
-            "[package]\nname='maintenance-fixture'\nversion='0.0.0'\nedition='2024'\n",
-        )
-        .unwrap();
-        fs::write(
-            workspace.join("src/main.rs"),
-            "fn main() { println!(\"complete\"); }\n",
-        )
-        .unwrap();
+        let workspace = fixture_workspace(root.path(), &format!("consumer-{index}"));
+        let action_log = root.path().join(format!("actions-{index}.jsonl"));
         let output = File::create(root.path().join(format!("build-{index}.log"))).unwrap();
-        let process = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
-            .current_dir(&workspace)
-            .env_remove("CARGO_TARGET_DIR")
-            .args(["--backend", "cache", "--cache-dir"])
-            .arg(&cache)
-            .arg("--action-log")
-            .arg(root.path().join(format!("actions-{index}.jsonl")))
-            .args(["--", "build", "--offline"])
+        let process = cached_build_command(&workspace, &cache, &action_log)
             .stdout(output.try_clone().unwrap())
             .stderr(output)
             .spawn()

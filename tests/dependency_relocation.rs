@@ -31,9 +31,16 @@ fn write_workspace(root: &Path) {
          [dependencies]\nrelocated-dependency={path='../dependency'}\n",
     )
     .expect("app manifest");
+    // The dependent library embeds the dependency's path; the binary only
+    // prints it, and its link step always runs.
+    fs::write(
+        root.join("app/src/lib.rs"),
+        "pub fn root() -> &'static str { relocated_dependency::ROOT }\n",
+    )
+    .expect("app library");
     fs::write(
         root.join("app/src/main.rs"),
-        "fn main() { println!(\"{}\", relocated_dependency::ROOT); }\n",
+        "fn main() { println!(\"{}\", relocated_app::root()); }\n",
     )
     .expect("app source");
 }
@@ -84,8 +91,13 @@ fn restored_dependent_names_the_consumers_dependency() {
     let actions = cached_build(&second, cache.path());
     let app = actions
         .iter()
-        .find(|action| action["crate_name"] == "relocated_app")
-        .expect("app action");
+        .find(|action| {
+            action["crate_name"] == "relocated_app"
+                && action["arguments"]
+                    .to_string()
+                    .contains("\"--crate-type\",\"lib\"")
+        })
+        .expect("app library action");
     assert_eq!(app["execution"], "cache-hit");
 
     // The first worktree is gone, as an abandoned worktree is.
