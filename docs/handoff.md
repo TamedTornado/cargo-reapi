@@ -123,6 +123,23 @@ mutation-checked: disabling the fix makes it fail.
 | 11 | Provider failure announced as uncached | Own error, Cargo not run | `an_unavailable_sandbox_is_an_error_not_a_decline` (announce and fall back) |
 | K | Test mode in release | `test-hooks` | release binary has no `ACTION_CACHE_TEST_MODE` or `COALESCE_SIGNAL` string |
 
+### Review of 1097d82 (0.2.13 findings)
+
+| # | Finding | Fix | Regression (mutation) |
+|---|---------|-----|------------------------|
+| 1 | A build script plants a link where the marker is written after the build | Driver writes in the target go through a handle with `openat`/`O_NOFOLLOW` (`beneath.rs`) | `a_link_planted_during_the_build_never_redirects_the_marker` (write with `fs::write`) |
+| 2 | Snapshot verification skipped entries restoration copied | Verification walks every entry, whatever its name (`snapshot_files`) | `a_snapshot_entry_that_was_never_verified_is_never_restored` (verify with the excluding walk) |
+| 3 | Fingerprint invalidation removed any `.fingerprint` directory | Only `<target>/<profile>/.fingerprint` and `<target>/<triple>/<profile>/.fingerprint` of directories holding `.cargo-lock` | `fingerprint_invalidation_removes_only_cargos_own_directories` (recursive removal) |
+| 4 | Inputs under `target/cargo-reapi/` gave stale gate hits | `cargo-reapi/` counts as content for cleanliness; a marker hit needs it to hold only cargo-reapi's own entry names, no link | `an_input_beneath_the_administrative_directory_is_never_a_stale_hit` (exempt it and trust it) |
+| 5 | Dep-info paths collapsed `..` lexically; backslashes dropped | Resolve with `canonicalize`, record and re-resolve the raw path; parse escaped spaces only | `dep_info_inputs_are_checked_as_rustc_read_them`, each input changed alone (lexical paths; backslash escape in both parsers) |
+| 6 | Git dependencies expose Git state | **Not denied: Cargo opens a checkout's `.git` under the sandbox and re-clones, failing, when it cannot.** The gate key hashes the whole repository state of each Git dependency's checkout, `objects` by file names and sizes | `a_git_dependencys_repository_state_is_keyed` (drop the hashing) |
+| 7 | Proc macros reading files outside dep-info | Held for Jason | |
+| 8 | `run` built every binary | Gate `build --bin <name>` for the binary `run` builds (`--bin`, `--example`, `-p`, `default-run`, only binary); decline when it cannot be told | `run_builds_only_the_binary_cargo_run_would` (name no binary) |
+| 9 | Failed gate preparation ran the program twice | The fallback runs the build arguments | `a_failed_gate_preparation_still_runs_the_program_once` (rerun the original arguments) |
+| 10 | Schema-1 entries aborted builds | Version read first, other versions are misses; keys namespaced | `an_action_entry_of_an_older_schema_is_a_miss_not_an_error` (deserialize directly) |
+| 11 | `doc --open` skipped the viewer on a hit | Declined | `doc_open_is_never_cached_and_opens_every_time` (cache it) |
+| 12 | Audit variables reached the compiler | Passed only while an observer is the compiler, and the shim removes them before the real rustc; never counted as withheld | `an_audit_variable_never_reaches_the_compiler` (pass them) |
+
 Decline reasons each have a stderr assertion (`assert_declined`): non-build
 command, `--help`/`--version`, alias, `--config`/`-Z`/`--` option, include,
 `--ignore-rust-version`, alternate lockfile (both forms), missing declared

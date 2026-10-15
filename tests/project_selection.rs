@@ -1967,6 +1967,10 @@ fn dep_info_inputs_are_checked_as_rustc_read_them() {
 
     assert_succeeded(&fixture.cargo_reapi(&workspace, &["build"]));
     assert_eq!(run(&binary), "oneuno");
+    // Each input changes alone, so that the other cannot be what notices.
+    write("two", "uno");
+    assert_succeeded(&fixture.cargo_reapi(&workspace, &["build"]));
+    assert_eq!(run(&binary), "twouno");
     write("two", "dos");
     assert_succeeded(&fixture.cargo_reapi(&workspace, &["build"]));
     assert_eq!(run(&binary), "twodos");
