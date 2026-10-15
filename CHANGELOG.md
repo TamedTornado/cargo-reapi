@@ -12,18 +12,27 @@ compiles it is asked to run.
 
 - A library compile (an `rlib`, or only its metadata) is cached. Its key
   covers the compiler's identity, its arguments, its keyed environment, every
-  file in the package directory and in `OUT_DIR`, and every file directly in
-  each `-L` native search directory inside the workspace, target or package,
-  so a static library an rlib bundles is keyed by content. An entry is a hit
+  file in the package directory and in `OUT_DIR`, and, for an rlib, every
+  file directly in each `-L` native search directory inside the workspace,
+  target or package, so a static library an rlib bundles is keyed by content. An entry is a hit
   only while every file in rustc's own dep-info still has the content it had,
   so `include!` and `include_str!` inputs outside the package invalidate it.
 - A link step runs every time: binaries, tests, examples, benches, proc
   macros, `cdylib`, `dylib` and `staticlib` crates. The linker reads libraries,
   start files and itself from places the key does not cover.
-- A compile with a `-L` directory outside the workspace, target, package and
-  the compiler's sysroot, or a `-l` library not found in an inside `-L`
-  directory, runs uncached. The action log records it as `local-ineligible`
-  with the reason.
+- A metadata-only compile ignores `-L` and `-l`: it reads no native library,
+  so `cargo check` and `cargo clippy` cache crates that link system libraries.
+- An rlib compile ignores `-l` kinds it does not bundle (`dylib`, the default
+  kind, `static:-bundle`). A bundled `-l static=` library not found in a `-L`
+  directory inside the workspace, target, package or the compiler's sysroot
+  makes it run uncached. A `-L` directory outside those (such as the system
+  directory pkg-config `-sys` crates pass to every dependent) is allowed, but
+  the result is stored only if the rlib holds nothing but `lib.rmeta` and the
+  crate's own objects, since `#[link(kind = "static")]` bundles without any
+  `-l`. The action log records an uncached compile as `local-ineligible`.
+- `CARGO_MAKEFLAGS`, `CARGO_BUILD_JOBS` and `CARGO_REAPI_*` are passed to the
+  compile but not keyed, so a different job count no longer splits the cache.
+  A compile that reads one through `env!` is not stored.
 - A build whose configuration already names a compiler wrapper
   (`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, their `CARGO_BUILD_*` forms,
   `build.rustc-wrapper` or `build.rustc-workspace-wrapper` in a configuration

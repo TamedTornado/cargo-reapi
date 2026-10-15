@@ -26,11 +26,21 @@ reads libraries, start files and itself from places the key does not cover,
 so a cached link could be stale. The action log records these as
 `local-ineligible`, with the reason.
 
-**Run uncached: compiles with native inputs outside the project.** A compile
-that passes rustc a `-L` directory outside the workspace, the target
-directory, the package and the compiler's own sysroot, or a `-l` library that
-is not found in an inside `-L` directory, runs uncached. Such a compile may
-bundle a static library cargo-reapi cannot key.
+**Run uncached: rlibs that bundle a static library from outside the
+project.** A metadata-only compile (as in `cargo check` and `cargo clippy`)
+reads no native library, so its `-L` and `-l` arguments do not matter. An
+rlib compile reads only the static libraries it bundles: `-l static=` (without
+`-bundle`) and `#[link(kind = "static")]` in its source. Other `-l` kinds are
+read only by a later link step. An rlib compile runs uncached when a bundled
+`-l static=` library is not found in a `-L` directory inside the workspace,
+the target directory, the package or the compiler's own sysroot. A `-L`
+directory outside those, such as the system library directory a pkg-config
+`-sys` crate passes to all its dependents, is allowed, but the result is
+stored only if the rlib rustc wrote holds nothing besides `lib.rmeta` and the
+crate's own object files; otherwise it ran uncached. This check is needed
+because a `#[link(kind = "static")]` bundles an archive that never appears as
+`-l`. The key covers the arguments and the sources, so every hit bundles the
+same nothing.
 
 **Plain Cargo: a wrapper you already chose.** When `RUSTC_WRAPPER`,
 `RUSTC_WORKSPACE_WRAPPER`, their `CARGO_BUILD_*` forms, or
@@ -50,10 +60,10 @@ A compile's key covers:
 - every file in the package directory and in `OUT_DIR`, by content, except
   the target directory and any entry named `.git`; a directory named `target`
   inside the sources is ordinary source;
-- every file directly in each `-L` native search directory inside the
-  workspace, target or package, so a static library an rlib bundles from
-  another package's output, or from a directory of the workspace, is keyed by
-  content;
+- for an rlib compile, every file directly in each `-L` native search
+  directory inside the workspace, target or package, so a static library an
+  rlib bundles from another package's output, or from a directory of the
+  workspace, is keyed by content;
 - every `--extern` artifact by content.
 
 An entry is a hit only while every file rustc's own dep-info listed when the
@@ -201,6 +211,12 @@ shells. A compile receives:
 cargo-reapi's own settings (action log, cache directory, backend, worktree
 roots and resource capacity) are read by the wrapper only; they never reach a
 compile and are not keyed.
+
+`CARGO_MAKEFLAGS` (Cargo's jobserver, which rustc joins), `CARGO_BUILD_JOBS`
+and any other `CARGO_REAPI_*` variable reach the compile but are not keyed:
+they schedule the build and cannot change what rustc writes. A compile whose
+source reads one of them through `env!` or `option_env!` runs but is not
+stored.
 
 Search lists (`PATH`, `LD_LIBRARY_PATH`, `LIBRARY_PATH`, `COMPILER_PATH` and
 the `DYLD_*` library paths) reach the compile as the canonical directories
