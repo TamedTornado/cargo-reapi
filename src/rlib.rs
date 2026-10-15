@@ -5,8 +5,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Whether the rlib at `path` holds only `lib.rmeta` and the object files
-/// rustc compiled from crate `crate_name` itself.
+/// Whether the rlib at `path` holds only rustc's metadata and the object
+/// files rustc compiled from crate `crate_name` itself.
+///
+/// rustc's metadata is `lib.rmeta`, and from Rust 1.97 also `lib.rmeta-link`,
+/// a small object rustc writes that lists the crate's own object files.
 ///
 /// rustc names its own objects `<crate>-<extra filename>.<codegen unit>.rcgu.o`
 /// (`<crate>.<codegen unit>.rcgu.o` without an extra filename). Any other
@@ -32,7 +35,7 @@ fn is_own_member(identifier: &[u8], crate_name: &str) -> bool {
     let Ok(name) = std::str::from_utf8(identifier) else {
         return false;
     };
-    if name == "lib.rmeta" {
+    if name == "lib.rmeta" || name == "lib.rmeta-link" {
         return true;
     }
 
@@ -49,6 +52,7 @@ mod tests {
     #[test]
     fn only_the_metadata_and_the_crates_own_objects_are_its_own() {
         assert!(is_own_member(b"lib.rmeta", "my_crate"));
+        assert!(is_own_member(b"lib.rmeta-link", "my_crate"));
         assert!(is_own_member(
             b"my_crate-abc123.my_crate.9d2e7ca3e9e4b14f-cgu.0.rcgu.o",
             "my_crate"
