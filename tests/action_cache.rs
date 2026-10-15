@@ -195,12 +195,12 @@ fn an_action_entry_of_an_older_schema_is_a_miss_not_an_error() {
         .and_then(|action| action["action_key"].as_str().map(str::to_owned))
         .expect("a published action");
 
-    // Rewrite the entry as schema 1 wrote it: no dep-info inputs.
+    // Mark the entry as another version wrote it. It still parses, and its
+    // inputs still match, so only the version can make it a miss.
     let manifest = cache.path().join("actions").join(format!("{key}.json"));
     let mut entry: Value =
         serde_json::from_slice(&fs::read(&manifest).expect("manifest")).expect("JSON");
     entry["schema_version"] = 1.into();
-    entry.as_object_mut().expect("object").remove("dep_inputs");
     fs::write(&manifest, serde_json::to_vec(&entry).expect("JSON")).expect("old manifest");
     fs::remove_dir_all(project.join("target")).expect("retire the target");
 
