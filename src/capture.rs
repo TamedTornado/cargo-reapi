@@ -250,6 +250,92 @@ fn unescape_spaces(text: &str) -> String {
     text.replace("\\ ", " ")
 }
 
+/// Why a compile is never cached for want of knowing its native inputs.
+///
+/// A link step (a binary, test, proc macro or other dynamic library) lets
+/// the linker pick libraries, start files and itself from places cargo-reapi
+/// does not key, so it always runs. So does a compile whose `-L` or `-l`
+/// arguments reach a file it cannot show to lie in the workspace, the build
+/// output or the compiler's own sysroot, such as a static library an rlib
+/// bundles. Whatever cannot be told cheaply counts as outside.
+fn native_input_reason(invocation: &RustcInvocation, roots: &CaptureRoots) -> Option<String> {
+    if invocation.requires_native_linker() {
+        return Some(
+            "a link step reads libraries and a linker that are not keyed, so it always runs"
+                .to_owned(),
+        );
+    }
+    let inside = |path: &Path| {
+        let path = absolute(path, &invocation.cwd);
+        [
+            Some(&roots.workspace),
+            Some(&roots.target),
+            Some(&roots.toolchain),
+            roots.package.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|root| path.starts_with(root))
+    };
+    let mut search_directories = Vec::new();
+    let mut libraries = Vec::new();
+    let mut arguments = invocation
+        .args
+        .iter()
+        .map(|argument| argument.to_string_lossy());
+    while let Some(argument) = arguments.next() {
+        let value = if argument == "-L" || argument == "-l" {
+            arguments.next().map(|value| value.into_owned())
+        } else {
+            argument
+                .strip_prefix("-L")
+                .or_else(|| argument.strip_prefix("-l"))
+                .map(str::to_owned)
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        if argument.starts_with("-L") {
+            let (kind, path) = value.split_once('=').unwrap_or(("all", value.as_str()));
+            if kind == "dependency" || kind == "crate" {
+                continue;
+            }
+            if !inside(Path::new(path)) {
+                return Some(format!(
+                    "-L {value} reaches outside the workspace and toolchain"
+                ));
+            }
+            search_directories.push(PathBuf::from(path));
+        } else if argument.starts_with("-l") {
+            libraries.push(value);
+        }
+    }
+    for library in libraries {
+        let (kind, name) = library
+            .split_once('=')
+            .unwrap_or(("dylib", library.as_str()));
+        let name = name.split(':').next().unwrap_or(name);
+        let found = kind != "framework"
+            && search_directories.iter().any(|directory| {
+                ["a", "so", "dylib", "lib"].iter().any(|extension| {
+                    absolute(directory, &invocation.cwd)
+                        .join(format!("lib{name}.{extension}"))
+                        .exists()
+                        || absolute(directory, &invocation.cwd)
+                            .join(format!("{name}.{extension}"))
+                            .exists()
+                })
+            });
+        if !found {
+            return Some(format!(
+                "-l {library} is not found beside a -L directory inside the workspace, so it \
+                 may be a system library"
+            ));
+        }
+    }
+    None
+}
+
 /// Records the action and runs the compiler with the caller's whole
 /// environment. The recorded key covers the environment a cached compile
 /// would start with.
@@ -277,6 +363,7 @@ pub fn prepare_invocation(
         record_path_mappings(&roots.path_mappings())?;
     }
     let (inputs, mut eligibility_reasons) = discover_inputs(invocation, &roots)?;
+    eligibility_reasons.extend(native_input_reason(invocation, &roots));
     let paths = prepare_paths(invocation, &roots, &mut eligibility_reasons)?;
     let toolchain = toolchain_identity(&invocation.compiler)?;
     let platform = PlatformIdentity {

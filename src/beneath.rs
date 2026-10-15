@@ -35,25 +35,6 @@ impl Beneath {
         Ok(Self { root: fd })
     }
 
-    /// Writes `bytes` to `relative`, replacing whatever stands there, even a
-    /// symlink, with a new regular file. Missing directories are created.
-    pub fn write_file(&self, relative: &Path, bytes: &[u8]) -> Result<()> {
-        let (parent, name) = self.parent_of(relative, true)?;
-        // A link at the name is removed, never followed; `O_EXCL` then
-        // refuses one planted between the two calls.
-        unlink_at(&parent, name)?;
-        let fd = open_at(
-            parent.as_raw_fd(),
-            name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644,
-        )
-        .with_context(|| format!("creating {}", relative.display()))?;
-        let mut file = File::from(fd);
-        file.write_all(bytes)
-            .with_context(|| format!("writing {}", relative.display()))
-    }
-
     /// Appends `line` and a newline to `relative`, under an exclusive lock.
     /// A symlink at the name, or in any directory on the way, is an error.
     /// Only a regular file nothing else is linked to is appended to: a file
@@ -67,16 +48,6 @@ impl Beneath {
         let written = writeln!(file, "{line}");
         fs2::FileExt::unlock(&file)?;
         written.with_context(|| format!("appending to {}", relative.display()))
-    }
-
-    /// Removes the file or link at `relative`, if there is one. A directory
-    /// on the way that is missing or is a link means nothing of ours is
-    /// there, so there is nothing to remove.
-    pub fn remove_file(&self, relative: &Path) -> Result<()> {
-        match self.parent_of(relative, false) {
-            Ok((parent, name)) => unlink_at(&parent, name),
-            Err(_) => Ok(()),
-        }
     }
 
     /// The directory holding `relative`, opened without following links,
@@ -203,7 +174,7 @@ mod tests {
     use super::Beneath;
 
     #[test]
-    fn writes_never_follow_a_link_in_the_file_or_a_directory_on_the_way() {
+    fn an_append_never_follows_a_link_in_the_file_or_a_directory_on_the_way() {
         let root = tempfile::tempdir().expect("root");
         let target = root.path().join("target");
         let source = root.path().join("source");
@@ -212,32 +183,22 @@ mod tests {
         fs::write(source.join("lib.rs"), "source").expect("source file");
         let beneath = Beneath::open(&target).expect("handle");
 
-        // A link at the file: replaced, and the source it named is untouched.
+        // A link at the file is replaced; the source it named is untouched.
         fs::create_dir_all(target.join("admin")).expect("admin");
-        std::os::unix::fs::symlink(source.join("lib.rs"), target.join("admin/marker"))
-            .expect("link");
+        std::os::unix::fs::symlink(source.join("lib.rs"), target.join("admin/log")).expect("link");
         beneath
-            .write_file("admin/marker".as_ref(), b"marker")
-            .expect("write");
+            .append_line("admin/log".as_ref(), "line")
+            .expect("append");
         assert_eq!(fs::read(source.join("lib.rs")).expect("source"), b"source");
         assert_eq!(
-            fs::read(target.join("admin/marker")).expect("marker"),
-            b"marker"
+            fs::read_to_string(target.join("admin/log")).expect("log"),
+            "line\n"
         );
 
-        // A link as the directory: refused, and nothing lands in the source.
+        // A link as the directory is refused, and nothing lands in the source.
         fs::remove_dir_all(target.join("admin")).expect("remove admin");
         std::os::unix::fs::symlink(&source, target.join("admin")).expect("link");
-        assert!(
-            beneath
-                .write_file("admin/marker".as_ref(), b"marker")
-                .is_err()
-        );
         assert!(beneath.append_line("admin/log".as_ref(), "line").is_err());
-        beneath
-            .remove_file("admin/marker".as_ref())
-            .expect("remove");
-        assert!(!source.join("marker").exists());
         assert!(!source.join("log").exists());
     }
 

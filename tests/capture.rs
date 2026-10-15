@@ -1,5 +1,3 @@
-mod common;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -162,13 +160,11 @@ fn run(
     backend: &str,
     cache_dir: Option<&std::path::Path>,
 ) -> Vec<Value> {
-    common::ensure_lockfile(root);
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
-        .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .args(["--backend", backend, "--action-log"])
         .arg(&action_log);
     if let Some(cache_dir) = cache_dir {
@@ -199,13 +195,11 @@ fn fixture_action(actions: &[Value]) -> &Value {
 }
 
 fn cache_command(root: &Path, cache_dir: &Path) -> (Command, PathBuf) {
-    common::ensure_lockfile(root);
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
-        .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .args(["--backend", "cache", "--action-log"])
         .arg(&action_log)
         .arg("--cache-dir")
@@ -413,7 +407,6 @@ fn run_snapshot_gate_with_inputs(
     trace: Option<&Path>,
     declared_inputs: &[&Path],
 ) -> ExitStatus {
-    common::ensure_lockfile(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
@@ -2374,13 +2367,10 @@ fn restored_action_relocates_integration_test_companion_binary_to_consumer_targe
         .expect("producer companion compiler action");
     assert_eq!(producer_companion["execution"], "local-cache-miss");
     fs::remove_dir_all(&producer).expect("remove producer before consumer");
-
-    common::ensure_lockfile(&consumer);
     let consumer_action_log = consumer.join("target/cargo-reapi/actions.jsonl");
     let consumer_status = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(&consumer)
         .env_remove("CARGO_TARGET_DIR")
-        .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .env("CARGO_REGISTRY_TOKEN", "do-not-record")
         .args(["--backend", "cache", "--action-log"])
         .arg(&consumer_action_log)

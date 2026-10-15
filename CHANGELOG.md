@@ -4,6 +4,28 @@ All notable changes to `cargo-reapi` are documented in this file.
 
 ## [Unreleased]
 
+### Narrowing (work in progress on branch `narrow-0216`)
+
+cargo-reapi is narrowed to per-action compile caching. Removed outright:
+the whole-gate snapshot, restore, marker, gate key and `gate-inputs.jsonl`; the
+strict `srt` sandbox, `--snapshot-policy`, `--declared-input` and the
+`CARGO_REAPI_SRT` variable; the `cargo metadata --locked` preflight and the
+selection, run-resolution and target-disjointness rules; link-input discovery
+and the linker capture (`CARGO_REAPI_LINKER_CAPTURE`,
+`CARGO_REAPI_REAL_LINKER`, `CARGO_REAPI_DEFAULT_LINKER`, `link-captures`); the
+rustc query shim and its cache; `CARGO_REAPI_ACTION_CACHE_TEST_MODE`,
+`CARGO_REAPI_GATE_INPUTS` and `CARGO_REAPI_CLONE_TRACE`; the doctor's sandbox
+and clone fields. `CARGO_REAPI_TARGET_ROOT` is set by the driver and a value
+the caller sets is overwritten, as before. Passing a removed option is a clap
+error; the removed variables above are no longer read. Link steps (binaries,
+tests, proc macros and other dynamic libraries) and compiles whose `-L`/`-l`
+reach outside the workspace, build output and sysroot always run uncached.
+`cache gc` removes the directories earlier versions kept (`gate-snapshots`,
+`access/gates`, `rustc-query-cache-v1`, `discoveries`, `link-captures`,
+`file-digests`) and reports them as `removed_obsolete_directories`; its report
+keeps `schema_version` 2 for the trim script.
+
+
 cargo-reapi now caches only what it can prove safe; everything else runs as
 plain Cargo. Several faults below could serve a stale gate hit or overwrite
 source.

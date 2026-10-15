@@ -8,40 +8,31 @@ mod cargo_config;
 mod environment;
 mod evidence;
 mod footprint;
-mod gate;
-mod hermetic;
 mod invocation;
 mod maintenance;
 mod project;
 mod proof;
-mod query;
 mod reclient;
 mod relocation;
 mod resource;
 mod safe_io;
-mod selection;
 
 use std::env;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::cache::{CacheOptions, LinkerCaptureRecord, execute_cached};
+use crate::cache::{CacheOptions, execute_cached};
 use crate::capture::{CaptureOptions, capture_invocation};
 use crate::environment::{
     CALLER_ENVIRONMENT, CONFIG_ENVIRONMENT, RUNTIME_PLUMBING_ENVIRONMENT, caller_record,
     config_record,
 };
-use crate::gate::GateSnapshot;
-use crate::hermetic::SnapshotPolicy;
 use crate::invocation::RustcInvocation;
 use crate::maintenance::{GcOptions, cache_stats, collect_garbage};
-use crate::project::Project;
 use crate::reclient::{ReclientOptions, execute_reapi, validate_platform_template};
 use crate::resource::ResourceCapacity;
 
@@ -51,21 +42,6 @@ enum Backend {
     Capture,
     Cache,
     Reapi,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum SnapshotPolicyArg {
-    Strict,
-    Off,
-}
-
-impl From<SnapshotPolicyArg> for SnapshotPolicy {
-    fn from(value: SnapshotPolicyArg) -> Self {
-        match value {
-            SnapshotPolicyArg::Strict => Self::Strict,
-            SnapshotPolicyArg::Off => Self::Off,
-        }
-    }
 }
 
 #[derive(Debug, Parser)]
@@ -92,14 +68,6 @@ struct Cli {
     /// Shared filesystem CAS used by the cache backend.
     #[arg(long, env = "CARGO_REAPI_CACHE_DIR")]
     cache_dir: Option<PathBuf>,
-
-    /// Hermetic policy for whole-gate snapshots. Strict is fail-closed.
-    #[arg(long, value_enum, default_value_t = SnapshotPolicyArg::Strict)]
-    snapshot_policy: SnapshotPolicyArg,
-
-    /// Additional read-only input made visible to strict build/proc-macro sandboxes.
-    #[arg(long = "declared-input")]
-    declared_inputs: Vec<PathBuf>,
 
     /// Path to reclient's rewrapper binary.
     #[arg(long, env = "CARGO_REAPI_REWRAPPER")]
@@ -184,8 +152,6 @@ struct DoctorReport {
     passed: bool,
     platform_os: &'static str,
     platform_arch: &'static str,
-    sandbox_provider_sha256: String,
-    clone_method: &'static str,
     resource_capacity: ResourceCapacity,
     cache: maintenance::CacheStats,
 }
@@ -289,12 +255,6 @@ fn main() -> ExitCode {
 
 fn run() -> Result<i32> {
     let args: Vec<OsString> = env::args_os().collect();
-    if env::var_os("CARGO_REAPI_RUSTC_QUERY_SHIM").is_some() {
-        return query::run_shim(&args);
-    }
-    if env::var_os("CARGO_REAPI_LINKER_CAPTURE").is_some() {
-        return run_linker_capture(args);
-    }
     let args = strip_cargo_subcommand_name(args);
     if args.get(1).is_some_and(|value| value == "contract") {
         return run_contract(args);
@@ -375,18 +335,13 @@ fn run_doctor(mut args: Vec<OsString>) -> Result<i32> {
         passed: true,
         platform_os: env::consts::OS,
         platform_arch: env::consts::ARCH,
-        sandbox_provider_sha256: hermetic::provider_identity_digest()?,
-        clone_method: gate::probe_clone_method(&cli.cache_dir)?,
         resource_capacity: ResourceCapacity::from_env()?,
         cache: cache_stats(&cli.cache_dir)?,
     };
     if !cli.json {
         eprintln!(
-            "cargo-reapi doctor passed: sandbox={} clone={} cpu={} memory_gib={}",
-            report.sandbox_provider_sha256,
-            report.clone_method,
-            report.resource_capacity.cpu,
-            report.resource_capacity.memory_gib
+            "cargo-reapi doctor passed: cpu={} memory_gib={}",
+            report.resource_capacity.cpu, report.resource_capacity.memory_gib
         );
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -419,111 +374,49 @@ fn describe_compile_environment(
 }
 
 fn run_cli(cli: &Cli) -> Result<i32> {
-    let context = resolve_driver_context(cli)?;
-    if let Some(reason) = &context.decline {
-        return run_uncached(cli, &context, &cli.cargo_args, reason);
-    }
-    if context.project.is_some() {
-        crate::hermetic::provider_identity_digest().context(SANDBOX_UNAVAILABLE)?;
+    let executable = env::current_exe()
+        .context("locating cargo-reapi executable")?
+        .canonicalize()
+        .context("resolving cargo-reapi executable")?;
+    let workspace_root =
+        crate::project::canonical(&env::current_dir().context("locating Cargo workspace root")?)?;
+
+    // cargo-reapi is Cargo's compiler wrapper, so a wrapper the user already
+    // set would be replaced: that invocation runs as plain Cargo.
+    if let Some(reason) = user_wrapper(&workspace_root) {
+        eprintln!("cargo-reapi: not caching ({reason}); running Cargo uncached");
+        let status = Command::new("cargo")
+            .args(&cli.cargo_args)
+            .status()
+            .context("starting Cargo")?;
+        return Ok(status.code().unwrap_or(1));
     }
 
-    // Only `run`'s build is cached, as the `build` it contains. The program
-    // then runs through Cargo as ever, with its own stdin and stdout, and
-    // is never skipped, replayed or sandboxed.
-    let Some(plan) = context
-        .runs_program
-        .clone()
-        .filter(|_| context.project.is_some())
-    else {
-        return run_with(cli, context, &cli.cargo_args);
-    };
-    let build = build_arguments(&cli.cargo_args, &plan);
-    let code = run_with(cli, context.clone(), &build)?;
-    if code != 0 {
-        return Ok(code);
-    }
-    let program = DriverContext {
-        project: None,
-        decline: None,
-        runs_program: None,
-        ..context
-    };
-    run_with(cli, program, &cli.cargo_args)
+    let target_root = resolve_target_root(cli, &workspace_root)?;
+    validate_driver_paths(&executable, &target_root)?;
+    run_cargo(cli, &executable, &workspace_root, &target_root)
 }
 
-/// `run`'s arguments as the `build` they contain: the subcommand replaced,
-/// the program's own arguments after `--` dropped, and the one binary `run`
-/// would build named, so that nothing else is built.
-fn build_arguments(cargo_args: &[OsString], plan: &RunPlan) -> Vec<OsString> {
-    let index = plan.command_index;
-    let mut build = cargo_args.to_vec();
-    build[index] = OsString::from("build");
-    if let Some(separator) = build[index..].iter().position(|argument| argument == "--") {
-        build.truncate(index + separator);
-    }
-    if let Some(binary) = &plan.binary {
-        build.extend([OsString::from("--bin"), OsString::from(binary)]);
-    }
-    build
-}
-
-fn run_with(cli: &Cli, context: DriverContext, cargo_args: &[OsString]) -> Result<i32> {
+/// Runs Cargo with cargo-reapi as its compiler wrapper. Cargo runs every
+/// time; only the compiles it asks the wrapper for are cached.
+fn run_cargo(
+    cli: &Cli,
+    executable: &Path,
+    workspace_root: &Path,
+    target_root: &Path,
+) -> Result<i32> {
     // Compiles run in their package's directory, so a relative log would
     // land beside each package rather than where the caller asked.
     let action_log = cli.action_log.as_ref().map_or_else(
-        || context.target_root.join("cargo-reapi/actions.jsonl"),
-        |path| context.workspace_root.join(path),
+        || target_root.join("cargo-reapi/actions.jsonl"),
+        |path| workspace_root.join(path),
     );
-    let action_log_for_snapshot = action_log.clone();
-    let cache_dir = cli.cache_dir.clone();
-    // The project is resolved exactly when the strict sandbox is used. A
-    // gate that cannot be prepared hands the command to Cargo.
-    let mut gate_snapshot = match prepare_gate(
-        cli,
-        &context.workspace_root,
-        &context.target_root,
-        &action_log_for_snapshot,
-        context.project.as_ref(),
-        cargo_args,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return run_uncached(cli, &context, cargo_args, &one_line(&format!("{error:#}")));
-        }
-    };
-    let DriverContext {
-        executable,
-        workspace_root,
-        target_root,
-        project,
-        ..
-    } = context;
-    if let Some(snapshot) = gate_snapshot.as_ref()
-        && snapshot.is_restored()
-    {
-        snapshot.record_successful_hit(&action_log_for_snapshot)?;
-        return Ok(0);
-    }
-    // A gate can wait a long time for another producer. If cargo-reapi was
-    // reinstalled meanwhile, Cargo would run the new version as the compiler
-    // wrapper under this driver; the new version takes the command instead.
-    if cache::replaced_since_start(&executable) {
-        drop(gate_snapshot);
-        return restart_installed(&executable);
-    }
-    let hermetic = cached_cargo_command(
-        cli,
-        &workspace_root,
-        &target_root,
-        &action_log_for_snapshot,
-        project.as_ref(),
-    )?;
-    let mut cargo = hermetic.command;
+    let mut cargo = Command::new("cargo");
     if matches!(cli.backend, Backend::Cache | Backend::Reapi) {
         ResourceCapacity::from_env()?.apply_to(&mut cargo);
     }
-    cargo.args(cargo_args);
-    describe_compile_environment(&mut cargo, &workspace_root, cargo_args);
+    cargo.args(&cli.cargo_args);
+    describe_compile_environment(&mut cargo, workspace_root, &cli.cargo_args);
     cargo
         .env("RUSTC_WRAPPER", executable)
         .env(
@@ -537,364 +430,78 @@ fn run_with(cli: &Cli, context: DriverContext, cargo_args: &[OsString]) -> Resul
         )
         .env("CARGO_REAPI_ACTION_LOG", action_log)
         .env("CARGO_REAPI_WORKSPACE_ROOT", workspace_root)
-        .env("CARGO_REAPI_TARGET_ROOT", &target_root);
-    if project.is_some() {
-        cargo.env(
-            "CARGO_REAPI_GATE_INPUTS",
-            target_root
-                .join(crate::gate::ADMINISTRATIVE_DIRECTORY)
-                .join(crate::gate::LINK_INPUTS_FILE),
-        );
-    }
-    if matches!(cli.backend, Backend::Cache) {
-        let default_linker = cache::default_linker_for_sandbox()?;
-        cargo.env("CARGO_REAPI_DEFAULT_LINKER", &default_linker);
-        if env::var_os("CC").is_none() {
-            // Native build scripts use cc-rs directly rather than rustc's
-            // linker setting. Supply the already-canonicalized distro
-            // default so /etc/alternatives does not have to be exposed.
-            cargo.env("CC", &default_linker);
-        }
-    }
-    if let Some(cache_dir) = cache_dir {
+        .env("CARGO_REAPI_TARGET_ROOT", target_root);
+    if let Some(cache_dir) = &cli.cache_dir {
         cargo
             .env(
                 "CARGO_REAPI_RESOURCE_LEDGER",
-                resource::ledger_root(&cache_dir)?,
+                resource::ledger_root(cache_dir)?,
             )
             .env("CARGO_REAPI_CACHE_DIR", cache_dir);
     }
     configure_reclient_environment(&mut cargo, cli);
     let status = cargo.status().context("starting Cargo")?;
-    complete_gate_snapshot(
-        status.success(),
-        gate_snapshot.as_mut(),
-        &action_log_for_snapshot,
-    )?;
     Ok(status.code().unwrap_or(1))
 }
 
-/// The Cargo command for a cached run: inside the strict sandbox when the
-/// project was resolved for it.
-fn cached_cargo_command(
-    cli: &Cli,
-    workspace_root: &Path,
-    target_root: &Path,
-    action_log: &Path,
-    project: Option<&Project>,
-) -> Result<crate::hermetic::HermeticCargo> {
-    if project.is_some() {
-        crate::hermetic::cargo_command(
-            SnapshotPolicy::Strict,
-            workspace_root,
-            target_root,
-            cli.cache_dir
-                .as_deref()
-                .context("cache directory is required")?,
-            action_log,
-            &cli.declared_inputs,
-            project,
-        )
-    } else {
-        crate::hermetic::cargo_command(
-            SnapshotPolicy::Off,
-            workspace_root,
-            target_root,
-            cli.cache_dir.as_deref().unwrap_or(target_root),
-            action_log,
-            &[],
-            None,
-        )
+/// Why this invocation cannot use cargo-reapi as its compiler wrapper, when
+/// the user's own configuration already names one.
+fn user_wrapper(workspace_root: &Path) -> Option<String> {
+    if let Some(name) = crate::cargo_config::wrapper_environment() {
+        return Some(format!("{name} already names a compiler wrapper"));
+    }
+    match crate::cargo_config::wrapper_setting(workspace_root) {
+        Ok(None) => None,
+        Ok(Some((origin, key))) => Some(format!("{origin} sets {key}, a compiler wrapper")),
+        Err(error) => Some(one_line(&format!(
+            "cargo-reapi cannot tell whether a compiler wrapper is configured: {error:#}"
+        ))),
     }
 }
 
-/// The whole-gate snapshot for a cache build in the strict sandbox.
-fn prepare_gate(
-    cli: &Cli,
-    workspace_root: &Path,
-    target_root: &Path,
-    action_log: &Path,
-    project: Option<&Project>,
-    cargo_args: &[OsString],
-) -> Result<Option<GateSnapshot>> {
-    let Some(project) = project else {
-        return Ok(None);
-    };
-    #[cfg(feature = "test-hooks")]
-    if env::var_os("CARGO_REAPI_ACTION_CACHE_TEST_MODE").is_some() {
-        return Ok(None);
-    }
-
-    let cache_dir = cli
-        .cache_dir
-        .as_deref()
-        .context("cache directory is required")?;
-    GateSnapshot::prepare(
-        cache_dir,
-        workspace_root,
-        target_root,
-        action_log,
-        cargo_args,
-        &cli.declared_inputs,
-        project,
-    )
-    .map(Some)
-}
-
-/// Runs this command with the cargo-reapi now installed at `executable`.
-#[cfg(unix)]
-fn restart_installed(executable: &Path) -> Result<i32> {
-    use std::os::unix::process::CommandExt;
-
-    let error = Command::new(executable).args(env::args_os().skip(1)).exec();
-    Err(error).with_context(|| format!("restarting the reinstalled {}", executable.display()))
-}
-
-#[cfg(not(unix))]
-fn restart_installed(executable: &Path) -> Result<i32> {
-    bail!(
-        "{} was replaced while this command ran",
-        executable.display()
-    )
-}
-
-/// What a cached `run` builds: the subcommand's place among the arguments,
-/// and the binary to name when the arguments do not.
-#[derive(Clone)]
-struct RunPlan {
-    command_index: usize,
-    binary: Option<String>,
-}
-
-/// Said when the strict sandbox cannot be built. Cargo did not run, and
-/// nothing was declined: this is a failure of the environment.
-const SANDBOX_UNAVAILABLE: &str =
-    "the strict sandbox is unavailable, so Cargo was not run (this is not a decline)";
-
-#[derive(Clone)]
-struct DriverContext {
-    executable: PathBuf,
-    workspace_root: PathBuf,
-    target_root: PathBuf,
-    /// The selected project, resolved for the strict sandbox and its gate.
-    project: Option<Project>,
-    /// Why this invocation is not cached, when it is not: the invocation
-    /// runs as plain Cargo.
-    decline: Option<String>,
-    /// The invocation is `run`: only its build is cached, as `build`, and
-    /// the program then runs normally.
-    runs_program: Option<RunPlan>,
-}
-
-/// What the preflight of a cached invocation learned before it declined or
-/// finished.
-#[derive(Default)]
-struct Preflight {
-    project: Option<Project>,
-    target_root: Option<PathBuf>,
-    /// For `run`, where the subcommand sits among the Cargo arguments.
-    runs_program: Option<RunPlan>,
-}
-
-fn resolve_driver_context(cli: &Cli) -> Result<DriverContext> {
-    let executable = env::current_exe()
-        .context("locating cargo-reapi executable")?
-        .canonicalize()
-        .context("resolving cargo-reapi executable")?;
-    let workspace_root =
-        crate::project::canonical(&env::current_dir().context("locating Cargo workspace root")?)?;
-
-    let snapshots: SnapshotPolicy = cli.snapshot_policy.into();
-    if matches!(cli.backend, Backend::Cache) && snapshots == SnapshotPolicy::Strict {
-        let mut preflight = Preflight::default();
-        let decline = prepare_cached_project(cli, &workspace_root, &executable, &mut preflight)
-            .err()
-            .map(|error| one_line(&format!("{error:#}")));
-        let target_root = match preflight.target_root {
-            Some(target_root) => target_root,
-            None => resolve_target_root_from(&workspace_root, None)?,
+/// Cargo's target directory: `--target-dir`, else `CARGO_TARGET_DIR`, else
+/// what Cargo reports for the working directory's project.
+fn resolve_target_root(cli: &Cli, workspace_root: &Path) -> Result<PathBuf> {
+    let mut target_dir = None;
+    let mut manifest_path = None;
+    let mut arguments = cli.cargo_args.iter();
+    while let Some(argument) = arguments.next() {
+        let Some(text) = argument.to_str() else {
+            continue;
         };
-        return Ok(DriverContext {
-            executable,
-            workspace_root,
-            target_root,
-            project: preflight.project,
-            decline,
-            runs_program: preflight.runs_program,
-        });
+        if text == "--" {
+            break;
+        }
+        for (name, slot) in [
+            ("--target-dir", &mut target_dir),
+            ("--manifest-path", &mut manifest_path),
+        ] {
+            if text == name {
+                *slot = arguments.next().cloned();
+            } else if let Some(value) = text.strip_prefix(&format!("{name}=")) {
+                *slot = Some(OsString::from(value));
+            }
+        }
     }
-
-    // Local, capture and snapshot-free runs cache nothing at the gate, so
-    // the restrictions that keep it sound do not apply. The selection only
-    // locates the target directory, where Cargo's own answer for the
-    // working directory serves when it cannot be read.
-    let (metadata_arguments, target_dir) =
-        crate::selection::select(&workspace_root, &cli.cargo_args)
-            .map(|selection| (selection.metadata_arguments, selection.target_dir))
-            .unwrap_or_default();
+    let metadata_arguments = manifest_path
+        .into_iter()
+        .flat_map(|path| [OsString::from("--manifest-path"), path])
+        .collect::<Vec<_>>();
     let configured = target_dir
+        .map(PathBuf::from)
         .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
-        .or_else(|| crate::project::target_directory(&workspace_root, &metadata_arguments));
-    let target_root = resolve_target_root_from(&workspace_root, configured)?;
-    validate_driver_paths(&executable, &target_root)?;
-
-    Ok(DriverContext {
-        executable,
-        workspace_root,
-        target_root,
-        project: None,
-        decline: None,
-        runs_program: None,
-    })
-}
-
-/// Proves the invocation safe to cache, or says why not. Nothing here
-/// changes the project: metadata runs with `--locked`, so it cannot write
-/// the lockfile.
-fn prepare_cached_project(
-    cli: &Cli,
-    workspace_root: &Path,
-    executable: &Path,
-    preflight: &mut Preflight,
-) -> Result<()> {
-    let selection = crate::selection::select(workspace_root, &cli.cargo_args)?;
-    if let Some(reason) = selection.uncacheable_reason() {
-        bail!("{reason}");
-    }
-    if let Some(name) = crate::cargo_config::declined_environment() {
-        bail!(
-            "{name} changes what Cargo builds in a way cargo-reapi neither reads nor keys \
-             (a lockfile path, compiler, wrapper, build directory or unstable option)"
-        );
-    }
-    if let Some((origin, key)) = crate::cargo_config::declined_setting(workspace_root)? {
-        bail!(
-            "{origin} sets {key}, which changes what Cargo builds in a way cargo-reapi neither \
-             reads nor keys"
-        );
-    }
-
-    if let Some(missing) = cli
-        .declared_inputs
-        .iter()
-        .find(|input| !workspace_root.join(input).exists())
-    {
-        bail!("declared input does not exist: {}", missing.display());
-    }
-
-    let cache_dir = cli
-        .cache_dir
-        .as_deref()
-        .context("cache directory is required")?;
-    let project = Project::resolve(workspace_root, cache_dir, &selection.metadata_arguments)?;
-    crate::gate::validate_git_dependencies(&project)?;
-    if selection
-        .command
-        .as_deref()
-        .is_some_and(|c| c == "run" || c == "r")
-    {
-        preflight.runs_program = Some(RunPlan {
-            command_index: selection
-                .command_index
-                .context("the subcommand has no position")?,
-            binary: run_binary(&selection, &project)?,
-        });
-    }
-    let configured = selection
-        .target_dir
-        .or_else(|| env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| project.target_directory.clone());
-    let target_root = resolve_target_root_from(workspace_root, Some(configured))?;
-    preflight.target_root = Some(target_root.clone());
-
-    // The sandbox policy assumes a target disjoint from the project, so a
-    // project is kept for the uncached run only once its target passes.
-    validate_driver_paths(executable, &target_root)?;
-    project.validate_target(workspace_root, &target_root, &cli.declared_inputs)?;
-    crate::gate::validate_administrative_directory(&target_root)?;
-    preflight.project = Some(project);
-    Ok(())
-}
-
-fn named_target(target: &crate::selection::NamedTarget) -> Result<Option<&str>> {
-    match target {
-        crate::selection::NamedTarget::Absent => Ok(None),
-        crate::selection::NamedTarget::Named(name) => Ok(Some(name.as_str())),
-        crate::selection::NamedTarget::Unnamed => {
-            bail!("`run` gives --bin or --example without a name")
-        }
-    }
-}
-
-/// The binary to name for `run`'s build, or `None` when the arguments name
-/// it (`--bin`, `--example`). Declines when which one `run` builds, or that
-/// Cargo can run it, cannot be told exactly, before anything is built.
-fn run_binary(
-    selection: &crate::selection::Selection,
-    project: &Project,
-) -> Result<Option<String>> {
-    if selection.target_options > 1 {
-        bail!("`run` gives more than one --bin or --example");
-    }
-    if selection.selects_packages && selection.packages.is_empty() {
-        bail!("`run` selects packages with --workspace or --exclude");
-    }
-    project.run_target(
-        &selection.packages,
-        named_target(&selection.bin)?,
-        named_target(&selection.example)?,
-    )
-}
-
-/// An error message as one line.
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Runs the user's exact Cargo command without caching: nothing is
-/// restored, recorded or wrapped. With a resolved project the strict
-/// sandbox still applies; without one no policy can be built and Cargo runs
-/// plainly.
-fn run_uncached(
-    cli: &Cli,
-    context: &DriverContext,
-    cargo_args: &[OsString],
-    reason: &str,
-) -> Result<i32> {
-    let mut cargo = match &context.project {
-        Some(project) => {
-            let cache_dir = cli
-                .cache_dir
-                .as_deref()
-                .context("cache directory is required")?;
-            let action_log = context.target_root.join("cargo-reapi/actions.jsonl");
-            crate::hermetic::cargo_command(
-                SnapshotPolicy::Strict,
-                &context.workspace_root,
-                &context.target_root,
-                cache_dir,
-                &action_log,
-                &cli.declared_inputs,
-                Some(project),
-            )
-            .context(SANDBOX_UNAVAILABLE)?
-            .command
-        }
-        None => Command::new("cargo"),
-    };
-    eprintln!("cargo-reapi: not caching ({reason}); running Cargo uncached");
-    let status = cargo.args(cargo_args).status().context("starting Cargo")?;
-    Ok(status.code().unwrap_or(1))
-}
-
-/// Cargo's target directory, canonical even before Cargo creates it.
-fn resolve_target_root_from(workspace_root: &Path, configured: Option<PathBuf>) -> Result<PathBuf> {
+        .or_else(|| crate::project::target_directory(workspace_root, &metadata_arguments));
     let target_root = configured.map_or_else(
         || workspace_root.join("target"),
         |path| workspace_root.join(path),
     );
     crate::project::canonical(&target_root)
         .with_context(|| format!("resolving Cargo target directory {}", target_root.display()))
+}
+
+/// An error message as one line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn validate_driver_paths(executable: &Path, target_root: &Path) -> Result<()> {
@@ -963,18 +570,6 @@ fn validate_cli(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn complete_gate_snapshot(
-    succeeded: bool,
-    snapshot: Option<&mut GateSnapshot>,
-    action_log: &std::path::Path,
-) -> Result<()> {
-    if succeeded && let Some(snapshot) = snapshot {
-        snapshot.record_successful_hit(action_log)?;
-        snapshot.publish_after_success()?;
-    }
-    Ok(())
-}
-
 fn run_prove(mut args: Vec<OsString>) -> Result<i32> {
     args.remove(1);
     let cli = ProveCli::parse_from(args);
@@ -1036,102 +631,6 @@ fn run_prove(mut args: Vec<OsString>) -> Result<i32> {
         }
     }
     Ok(0)
-}
-
-fn run_linker_capture(args: Vec<OsString>) -> Result<i32> {
-    use fs2::FileExt;
-
-    let capture_path = env::var_os("CARGO_REAPI_LINKER_CAPTURE")
-        .map(PathBuf::from)
-        .context("CARGO_REAPI_LINKER_CAPTURE is required in linker mode")?;
-    let real_linker = env::var_os("CARGO_REAPI_REAL_LINKER")
-        .map(PathBuf::from)
-        .context("CARGO_REAPI_REAL_LINKER is required in linker mode")?;
-    let arguments = args
-        .iter()
-        .skip(1)
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    let mut command = Command::new(&real_linker);
-    command.args(args.into_iter().skip(1));
-    #[cfg(target_os = "linux")]
-    let trace_argument = linux_linker_trace_argument(&real_linker);
-    #[cfg(target_os = "linux")]
-    if let Some(argument) = trace_argument {
-        command.arg(argument);
-    }
-
-    #[cfg(target_os = "linux")]
-    let (exit_code, traced_inputs) = if trace_argument.is_some() {
-        let output = command
-            .output()
-            .with_context(|| format!("executing real linker {}", real_linker.display()))?;
-        std::io::stderr()
-            .write_all(&output.stderr)
-            .context("replaying linker stderr")?;
-        if !output.status.success() {
-            std::io::stdout()
-                .write_all(&output.stdout)
-                .context("replaying failed linker stdout")?;
-        }
-        (
-            output.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        let status = command
-            .status()
-            .with_context(|| format!("executing real linker {}", real_linker.display()))?;
-        (status.code().unwrap_or(1), Vec::new())
-    };
-    #[cfg(not(target_os = "linux"))]
-    let (exit_code, traced_inputs) = {
-        let status = command
-            .status()
-            .with_context(|| format!("executing real linker {}", real_linker.display()))?;
-        (status.code().unwrap_or(1), Vec::new())
-    };
-
-    if let Some(parent) = capture_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating linker capture directory {}", parent.display()))?;
-    }
-    let mut capture = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&capture_path)
-        .with_context(|| format!("opening linker capture {}", capture_path.display()))?;
-    capture.lock_exclusive().context("locking linker capture")?;
-    let record = LinkerCaptureRecord {
-        schema_version: 1,
-        arguments,
-        traced_inputs,
-    };
-    writeln!(
-        capture,
-        "{}",
-        serde_json::to_string(&record).context("serializing linker capture")?
-    )
-    .context("writing linker capture")?;
-    FileExt::unlock(&capture).context("unlocking linker capture")?;
-    Ok(exit_code)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_linker_trace_argument(linker: &std::path::Path) -> Option<&'static str> {
-    let name = linker.file_name()?.to_str()?;
-    if name.contains("gcc") || name.contains("g++") || name.contains("clang") || name == "cc" {
-        Some("-Wl,-t")
-    } else if name == "ld" || name.starts_with("ld.") || name.ends_with("-ld") {
-        Some("-t")
-    } else {
-        None
-    }
 }
 
 fn run_contract(mut args: Vec<OsString>) -> Result<i32> {
@@ -1208,37 +707,7 @@ mod cli_tests {
 
     use clap::{Parser, error::ErrorKind};
 
-    use std::ffi::OsString;
-
-    use super::{Cli, RunPlan, build_arguments, resolve_target_root_from, validate_driver_paths};
-
-    fn arguments(words: &[&str]) -> Vec<OsString> {
-        words.iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn run_is_cached_as_the_build_it_contains() {
-        assert_eq!(
-            build_arguments(
-                &arguments(&["--locked", "run", "-p", "tool", "--", "--all"]),
-                &RunPlan {
-                    command_index: 1,
-                    binary: Some("tool".to_owned())
-                }
-            ),
-            arguments(&["--locked", "build", "-p", "tool", "--bin", "tool"])
-        );
-        assert_eq!(
-            build_arguments(
-                &arguments(&["r", "--bin", "tool"]),
-                &RunPlan {
-                    command_index: 0,
-                    binary: None
-                }
-            ),
-            arguments(&["build", "--bin", "tool"])
-        );
-    }
+    use super::{Cli, validate_driver_paths};
 
     #[test]
     fn version_identifies_cargo_reapi_instead_of_delegating_to_cargo() {
@@ -1272,39 +741,5 @@ mod cli_tests {
             Path::new("/build/cargo-target"),
         )
         .expect("installed driver may manage an external target");
-    }
-
-    #[test]
-    fn resolves_relative_target_directory_against_workspace() {
-        let resolved = resolve_target_root_from(
-            Path::new("/workspace/project"),
-            Some("shared-target".into()),
-        )
-        .expect("resolve relative target");
-
-        assert_eq!(resolved, Path::new("/workspace/project/shared-target"));
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod linux_tests {
-    use std::path::Path;
-
-    use super::linux_linker_trace_argument;
-
-    #[test]
-    fn selects_trace_syntax_for_driver_and_direct_linker() {
-        assert_eq!(
-            linux_linker_trace_argument(Path::new("/usr/bin/x86_64-linux-gnu-gcc-12")),
-            Some("-Wl,-t")
-        );
-        assert_eq!(
-            linux_linker_trace_argument(Path::new("/usr/bin/ld")),
-            Some("-t")
-        );
-        assert_eq!(
-            linux_linker_trace_argument(Path::new("/opt/custom/linker")),
-            None
-        );
     }
 }

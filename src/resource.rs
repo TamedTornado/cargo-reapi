@@ -261,32 +261,6 @@ impl ResourceLease {
             )
         })
     }
-
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn acquire_snapshot_signing_at(lease_root: &Path) -> Result<Self> {
-        let contract = AcceptanceContract::embedded()?;
-        let root = lease_root.join("snapshot-signing");
-        fs::create_dir_all(&root)?;
-        let progress = root.join(PROGRESS_MARKER);
-        let lease = wait_for_progress(
-            &progress,
-            Duration::from_secs(contract.stall_seconds),
-            || {
-                let mut files = Vec::with_capacity(1);
-                let acquired = try_acquire_tokens(&root, 4, 1, &mut files)?;
-                Ok(acquired.then(|| Self {
-                    files,
-                    progress: progress.clone(),
-                }))
-            },
-        )?;
-        lease.with_context(|| {
-            format!(
-                "infrastructure stall: no snapshot-signing lease was released for {} seconds",
-                contract.stall_seconds
-            )
-        })
-    }
 }
 
 impl Drop for ResourceLease {
@@ -327,7 +301,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use std::path::Path;
     use tempfile::tempdir;
 
     use super::{ResourceCapacity, ResourceLease, record_progress, wait_for_progress};
@@ -475,31 +448,5 @@ mod tests {
             peak.load(Ordering::SeqCst) <= 2,
             "ledger exceeded the link memory budget"
         );
-    }
-
-    #[test]
-    fn snapshot_signing_has_four_shared_tokens() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let mut workers = Vec::new();
-        for _ in 0..20 {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            workers.push(std::thread::spawn(move || {
-                let _lease = ResourceLease::acquire_snapshot_signing_at(Path::new(
-                    "/tmp/cargo-reapi-resource-ledger-v1-test",
-                ))
-                .expect("signing lease");
-                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(current, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(4));
-                active.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("worker");
-        }
-        assert!(peak.load(Ordering::SeqCst) > 1);
-        assert!(peak.load(Ordering::SeqCst) <= 4);
     }
 }

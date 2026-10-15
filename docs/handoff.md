@@ -1,3 +1,127 @@
+# cargo-reapi handoff: narrowing in progress (read this first)
+
+State as of 2026-10-15, branch `narrow-0216` (work in progress, not on `main`).
+`main` at 86d3e1c is the last whole-gate design; everything below the
+"Superseded" line describes that design and its review history, not what the
+branch does. Nothing is bumped, tagged or published.
+
+## Jason's decision (via the coordinator)
+
+Narrow cargo-reapi to what holds up: **per-action rustc compile caching only**,
+keyed by compiler identity, arguments, keyed environment and every rustc
+dep-info input verified by content (the sccache model, with the existing
+raw-path re-resolution). Cargo runs every time. Hostile build code is out of
+scope; the README must say plainly that the cache assumes build scripts and
+proc macros are not written to defeat it and that proc macros declare the files
+they read (the held finding #7 is a documented assumption). The one write path
+(`safe_io`, `beneath`) stays. Link steps and compiles with native inputs
+outside the hashed project and toolchain run uncached.
+
+Approved follow-ons: the strict sandbox, `--snapshot-policy`,
+`--declared-input`, the metadata preflight, the target-disjointness rule and the
+`run` build-then-run split are removed too; the user-wrapper decline, per-action
+caching, `safe_io`/`beneath`, `doctor` and `cache` stay.
+
+## Done on the branch (builds; 78 unit tests pass)
+
+- Deleted: `gate.rs`, `hermetic.rs`, `selection.rs`, `query.rs`; link caching in
+  `cache.rs` (`execute_cached_link`, discovery, memo, linker capture); the
+  linker capture and `run` machinery in `main.rs`; `learned_environment_digest`;
+  the macOS snapshot-signing lease; the sandbox provider fields of the
+  environment proof; `tests/project_selection.rs`, `tests/source_acquisition.rs`,
+  `tests/common`.
+- `main.rs`: `run_cli` resolves the target root (`--target-dir`,
+  `--manifest-path`, `CARGO_TARGET_DIR`, else `cargo metadata --no-deps`), runs
+  `cargo` with `RUSTC_WRAPPER` set, or runs plain Cargo with a reason line when
+  the user already names a wrapper (`cargo_config::wrapper_environment`,
+  `wrapper_setting`).
+- `capture.rs`: link steps are cache-ineligible; `native_input_reason` makes a
+  compile ineligible when a `-L` path lies outside workspace, target and
+  sysroot, or a `-l` library is not found beside an inside `-L` directory.
+- `maintenance.rs`: no gate entries or access records; `OBSOLETE_DIRECTORIES`
+  are removed whole by `cache gc` (the first run reclaims old gate snapshots).
+  Its report keeps `schema_version` 2 and `capacity_satisfied`,
+  `after.total_bytes`, `after.available_bytes`, which `trim-cache.sh` reads, so
+  `/mnt/build/moria-v2/scripts/trim-cache.sh` and the copy `MORIA_TRIM_CACHE`
+  points at need **no change**.
+- `Cargo.toml`: `test-hooks` now only gates the coalescing signal.
+
+## To do (in order)
+
+1. Triage `cargo test --features test-hooks`. Failing at the last run, all in
+   `tests/capture.rs`: delete the tests that only covered removed code
+   (`strict_sandbox_*`,
+   `separate_project_caches_share_the_explicit_ledger_in_strict_sandboxes`,
+   `strict_snapshot_*`, `undeclared_*_fails_closed`,
+   `declared_external_build_script_input_invalidates_snapshot`,
+   `whole_gate_snapshot_*`,
+   `check_clippy_and_test_publish_three_exact_gate_snapshots`,
+   `changed_source_in_an_existing_target_*`, `identical_cold_gates_*`,
+   `failing_simultaneous_gates_*`,
+   `poisoned_dependency_makes_the_restored_gate_say_no`,
+   `strict_compiler_actions_use_the_drivers_selected_capacity`,
+   `exact_mutation_*`); adapt the ones that cached links to the new rule
+   (`linked_binary_is_durably_cached_and_runs_in_a_later_worktree`,
+   `a_library_with_two_crate_types_restores_both_from_the_cache`,
+   `restored_action_relocates_integration_test_companion_binary_*`,
+   `restored_rlib_keeps_the_downstream_link_action_key`,
+   `mutation_rebuilds_only_leaf_and_dependents_*`: a link step now logs
+   `local-ineligible`; compiles of rlibs still hit) and drop
+   `--snapshot-policy` and `--declared-input` from every command line
+   (`explicit_external_cargo_target_dir_remains_supported`).
+   `tests/environment.rs`, `maintenance.rs`, `pipelining.rs`,
+   `dependency_relocation.rs`, `reinstall.rs` (delete
+   `a_build_waiting_to_start_survives_reinstalling_cargo_reapi`) and `bevy.rs`
+   were not yet checked. Never `git checkout` a file with uncommitted work to
+   undo a mutation: commit first, revert only that change.
+2. Add regressions, each mutation-checked: an outside static library replaced
+   makes the link run fresh (compile `answer.c` with `cc` and `ar` into a
+   directory under the cache, link it with `#[link(name = "answer", kind =
+   "static")]` and a build script's `rustc-link-search`); a bundled static
+   archive in a library crate makes that action run uncached (action log
+   `local-ineligible`); user-wrapper decline; a compile whose `-l` resolves
+   inside an inside `-L` stays cached. Port the per-action tests that lived in
+   the deleted `project_selection.rs` (`git show 6d49afd:tests/project_selection.rs`):
+   `a_file_included_from_outside_the_package_keys_the_compile`,
+   `dep_info_inputs_are_checked_as_rustc_read_them`,
+   `an_action_entry_of_an_older_schema_is_a_miss_not_an_error`,
+   `a_source_directory_named_target_is_hashed`,
+   `an_audit_variable_never_reaches_the_compiler`,
+   `audit_variables_never_reach_an_ordinary_compiler_even_with_a_real_rustc_set`;
+   they used a lockfile and the strict gate and need the plain
+   `--backend cache --cache-dir` command line.
+3. Rewrite README (remove "Strict snapshot execution", the gate, sandbox and
+   selection sections; add the assumptions paragraph above; describe link steps
+   and the native-input rule) and fold the older gate-era CHANGELOG bullets
+   into one line saying they were superseded (a "Narrowing" section is already
+   there). `acceptance/`, `proof.rs`, `evidence.rs` and `acceptance.rs` predate
+   the narrowing: their warm-run criteria assume zero physical compiler
+   actions, which link steps now violate, and the `portable-copy-isolated`
+   receipt names a deleted test; treat that harness as stale until Jason
+   decides its future.
+4. Measure the `moria_cargo` invocations on a clean Moria checkout with a warm
+   cache: wall time, compile actions executed (expect 0 for rlibs) and link
+   actions executed (the action log marks each with `execution`;
+   `local-ineligible` excluding `-vV` control probes). Report to the
+   coordinator.
+5. One more review, then the release rule below.
+
+## Follow-ons for the coordinator to route (not done by this lane)
+
+- `/mnt/build/g1-tools/moria-env.sh`: remove `export CARGO_REAPI_SRT=...` (no
+  longer read) and `CARGO_REAPI_TARGET_ROOT=$checkout/target` in `moria_cargo`
+  (the driver sets it for the wrapper and overwrote the caller's value even
+  before; harmless but meaningless). `CARGO_REAPI_ACTION_LOG` still means what
+  it did (`--action-log`, default `target/cargo-reapi/actions.jsonl`);
+  `CARGO_REAPI_CACHE_DIR`, `_RESOURCE_LEDGER`, `_RESOURCE_CPU_CAPACITY` and
+  `_BACKEND` are all still read.
+- Gate-era variables are listed as removed in the CHANGELOG rather than
+  refused, because Moria's environment still exports `CARGO_REAPI_SRT`.
+
+---
+
+# Superseded: whole-gate design and review history
+
 # cargo-reapi handoff: 0.2.11 cache only what can be proven
 
 State as of 2026-10-15. The work is on `main` (see the commit that adds this

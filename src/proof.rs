@@ -504,9 +504,6 @@ pub struct EnvironmentProof {
     logical_cpus: usize,
     physical_memory_bytes: u64,
     rustc_verbose_version: String,
-    sandbox_provider: String,
-    sandbox_provider_version: String,
-    sandbox_provider_identity_sha256: String,
     violations: Vec<String>,
     passed: bool,
 }
@@ -800,7 +797,6 @@ impl EnvironmentProof {
             .context("reading host logical CPU count")?;
         let physical_memory_bytes = physical_memory_bytes()?;
         let rustc_verbose_version = rustc_verbose_version()?;
-        let sandbox_provider_identity_sha256 = crate::hermetic::provider_identity_digest()?;
         let mut violations = Vec::new();
         if std::env::consts::OS != platform.platform_os {
             violations.push(format!(
@@ -841,9 +837,6 @@ impl EnvironmentProof {
             logical_cpus,
             physical_memory_bytes,
             rustc_verbose_version,
-            sandbox_provider: crate::hermetic::SRT_REQUIRED_PACKAGE.to_owned(),
-            sandbox_provider_version: crate::hermetic::SRT_REQUIRED_VERSION.to_owned(),
-            sandbox_provider_identity_sha256,
             passed: violations.is_empty(),
             violations,
         })

@@ -3,8 +3,6 @@
 //! `test-hooks` feature compiles in; run it with
 //! `cargo test --features test-hooks`.
 
-mod common;
-
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,13 +29,11 @@ fn fixture_action(actions: &[Value]) -> &Value {
 }
 
 fn cache_command(root: &Path, cache_dir: &Path) -> (Command, PathBuf) {
-    common::ensure_lockfile(root);
     let action_log = root.join("target/cargo-reapi/actions.jsonl");
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
-        .env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1")
         .args(["--backend", "cache", "--action-log"])
         .arg(&action_log)
         .arg("--cache-dir")

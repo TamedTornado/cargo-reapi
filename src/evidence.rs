@@ -562,7 +562,7 @@ fn verify_environment(
     {
         violations.push("environment is not the required SSD qualification".to_owned());
     }
-    for field in ["sandbox_provider_identity_sha256", "rustc_verbose_version"] {
+    for field in ["rustc_verbose_version"] {
         if report
             .get(field)
             .and_then(serde_json::Value::as_str)

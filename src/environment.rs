@@ -537,25 +537,6 @@ impl EnvironmentHints {
     }
 }
 
-/// A digest of every name learned for every crate. Learning changes how
-/// later compiles run, so state built before it must not be reused after.
-pub fn learned_environment_digest(cache_root: &Path) -> Result<String> {
-    let root = cache_root.join(LEARNED_ENVIRONMENT_DIRECTORY);
-    let mut entries = Vec::new();
-    if root.is_dir() {
-        for entry in walkdir::WalkDir::new(&root).min_depth(2).max_depth(2) {
-            let entry = entry.context("listing learned environment")?;
-            let relative = entry
-                .path()
-                .strip_prefix(&root)
-                .context("learned name outside its directory")?;
-            entries.push(relative.to_string_lossy().into_owned());
-        }
-    }
-    entries.sort();
-    Ok(format!("{:x}", Sha256::digest(entries.join("\n"))))
-}
-
 /// File names are hex, since a variable name may hold any character but `=`.
 fn encode_name(name: &str) -> String {
     use std::fmt::Write;

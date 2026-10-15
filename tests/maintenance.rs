@@ -1,5 +1,3 @@
-mod common;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -62,7 +60,6 @@ fn fixture_workspace(root: &Path, name: &str) -> PathBuf {
 }
 
 fn cached_build(workspace: &Path, cache: &Path, action_log: &Path) -> Output {
-    common::ensure_lockfile(workspace);
     Command::new(env!("CARGO_BIN_EXE_cargo-reapi"))
         .current_dir(workspace)
         .env_remove("CARGO_TARGET_DIR")

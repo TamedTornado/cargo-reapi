@@ -4,8 +4,6 @@
 
 #![cfg(unix)]
 
-mod common;
-
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -109,11 +107,9 @@ impl Fixture {
 
     /// Starts an ordinary gated build, in the strict sandbox.
     fn start_build(&self) -> Child {
-        common::ensure_lockfile(&self.workspace);
         Command::new(&self.executable)
             .current_dir(&self.workspace)
             .env_remove("CARGO_TARGET_DIR")
-            .env_remove("CARGO_REAPI_ACTION_CACHE_TEST_MODE")
             .args(["--backend", "cache", "--cache-dir"])
             .arg(self.cache())
             .args(["--", "build"])

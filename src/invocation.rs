@@ -54,33 +54,6 @@ impl RustcInvocation {
         Ok(status.code().unwrap_or(1))
     }
 
-    pub fn execute_with_linker_capture(
-        &self,
-        wrapper: &Path,
-        capture_path: &Path,
-        real_linker: &Path,
-        environment: &CompileEnvironment,
-    ) -> Result<i32> {
-        self.record_physical_compiler_observation()?;
-        let mut arguments = self.args.clone();
-        arguments.push(OsString::from("-C"));
-        arguments.push(OsString::from(format!(
-            "linker={}",
-            wrapper.to_string_lossy()
-        )));
-        let mut command = Command::new(&self.compiler);
-        command.args(arguments);
-        apply_compiler_environment(&mut command, &self.compiler, Some(environment))?;
-        let status = command
-            .env("CARGO_REAPI_LINKER_CAPTURE", capture_path)
-            .env("CARGO_REAPI_REAL_LINKER", real_linker)
-            .status()
-            .with_context(|| {
-                format!("executing {} with linker capture", self.compiler.display())
-            })?;
-        Ok(status.code().unwrap_or(1))
-    }
-
     /// Record only compiler processes that cargo-reapi is actually about to
     /// execute. Cache hits never reach this method, so this trace cannot turn
     /// a restored action into a false physical-compiler observation.
@@ -118,10 +91,6 @@ impl RustcInvocation {
         )?;
         writeln!(output, "cwd={}", self.cwd.display())?;
         Ok(())
-    }
-
-    pub fn configured_linker(&self) -> Option<PathBuf> {
-        codegen_value(&self.args, "linker").map(PathBuf::from)
     }
 
     pub fn crate_name(&self) -> Option<&OsStr> {

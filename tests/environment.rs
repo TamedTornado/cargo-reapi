@@ -1,8 +1,6 @@
 //! A cached compile runs with, and is keyed on, only the environment it can
 //! read. These tests drive real Cargo through the cache backend.
 
-mod common;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -59,9 +57,7 @@ fn cached_build_command(
     cargo_args: &[&str],
     environment: &[(&str, &str)],
 ) -> Command {
-    let mut command = cargo_reapi(root, cache, cargo_args, environment);
-    command.env("CARGO_REAPI_ACTION_CACHE_TEST_MODE", "1");
-    command
+    cargo_reapi(root, cache, cargo_args, environment)
 }
 
 /// Runs Cargo through the cache backend with whole-gate snapshots, as
@@ -84,14 +80,12 @@ fn cargo_reapi(
     cargo_args: &[&str],
     environment: &[(&str, &str)],
 ) -> Command {
-    common::ensure_lockfile(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-reapi"));
     command
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_REAPI_DECLARED_ENV")
         .env_remove("CARGO_REAPI_REPORT_STRIPPED_ENV")
-        .env_remove("CARGO_REAPI_ACTION_CACHE_TEST_MODE")
         .args(["--backend", "cache", "--action-log"])
         .arg(action_log(root))
         .arg("--cache-dir")

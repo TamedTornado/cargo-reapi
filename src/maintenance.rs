@@ -13,12 +13,6 @@ use crate::footprint::{Footprint, FootprintBuilder, OwnerId};
 const MAINTENANCE_LOCK: &str = ".maintenance.lock";
 const MAINTENANCE_ADMISSION_LOCK: &str = ".maintenance-admission.lock";
 
-/// Prefix of a gate snapshot being staged inside `gate-snapshots/objects`.
-/// A producer holds a shared maintenance lease from creating such a directory
-/// until renaming it into place, so one observed under the exclusive lease was
-/// left by a producer that died before its cleanup ran.
-pub(crate) const GATE_STAGING_PREFIX: &str = ".gate-";
-
 pub struct CacheSharedGuard {
     lock: File,
 }
@@ -46,22 +40,9 @@ fn open_lock(cache_root: &Path, name: &str) -> Result<File> {
         .context("opening cargo-reapi cache maintenance lock")
 }
 
-#[derive(Clone, Copy)]
-pub enum AccessKind {
-    Action,
-    Gate,
-}
-
-impl AccessKind {
-    fn directory(self) -> &'static str {
-        match self {
-            Self::Action => "actions",
-            Self::Gate => "gates",
-        }
-    }
-}
-
-pub fn record_access(cache_root: &Path, kind: AccessKind, key: &str) -> Result<()> {
+/// Records that the action `key` was used, so that collection evicts the
+/// least recently used first.
+pub fn record_access(cache_root: &Path, key: &str) -> Result<()> {
     if key.is_empty()
         || !key
             .bytes()
@@ -69,7 +50,7 @@ pub fn record_access(cache_root: &Path, kind: AccessKind, key: &str) -> Result<(
     {
         bail!("cache access key contains unsupported characters");
     }
-    let directory = cache_root.join("access").join(kind.directory());
+    let directory = cache_root.join("access/actions");
     fs::create_dir_all(&directory)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -93,12 +74,10 @@ pub struct CacheStats {
     pub cache_root: PathBuf,
     /// Physical bytes the cache occupies, each shared block counted once.
     pub total_bytes: u64,
-    /// Sum of file lengths. Reflinked gate snapshots make this far larger
-    /// than the disk the cache actually occupies.
+    /// Sum of file lengths.
     pub apparent_bytes: u64,
     pub available_bytes: u64,
     pub action_entries: usize,
-    pub gate_entries: usize,
     pub blob_entries: usize,
 }
 
@@ -120,7 +99,6 @@ fn stats(cache_root: &Path, total_bytes: u64, apparent_bytes: u64) -> Result<Cac
         apparent_bytes,
         available_bytes: fs2::available_space(cache_root)?,
         action_entries: entry_count(&cache_root.join("actions"), false)?,
-        gate_entries: entry_count(&cache_root.join("gate-snapshots/objects"), true)?,
         blob_entries: entry_count(&cache_root.join("blobs"), false)?,
     })
 }
@@ -156,24 +134,16 @@ pub struct GcReport {
     pub before: CacheStats,
     pub after: CacheStats,
     pub removed_action_entries: usize,
-    pub removed_gate_entries: usize,
-    pub removed_auxiliary_entries: usize,
-    pub removed_abandoned_staging_entries: usize,
+    /// Directories earlier versions kept and this one does not use, removed
+    /// whole (see [`OBSOLETE_DIRECTORIES`]).
+    pub removed_obsolete_directories: usize,
     pub removed_blob_entries: usize,
     pub estimated_freed_bytes: u64,
     pub capacity_satisfied: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CandidateKind {
-    Action,
-    Gate,
-    Auxiliary,
-}
-
 #[derive(Debug)]
 struct Candidate {
-    kind: CandidateKind,
     key: String,
     path: PathBuf,
     last_used: SystemTime,
@@ -191,7 +161,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         .context("acquiring exclusive cargo-reapi cache maintenance lock")?;
 
     let Units {
-        staging: abandoned_staging,
+        obsolete,
         candidates,
         blobs: blob_owners,
         owners,
@@ -210,15 +180,13 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
     let recovering_free_space = before.available_bytes < options.min_free_bytes;
     let mut projected_free = before.available_bytes;
     let mut removed_action_entries = 0;
-    let mut removed_gate_entries = 0;
-    let mut removed_auxiliary_entries = 0;
     let mut removed_blob_entries = 0;
 
-    // Abandoned staging is never a reuse candidate, yet it occupies the disk.
-    // Left in place it can exceed the budget on its own, and every collection
-    // would then evict all reusable entries without satisfying it.
-    let removed_abandoned_staging_entries = abandoned_staging.len();
-    for (staging, owner) in &abandoned_staging {
+    // What earlier versions kept is never a reuse candidate, yet it occupies
+    // the disk. Left in place it can exceed the budget on its own, and every
+    // collection would then evict all reusable entries without satisfying it.
+    let removed_obsolete_directories = obsolete.len();
+    for (staging, owner) in &obsolete {
         projected_free = projected_free.saturating_add(removal.remove(staging, *owner)?);
     }
 
@@ -255,11 +223,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         } else {
             projected_free.saturating_add(freed)
         };
-        match candidate.kind {
-            CandidateKind::Action => removed_action_entries += 1,
-            CandidateKind::Gate => removed_gate_entries += 1,
-            CandidateKind::Auxiliary => removed_auxiliary_entries += 1,
-        }
+        removed_action_entries += 1;
     }
 
     let after = if options.dry_run {
@@ -269,7 +233,6 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
             available_bytes: projected_free,
             // Entry counts skip dot-files; removals also cover stray temporaries.
             action_entries: before.action_entries.saturating_sub(removed_action_entries),
-            gate_entries: before.gate_entries.saturating_sub(removed_gate_entries),
             blob_entries: before.blob_entries.saturating_sub(removed_blob_entries),
             ..before.clone()
         }
@@ -290,9 +253,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
         before,
         after,
         removed_action_entries,
-        removed_gate_entries,
-        removed_auxiliary_entries,
-        removed_abandoned_staging_entries,
+        removed_obsolete_directories,
         removed_blob_entries,
         capacity_satisfied,
     })
@@ -301,7 +262,7 @@ pub fn collect_garbage(cache_root: &Path, options: GcOptions) -> Result<GcReport
 /// Everything a collection may remove. Each unit owns its files, so the
 /// footprint knows exactly which physical bytes removing it frees.
 struct Units {
-    staging: Vec<(PathBuf, OwnerId)>,
+    obsolete: Vec<(PathBuf, OwnerId)>,
     /// Least recently used first.
     candidates: Vec<(Candidate, OwnerId)>,
     blobs: BTreeMap<String, (OwnerId, PathBuf)>,
@@ -317,7 +278,8 @@ fn removable_units(cache_root: &Path) -> Result<Units> {
         owner
     };
 
-    let staging = abandoned_gate_staging(cache_root)?
+    let obsolete = obsolete_directories(cache_root)
+        .into_iter()
         .into_iter()
         .map(|path| {
             let owner = register(&path);
@@ -339,7 +301,7 @@ fn removable_units(cache_root: &Path) -> Result<Units> {
         .collect();
 
     Ok(Units {
-        staging,
+        obsolete,
         candidates,
         blobs,
         owners,
@@ -376,10 +338,7 @@ impl BlobReferences {
     fn of(candidates: &[(Candidate, OwnerId)]) -> Result<Self> {
         let outputs = candidates
             .iter()
-            .map(|(candidate, _)| match candidate.kind {
-                CandidateKind::Action => action_outputs(&candidate.path),
-                CandidateKind::Gate | CandidateKind::Auxiliary => Ok(Vec::new()),
-            })
+            .map(|(candidate, _)| action_outputs(&candidate.path))
             .collect::<Result<Vec<_>>>()?;
         let mut counts = BTreeMap::<String, usize>::new();
         for digest in outputs.iter().flatten() {
@@ -470,65 +429,34 @@ fn cache_files(cache_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Call only under the exclusive maintenance lock, which excludes every live
-/// producer's staging (see [`GATE_STAGING_PREFIX`]).
-fn abandoned_gate_staging(cache_root: &Path) -> Result<Vec<PathBuf>> {
-    let Ok(entries) = fs::read_dir(cache_root.join("gate-snapshots/objects")) else {
+/// Directories earlier versions kept in the cache and this one never reads:
+/// whole-gate snapshots and their access records, the query cache, and the
+/// link discoveries and digest memos of native-input caching. They are
+/// removed whole by the first collection, so an upgraded cache does not keep
+/// gigabytes nothing will use.
+const OBSOLETE_DIRECTORIES: [&str; 6] = [
+    "gate-snapshots",
+    "access/gates",
+    "rustc-query-cache-v1",
+    "discoveries",
+    "link-captures",
+    "file-digests",
+];
+
+fn obsolete_directories(cache_root: &Path) -> Vec<PathBuf> {
+    OBSOLETE_DIRECTORIES
+        .iter()
+        .map(|name| cache_root.join(name))
+        .filter(|path| fs::symlink_metadata(path).is_ok())
+        .collect()
+}
+
+/// The action entries a collection may evict, with when each was last used.
+fn candidates(cache_root: &Path) -> Result<Vec<Candidate>> {
+    let Ok(entries) = fs::read_dir(cache_root.join("actions")) else {
         return Ok(Vec::new());
     };
-    let mut staging = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_dir()
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(GATE_STAGING_PREFIX)
-        {
-            staging.push(entry.path());
-        }
-    }
-    Ok(staging)
-}
-
-fn candidates(cache_root: &Path) -> Result<Vec<Candidate>> {
     let mut result = Vec::new();
-    add_file_candidates(
-        cache_root,
-        &cache_root.join("actions"),
-        CandidateKind::Action,
-        Some(AccessKind::Action),
-        &mut result,
-    )?;
-    add_directory_candidates(
-        cache_root,
-        &cache_root.join("gate-snapshots/objects"),
-        CandidateKind::Gate,
-        Some(AccessKind::Gate),
-        &mut result,
-    )?;
-    for auxiliary in ["discoveries", "link-captures", "file-digests"] {
-        add_file_candidates(
-            cache_root,
-            &cache_root.join(auxiliary),
-            CandidateKind::Auxiliary,
-            None,
-            &mut result,
-        )?;
-    }
-    Ok(result)
-}
-
-fn add_file_candidates(
-    cache_root: &Path,
-    directory: &Path,
-    kind: CandidateKind,
-    access_kind: Option<AccessKind>,
-    result: &mut Vec<Candidate>,
-) -> Result<()> {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Ok(());
-    };
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -540,75 +468,26 @@ fn add_file_candidates(
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_owned();
-        result.push(Candidate {
-            last_used: last_used(cache_root, access_kind, &key, &entry.path())?,
-            kind,
-            key,
-            path: entry.path(),
-        });
-    }
-    Ok(())
-}
-
-fn add_directory_candidates(
-    cache_root: &Path,
-    directory: &Path,
-    kind: CandidateKind,
-    access_kind: Option<AccessKind>,
-    result: &mut Vec<Candidate>,
-) -> Result<()> {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Ok(());
-    };
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
-        let key = entry.file_name().to_string_lossy().into_owned();
-        result.push(Candidate {
-            last_used: last_used(cache_root, access_kind, &key, &entry.path())?,
-            kind,
-            key,
-            path: entry.path(),
-        });
-    }
-    Ok(())
-}
-
-fn last_used(
-    cache_root: &Path,
-    kind: Option<AccessKind>,
-    key: &str,
-    fallback: &Path,
-) -> Result<SystemTime> {
-    if let Some(kind) = kind {
-        let marker = cache_root.join("access").join(kind.directory()).join(key);
-        if let Ok(metadata) = fs::metadata(marker) {
-            return metadata
+        let marker = cache_root.join("access/actions").join(&key);
+        let last_used = match fs::metadata(marker) {
+            Ok(metadata) => metadata
                 .modified()
-                .context("reading cache access timestamp");
-        }
+                .context("reading cache access timestamp")?,
+            Err(_) => fs::metadata(entry.path())?
+                .modified()
+                .context("reading cache entry timestamp")?,
+        };
+        result.push(Candidate {
+            key,
+            path: entry.path(),
+            last_used,
+        });
     }
-    fs::metadata(fallback)?
-        .modified()
-        .context("reading cache entry timestamp")
+    Ok(result)
 }
 
 fn remove_access_marker(cache_root: &Path, candidate: &Candidate) {
-    let kind = match candidate.kind {
-        CandidateKind::Action => Some(AccessKind::Action),
-        CandidateKind::Gate => Some(AccessKind::Gate),
-        CandidateKind::Auxiliary => None,
-    };
-    if let Some(kind) = kind {
-        let _ = fs::remove_file(
-            cache_root
-                .join("access")
-                .join(kind.directory())
-                .join(&candidate.key),
-        );
-    }
+    let _ = fs::remove_file(cache_root.join("access/actions").join(&candidate.key));
 }
 
 fn sweep_unreferenced_blobs(cache_root: &Path) -> Result<usize> {
@@ -749,12 +628,7 @@ mod tests {
     #[test]
     fn dry_run_reports_eviction_without_mutating_entries() {
         let root = tempdir().unwrap();
-        fs::create_dir_all(root.path().join("gate-snapshots/objects/gate")).unwrap();
-        fs::write(
-            root.path().join("gate-snapshots/objects/gate/data"),
-            vec![0_u8; 1024],
-        )
-        .unwrap();
+        write_action(root.path(), "action", &["action-blob"], 1024);
         let report = collect_garbage(
             root.path(),
             GcOptions {
@@ -765,46 +639,42 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(report.removed_gate_entries, 1);
-        assert!(root.path().join("gate-snapshots/objects/gate").exists());
+        assert_eq!(report.removed_action_entries, 1);
+        assert!(root.path().join("actions/action.json").exists());
+        assert!(root.path().join("blobs/action-blob").exists());
     }
 
-    fn write_gate_object(root: &Path, name: &str, bytes: usize) -> PathBuf {
-        let object = root.join("gate-snapshots/objects").join(name);
-        fs::create_dir_all(object.join("target")).unwrap();
-        fs::write(object.join("target/data"), vec![0_u8; bytes]).unwrap();
-        object
+    fn write_obsolete(root: &Path, name: &str, bytes: usize) -> PathBuf {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("data"), vec![0_u8; bytes]).unwrap();
+        directory
     }
 
     #[test]
-    fn gc_removes_abandoned_staging_before_evicting_reusable_entries() {
+    fn gc_removes_directories_earlier_versions_kept_before_evicting_reusable_entries() {
         let root = tempdir().unwrap();
-        let published = write_gate_object(root.path(), "published", 1024);
-        let abandoned = write_gate_object(root.path(), ".gate-abandoned", 64 * 1024);
+        write_action(root.path(), "reusable", &["reusable-blob"], 1024);
+        let snapshots = write_obsolete(root.path(), "gate-snapshots/objects", 64 * 1024);
+        let gates = write_obsolete(root.path(), "access/gates", 16);
+        let discoveries = write_obsolete(root.path(), "discoveries", 16);
 
-        // The budget fits every reusable entry but not the abandoned staging.
-        let report = collect_garbage(
-            root.path(),
-            GcOptions {
-                max_bytes: 8 * 1024,
-                min_free_bytes: 0,
-                target_free_bytes: 0,
-                dry_run: false,
-            },
-        )
-        .unwrap();
+        // The budget fits the reusable entry but not the obsolete snapshots.
+        let report = collect_within(root.path(), 8 * 1024);
 
-        assert!(!abandoned.exists());
-        assert!(published.exists());
-        assert_eq!(report.removed_abandoned_staging_entries, 1);
-        assert_eq!(report.removed_gate_entries, 0);
+        for obsolete in [&snapshots, &gates, &discoveries] {
+            assert!(!obsolete.exists(), "{obsolete:?} was kept");
+        }
+        assert!(root.path().join("actions/reusable.json").exists());
+        assert_eq!(report.removed_obsolete_directories, 3);
+        assert_eq!(report.removed_action_entries, 0);
         assert!(report.capacity_satisfied);
     }
 
     #[test]
-    fn dry_run_reports_abandoned_staging_without_removing_it() {
+    fn dry_run_reports_obsolete_directories_without_removing_them() {
         let root = tempdir().unwrap();
-        let abandoned = write_gate_object(root.path(), ".gate-abandoned", 1024);
+        let snapshots = write_obsolete(root.path(), "gate-snapshots", 1024);
 
         let report = collect_garbage(
             root.path(),
@@ -817,46 +687,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.removed_abandoned_staging_entries, 1);
-        assert!(abandoned.exists());
-    }
-
-    #[test]
-    fn gc_never_removes_staging_owned_by_a_live_producer() {
-        let root = tempdir().unwrap();
-        // A producer stages while holding its shared maintenance lease.
-        let producer = acquire_shared(root.path()).unwrap();
-        let staging = write_gate_object(root.path(), ".gate-live", 1024);
-        let cache_root = root.path().to_path_buf();
-        let (sender, receiver) = mpsc::channel();
-        let collector = thread::spawn(move || {
-            let result = collect_garbage(
-                &cache_root,
-                GcOptions {
-                    max_bytes: 0,
-                    min_free_bytes: 0,
-                    target_free_bytes: 0,
-                    dry_run: false,
-                },
-            );
-            sender.send(result).unwrap();
-        });
-
-        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
-        assert!(staging.exists());
-
-        // Publication renames the staging into place before the lease ends.
-        let published = root.path().join("gate-snapshots/objects/published");
-        fs::rename(&staging, &published).unwrap();
-        drop(producer);
-        let report = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("GC should proceed after the producer publishes")
-            .unwrap();
-        collector.join().unwrap();
-
-        assert_eq!(report.removed_abandoned_staging_entries, 0);
-        assert_eq!(report.removed_gate_entries, 1);
+        assert_eq!(report.removed_obsolete_directories, 1);
+        assert!(snapshots.exists());
     }
 
     #[test]
@@ -963,9 +795,9 @@ mod tests {
             format!(r#"{{"outputs":[]}}{}"#, " ".repeat(1024)),
         )
         .unwrap();
-        record_access(root.path(), AccessKind::Action, "older").unwrap();
+        record_access(root.path(), "older").unwrap();
         thread::sleep(Duration::from_millis(10));
-        record_access(root.path(), AccessKind::Action, "newer").unwrap();
+        record_access(root.path(), "newer").unwrap();
         let before = cache_stats(root.path()).unwrap();
         let report = collect_garbage(
             root.path(),
@@ -1018,8 +850,8 @@ mod tests {
     }
 
     /// Access markers have millisecond timestamps; keep the LRU order explicit.
-    fn touch(root: &Path, kind: AccessKind, key: &str) {
-        record_access(root, kind, key).unwrap();
+    fn touch(root: &Path, key: &str) {
+        record_access(root, key).unwrap();
         thread::sleep(Duration::from_millis(20));
     }
 
@@ -1045,7 +877,7 @@ mod tests {
         let root = tempdir().unwrap();
         for key in ["a0", "a1", "a2", "a3"] {
             write_action(root.path(), key, &[&format!("{key}-blob")], 4 * MIB);
-            touch(root.path(), AccessKind::Action, key);
+            touch(root.path(), key);
         }
         let before = cache_stats(root.path()).unwrap();
 
@@ -1066,11 +898,11 @@ mod tests {
     fn a_blob_still_referenced_by_a_surviving_action_is_not_credited() {
         let root = tempdir().unwrap();
         write_action(root.path(), "a0", &["shared"], 4 * MIB);
-        touch(root.path(), AccessKind::Action, "a0");
+        touch(root.path(), "a0");
         write_action(root.path(), "a1", &["shared"], 4 * MIB);
-        touch(root.path(), AccessKind::Action, "a1");
+        touch(root.path(), "a1");
         write_action(root.path(), "a2", &["a2-blob"], 4 * MIB);
-        touch(root.path(), AccessKind::Action, "a2");
+        touch(root.path(), "a2");
         let before = cache_stats(root.path()).unwrap();
 
         // Evicting a0 frees nothing while a1 still needs the shared blob.
@@ -1080,95 +912,6 @@ mod tests {
         assert!(!root.path().join("blobs/shared").exists());
         assert!(root.path().join("actions/a2.json").exists());
         assert!(root.path().join("blobs/a2-blob").exists());
-        assert!(report.capacity_satisfied);
-    }
-
-    /// A temporary directory on a reflink-capable file system, which the
-    /// footprint tests need in order to create real shared extents.
-    #[cfg(target_os = "linux")]
-    fn cow_test_root() -> tempfile::TempDir {
-        let base = std::env::var_os("CARGO_REAPI_COW_TEST_DIR").expect(
-            "set CARGO_REAPI_COW_TEST_DIR to a directory on a reflink-capable file system (XFS or Btrfs)",
-        );
-        tempfile::Builder::new()
-            .prefix("footprint-")
-            .tempdir_in(base)
-            .unwrap()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn write_snapshot(root: &Path, name: &str, bytes: usize) -> PathBuf {
-        let object = root.join("gate-snapshots/objects").join(name);
-        fs::create_dir_all(object.join("target")).unwrap();
-        fs::write(object.join("target/data"), patterned(bytes, name)).unwrap();
-        object
-    }
-
-    #[cfg(target_os = "linux")]
-    fn reflink_snapshot(root: &Path, source: &Path, name: &str) -> PathBuf {
-        let destination = root.join("gate-snapshots/objects").join(name);
-        let status = std::process::Command::new("cp")
-            .args(["--reflink=always", "-a"])
-            .arg(source)
-            .arg(&destination)
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "CARGO_REAPI_COW_TEST_DIR must support reflink"
-        );
-        destination
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn reflinked_gate_snapshots_count_their_shared_blocks_once() {
-        let root = cow_test_root();
-        let cache = root.path();
-        write_action(cache, "hot", &["hot-blob"], 8 * MIB);
-        touch(cache, AccessKind::Action, "hot");
-        let first = write_snapshot(cache, "snapshot-0", 32 * MIB);
-        touch(cache, AccessKind::Gate, "snapshot-0");
-        for index in 1..5 {
-            let name = format!("snapshot-{index}");
-            reflink_snapshot(cache, &first, &name);
-            touch(cache, AccessKind::Gate, &name);
-        }
-
-        // Apparent size is 8 + 5 * 32 MiB; the disk holds 8 + 32 MiB.
-        let report = collect_within(cache, mib(48 * MIB));
-
-        assert!(
-            report.before.total_bytes < mib(48 * MIB),
-            "footprint {} counts shared snapshot blocks more than once",
-            report.before.total_bytes
-        );
-        assert_eq!(report.removed_action_entries, 0);
-        assert_eq!(report.removed_gate_entries, 0);
-        assert!(cache.join("blobs/hot-blob").exists());
-        assert!(report.capacity_satisfied);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn evicting_a_snapshot_whose_blocks_are_still_shared_frees_nothing() {
-        let root = cow_test_root();
-        let cache = root.path();
-        let old = write_snapshot(cache, "old", 32 * MIB);
-        touch(cache, AccessKind::Gate, "old");
-        write_action(cache, "action", &["action-blob"], 8 * MIB);
-        touch(cache, AccessKind::Action, "action");
-        let new = reflink_snapshot(cache, &old, "new");
-        touch(cache, AccessKind::Gate, "new");
-
-        // About 40 MiB is on disk. Evicting `old` frees nothing because `new`
-        // shares its blocks, so the action must go to reach 36 MiB.
-        let report = collect_within(cache, mib(36 * MIB));
-
-        assert!(!old.exists());
-        assert!(!cache.join("actions/action.json").exists());
-        assert!(new.exists(), "the newest snapshot fits within the budget");
-        assert!(report.after.total_bytes <= mib(36 * MIB));
         assert!(report.capacity_satisfied);
     }
 }
